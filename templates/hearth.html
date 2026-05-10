@@ -85,6 +85,8 @@ body {
     word-wrap: break-word;
     hyphens: auto;
     text-rendering: optimizeLegibility;
+    /* Top accent bar — the hearth brand mark */
+    border-top: 4px solid var(--accent);
 }
 
 /* ═══════════════════════════════════════════
@@ -94,7 +96,7 @@ body {
 main {
     max-width: var(--max-width);
     margin: 0 auto;
-    padding: var(--space-xxl) var(--space-lg) var(--space-xxl);
+    padding: var(--space-xl) var(--space-lg) var(--space-xxl);
 }
 
 article {
@@ -118,20 +120,12 @@ h1 {
     font-size: 2rem;
     font-weight: 800;
     margin-top: 0;
-    margin-bottom: var(--space-sm);
+    margin-bottom: var(--space-md);
     letter-spacing: -0.02em;
     line-height: 1.15;
     color: var(--accent);
-}
-
-/* The ember rule beneath h1 — the brand mark */
-h1::after {
-    content: "";
-    display: block;
-    width: 100%;
-    height: 2px;
-    background: var(--accent);
-    margin-top: var(--space-sm);
+    padding-bottom: var(--space-sm);
+    border-bottom: 3px solid var(--accent);
 }
 
 h2 {
@@ -139,6 +133,8 @@ h2 {
     font-weight: 600;
     margin-top: var(--space-xxl);
     color: var(--fg);
+    padding-bottom: var(--space-xs);
+    border-bottom: 1.5px solid var(--accent-soft);
 }
 
 h3 {
@@ -146,6 +142,8 @@ h3 {
     font-weight: 600;
     margin-top: var(--space-xl);
     color: var(--fg-secondary);
+    padding-left: var(--space-sm);
+    border-left: 3px solid var(--accent-soft);
 }
 
 h4 {
@@ -270,8 +268,7 @@ dd {
 
 blockquote {
     margin: var(--space-lg) 0;
-    padding: var(--space-sm) 0 var(--space-sm) var(--space-lg);
-    border-left: 3px solid var(--accent-soft);
+    border-left: 3px solid var(--accent);
     background: var(--bg-subtle);
     border-radius: 0 4px 4px 0;
     padding: var(--space-md) var(--space-lg);
@@ -317,8 +314,8 @@ code {
 }
 
 pre {
-    background: var(--bg-subtle);
-    border: 1px solid var(--border);
+    background: var(--fg);
+    border: none;
     border-radius: 4px;
     padding: var(--space-md) var(--space-lg);
     overflow-x: auto;
@@ -332,30 +329,30 @@ pre code {
     font-size: 0.8125rem;
     line-height: 1.6;
     word-break: normal;
-    color: var(--code-fg);
+    color: var(--bg-subtle);
 }
 
-/* Syntax highlighting — hearth-warm palette */
+/* Syntax highlighting — hearth-warm palette (on dark background) */
 pre code .comment,
-pre code .prolog { color: var(--fg-muted); font-style: italic; }
+pre code .prolog { color: #A89888; font-style: italic; }
 
 pre code .keyword,
-pre code .tag { color: #C4762B; }
+pre code .tag { color: #D4943C; }
 
 pre code .string,
-pre code .attr-value { color: #7A9A60; }
+pre code .attr-value { color: #A4C484; }
 
 pre code .function,
-pre code .class-name { color: #D4943C; }
+pre code .class-name { color: #E8B060; }
 
 pre code .number,
-pre code .boolean { color: #B87840; }
+pre code .boolean { color: #D4943C; }
 
 pre code .operator,
-pre code .punctuation { color: var(--fg-secondary); }
+pre code .punctuation { color: #C8B8A8; }
 
 pre code .property,
-pre code .attr-name { color: #A89888; }
+pre code .attr-name { color: #C8B8A8; }
 
 /* ═══════════════════════════════════════════
    TABLES — hearth branded
@@ -408,21 +405,15 @@ thead, tbody, tr, th, td {
 }
 
 /* ═══════════════════════════════════════════
-   HORIZONTAL RULE — the ember breath
+   HORIZONTAL RULE — section divider
    ═══════════════════════════════════════════ */
 
 hr {
     border: none;
-    height: 1px;
-    background: linear-gradient(
-        to right,
-        transparent,
-        var(--accent) 30%,
-        var(--accent) 70%,
-        transparent
-    );
+    height: 2px;
+    background: var(--accent);
     margin: var(--space-xxl) 0;
-    opacity: 0.5;
+    opacity: 0.4;
 }
 
 /* ═══════════════════════════════════════════
@@ -484,24 +475,25 @@ footer {
     margin: 0 auto;
     padding: var(--space-lg) var(--space-lg) var(--space-xl);
     text-align: center;
+    border-top: 1px solid var(--border-strong);
 }
 
 footer::before {
     content: "";
     display: block;
-    width: 3rem;
-    height: 2px;
+    width: 2.5rem;
+    height: 3px;
     background: var(--accent);
-    margin: 0 auto var(--space-lg);
-    opacity: 0.6;
+    margin: 0 auto var(--space-md);
+    border-radius: 2px;
 }
 
 footer small {
     color: var(--fg-muted);
-    font-size: 0.75rem;
+    font-size: 0.7rem;
     font-family: var(--font-heading);
-    letter-spacing: 0.05em;
-    text-transform: lowercase;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
 }
 
 /* ═══════════════════════════════════════════
@@ -571,10 +563,7 @@ footer small {
 
     h1 {
         color: #C4762B;
-    }
-
-    h1::after {
-        background: #C4762B;
+        border-bottom-color: #C4762B;
     }
 
     a {
@@ -588,7 +577,17 @@ footer small {
         color: #6B5D52;
     }
 
-    pre, code {
+    pre {
+        background: #2C2420;
+        -webkit-print-color-adjust: exact;
+        print-color-adjust: exact;
+    }
+
+    pre code {
+        color: #EDE6DE;
+    }
+
+    code {
         border: 1px solid #E8E0D8;
     }
 
@@ -617,7 +616,7 @@ footer small {
 }
 
 /* ═══════════════════════════════════════════
-   TOOLBAR
+   TOOLBAR — document header bar
    ═══════════════════════════════════════════ */
 
 .doc-toolbar {
@@ -626,6 +625,8 @@ footer small {
     align-items: center;
     gap: 0.4rem;
     margin-bottom: var(--space-lg);
+    padding-bottom: var(--space-sm);
+    border-bottom: 1px solid var(--border);
     flex-wrap: wrap;
 }
 
@@ -719,7 +720,7 @@ footer small {
         </article>
     </main>
     <footer>
-        <small>shared via twofold</small>
+        <small>shared via the hearth</small>
     </footer>
 
     <div class="doc-toast" id="doc-toast" aria-live="polite"></div>
