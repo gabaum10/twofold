@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 /// Serves two views from one document: a styled human view and a full raw
 /// agent view. POST markdown in, get a URL out.
 #[derive(Parser, Debug)]
-#[command(name = "sharesvc", version, about)]
+#[command(name = "twofold", version, about)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
@@ -16,14 +16,14 @@ pub enum Commands {
     /// Start the HTTP server.
     ///
     /// Reads configuration from environment variables:
-    ///   SHARESVC_TOKEN   (required) Bearer token for publish auth
-    ///   SHARESVC_BIND    (optional) Bind address (default: 127.0.0.1:3000)
-    ///   SHARESVC_DB_PATH (optional) SQLite path (default: ./sharesvc.db)
-    ///   SHARESVC_BASE_URL (optional) Base URL (default: http://localhost:3000)
-    ///   SHARESVC_MAX_SIZE (optional) Max body bytes (default: 1048576)
+    ///   TWOFOLD_TOKEN   (required) Bearer token for publish auth
+    ///   TWOFOLD_BIND    (optional) Bind address (default: 127.0.0.1:3000)
+    ///   TWOFOLD_DB_PATH (optional) SQLite path (default: ./twofold.db)
+    ///   TWOFOLD_BASE_URL (optional) Base URL (default: http://localhost:3000)
+    ///   TWOFOLD_MAX_SIZE (optional) Max body bytes (default: 1048576)
     Serve,
 
-    /// Publish a markdown document to a sharesvc server.
+    /// Publish a markdown document to a twofold server.
     ///
     /// Reads the file at PATH (or stdin if PATH is `-`) and POSTs it to the
     /// server. Prints the resulting URL to stdout on success. Exits 1 on failure.
@@ -41,7 +41,7 @@ pub struct PublishArgs {
     pub server: String,
 
     /// Bearer token for authentication.
-    /// Defaults to the SHARESVC_TOKEN environment variable.
+    /// Defaults to the TWOFOLD_TOKEN environment variable.
     #[arg(long)]
     pub token: Option<String>,
 }

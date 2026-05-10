@@ -40,7 +40,7 @@ fn main() {
 }
 
 // ---------------------------------------------------------------------------
-// `sharesvc serve`
+// `twofold serve`
 // ---------------------------------------------------------------------------
 
 async fn run_server() {
@@ -48,7 +48,7 @@ async fn run_server() {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::from_default_env()
-                .add_directive("sharesvc=info".parse().unwrap()),
+                .add_directive("twofold=info".parse().unwrap()),
         )
         .init();
 
@@ -102,7 +102,7 @@ async fn run_server() {
     };
 
     // Print bind address to stdout (per spec: "Prints bind address to stdout on start").
-    println!("sharesvc listening on http://{bind_addr}");
+    println!("twofold listening on http://{bind_addr}");
 
     if let Err(e) = axum::serve(listener, app).await {
         eprintln!("Server error: {e}");
@@ -111,19 +111,19 @@ async fn run_server() {
 }
 
 // ---------------------------------------------------------------------------
-// `sharesvc publish <path|->`
+// `twofold publish <path|->`
 // ---------------------------------------------------------------------------
 
 fn run_publish(args: cli::PublishArgs) {
-    // Resolve token: --token flag > SHARESVC_TOKEN env var.
+    // Resolve token: --token flag > TWOFOLD_TOKEN env var.
     let token = match args.token {
         Some(t) => t,
-        None => match std::env::var("SHARESVC_TOKEN") {
+        None => match std::env::var("TWOFOLD_TOKEN") {
             Ok(t) => t,
             Err(_) => {
                 eprintln!(
-                    "Error: --token not provided and SHARESVC_TOKEN is not set.\n\
-                     Provide a token via --token <TOKEN> or set SHARESVC_TOKEN."
+                    "Error: --token not provided and TWOFOLD_TOKEN is not set.\n\
+                     Provide a token via --token <TOKEN> or set TWOFOLD_TOKEN."
                 );
                 std::process::exit(1);
             }

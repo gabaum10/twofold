@@ -1,10 +1,10 @@
 [package]
-name = "sharesvc"
+name = "twofold"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "sharesvc"
+name = "twofold"
 path = "src/main.rs"
 
 [dependencies]
