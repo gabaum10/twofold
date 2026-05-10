@@ -7,15 +7,16 @@ mod parser;
 use std::sync::Arc;
 
 use axum::{
+    extract::DefaultBodyLimit,
     routing::{get, post},
     Router,
 };
 use clap::Parser;
 use axum::http::HeaderValue;
-use tower_http::{limit::RequestBodyLimitLayer, set_header::SetResponseHeaderLayer, trace::TraceLayer};
+use tower_http::{set_header::SetResponseHeaderLayer, trace::TraceLayer};
 use tracing_subscriber::EnvFilter;
 
-use cli::{Cli, Commands};
+use cli::{Cli, Commands, TokenAction};
 use config::ServeConfig;
 use db::Db;
 use handlers::AppState;
@@ -25,8 +26,6 @@ fn main() {
 
     match cli.command {
         // Publish is synchronous: parse CLI, read file, POST via reqwest blocking.
-        // It MUST run outside a Tokio runtime context to avoid the
-        // "Cannot drop runtime in async context" panic with reqwest blocking.
         Commands::Publish(args) => run_publish(args),
 
         // Serve requires async: build the Tokio runtime here.
@@ -37,6 +36,9 @@ fn main() {
                 .expect("Failed to build Tokio runtime");
             rt.block_on(run_server());
         }
+
+        // Token management — direct database access, no server needed.
+        Commands::Token(args) => run_token(args),
     }
 }
 
@@ -73,32 +75,54 @@ async fn run_server() {
 
     let max_size = config.max_size;
     let bind_addr = config.bind.clone();
+    let reaper_interval = config.reaper_interval;
 
     let state = AppState {
-        db,
+        db: db.clone(),
         config: Arc::new(config),
     };
 
+    // Spawn the background reaper task for expired documents
+    let reaper_db = db.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(
+            std::time::Duration::from_secs(reaper_interval),
+        );
+        loop {
+            interval.tick().await;
+            let now = handlers::chrono_now();
+            match reaper_db.delete_expired(&now) {
+                Ok(count) if count > 0 => {
+                    tracing::info!(count, "Reaper cleaned up expired documents");
+                }
+                Ok(_) => {} // nothing to reap
+                Err(e) => {
+                    tracing::error!(error = %e, "Reaper failed to delete expired documents");
+                }
+            }
+        }
+    });
+
     // Build the router.
     //
-    // Route ordering matters: the API routes must be registered BEFORE the
+    // Route ordering matters: API routes must be registered BEFORE the
     // slug catch-all, otherwise axum would try to parse "api" as a slug.
-    //
-    // RequestBodyLimitLayer is applied globally; it returns 413 automatically
-    // when the body exceeds max_size bytes.
     let csp = HeaderValue::from_static(
         "default-src 'self'; script-src 'none'; style-src 'unsafe-inline'",
     );
 
     let app = Router::new()
         .route("/api/v1/documents", post(handlers::post_document))
-        .route("/api/v1/documents/{slug}", get(handlers::get_agent))
-        .route("/{slug}", get(handlers::get_human))
+        .route("/api/v1/documents/:slug", get(handlers::get_agent)
+            .put(handlers::put_document)
+            .delete(handlers::delete_document))
+        .route("/:slug/unlock", post(handlers::post_unlock))
+        .route("/:slug", get(handlers::get_human))
         .layer(SetResponseHeaderLayer::overriding(
             axum::http::header::CONTENT_SECURITY_POLICY,
             csp,
         ))
-        .layer(RequestBodyLimitLayer::new(max_size))
+        .layer(DefaultBodyLimit::max(max_size))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
@@ -110,7 +134,7 @@ async fn run_server() {
         }
     };
 
-    // Print bind address to stdout (per spec: "Prints bind address to stdout on start").
+    // Print bind address to stdout on start.
     println!("twofold listening on http://{bind_addr}");
 
     if let Err(e) = axum::serve(listener, app).await {
@@ -194,9 +218,6 @@ fn run_publish(args: cli::PublishArgs) {
 }
 
 /// Read content from a file path or stdin (`-`).
-///
-/// Does NOT use .unwrap() on user-provided paths.
-/// Exits with exit code 1 and an error message on failure.
 fn read_publish_source(path: &str) -> String {
     if path == "-" {
         use std::io::Read;
@@ -213,6 +234,144 @@ fn read_publish_source(path: &str) -> String {
                 eprintln!("Failed to read file '{path}': {e}");
                 std::process::exit(1);
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `twofold token {create|list|revoke}`
+// ---------------------------------------------------------------------------
+
+fn run_token(args: cli::TokenArgs) {
+    match args.action {
+        TokenAction::Create { name, db } => token_create(&name, &resolve_db_path(db)),
+        TokenAction::List { db } => token_list(&resolve_db_path(db)),
+        TokenAction::Revoke { name, db } => token_revoke(&name, &resolve_db_path(db)),
+    }
+}
+
+fn resolve_db_path(explicit: Option<String>) -> String {
+    explicit
+        .or_else(|| std::env::var("TWOFOLD_DB_PATH").ok())
+        .unwrap_or_else(|| "./twofold.db".to_string())
+}
+
+fn token_create(name: &str, db_path: &str) {
+    let db = match Db::open(db_path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Failed to open database '{db_path}': {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // Check for duplicate name
+    match db.token_name_exists(name) {
+        Ok(true) => {
+            eprintln!("Error: Token name '{name}' already exists.");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Database error: {e}");
+            std::process::exit(1);
+        }
+        _ => {}
+    }
+
+    // Generate a 32-byte random token, base64url-encode it
+    use rand::RngCore;
+    use base64::Engine;
+
+    let mut token_bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut token_bytes);
+    let token_plain = format!(
+        "tf_{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token_bytes)
+    );
+
+    // Hash the token
+    let hash = match handlers::hash_password(&token_plain) {
+        Ok(h) => h,
+        Err(_) => {
+            eprintln!("Failed to hash token");
+            std::process::exit(1);
+        }
+    };
+
+    let now = handlers::chrono_now();
+    let id = nanoid::nanoid!(10);
+
+    let record = db::TokenRecord {
+        id,
+        name: name.to_string(),
+        hash,
+        created_at: now,
+        last_used: None,
+        revoked: false,
+    };
+
+    if let Err(e) = db.insert_token(&record) {
+        eprintln!("Failed to store token: {e}");
+        std::process::exit(1);
+    }
+
+    // Print the plaintext token ONCE
+    println!("{token_plain}");
+}
+
+fn token_list(db_path: &str) {
+    let db = match Db::open(db_path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Failed to open database '{db_path}': {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let tokens = match db.list_tokens() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("Failed to list tokens: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // Print table header
+    println!("{:<20} {:<22} {:<22} {}",
+        "NAME", "CREATED", "LAST USED", "STATUS");
+
+    for token in tokens {
+        let status = if token.revoked { "revoked" } else { "active" };
+        let last_used = token.last_used.as_deref().unwrap_or("never");
+        // Truncate timestamps for display
+        let created = &token.created_at[..std::cmp::min(16, token.created_at.len())];
+        let used = if last_used == "never" {
+            "never".to_string()
+        } else {
+            last_used[..std::cmp::min(16, last_used.len())].to_string()
+        };
+        println!("{:<20} {:<22} {:<22} {}", token.name, created, used, status);
+    }
+}
+
+fn token_revoke(name: &str, db_path: &str) {
+    let db = match Db::open(db_path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Failed to open database '{db_path}': {e}");
+            std::process::exit(1);
+        }
+    };
+
+    match db.revoke_token(name) {
+        Ok(true) => println!("Token '{name}' revoked."),
+        Ok(false) => {
+            eprintln!("Error: Token '{name}' not found or already revoked.");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Database error: {e}");
+            std::process::exit(1);
         }
     }
 }

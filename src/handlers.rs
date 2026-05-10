@@ -5,8 +5,8 @@ use axum::{
     body::Bytes,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
-    response::{Html, IntoResponse, Response},
-    Json,
+    response::{Html, IntoResponse, Redirect, Response},
+    Form, Json,
 };
 use comrak::{markdown_to_html, Options};
 use serde::{Deserialize, Serialize};
@@ -14,50 +14,117 @@ use serde::{Deserialize, Serialize};
 use crate::{
     config::ServeConfig,
     db::{Db, DocumentRecord},
-    parser::{extract_title, parse_document},
+    parser::{extract_frontmatter, extract_title, parse_document, parse_expiry, validate_slug},
 };
 
-/// URL-safe slug alphabet per spec: alphanumeric + hyphen only (no underscore,
-/// which is in the default nanoid alphabet but violates the spec's literal
-/// "URL-safe (alphanumeric + hyphen)").
+/// URL-safe slug alphabet: alphanumeric + hyphen.
 const SLUG_ALPHABET: [char; 63] = [
-    '0','1','2','3','4','5','6','7','8','9',
-    'a','b','c','d','e','f','g','h','i','j','k','l','m',
-    'n','o','p','q','r','s','t','u','v','w','x','y','z',
-    'A','B','C','D','E','F','G','H','I','J','K','L','M',
-    'N','O','P','Q','R','S','T','U','V','W','X','Y','Z',
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm',
+    'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
+    'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M',
+    'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z',
     '-',
 ];
 
+// ── Application Error ────────────────────────────────────────────────────────
+
+/// Unified error type with IntoResponse impl.
+/// Replaces inline error tuples throughout handlers.
+#[derive(Debug)]
+pub enum AppError {
+    Unauthorized,
+    BadRequest(String),
+    NotFound,
+    Conflict(String),
+    Gone,
+    Internal(String),
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        let (status, msg) = match self {
+            AppError::Unauthorized => (StatusCode::UNAUTHORIZED, "Unauthorized".to_string()),
+            AppError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
+            AppError::NotFound => (StatusCode::NOT_FOUND, "Not found".to_string()),
+            AppError::Conflict(m) => (StatusCode::CONFLICT, m),
+            AppError::Gone => (StatusCode::GONE, "Document has expired".to_string()),
+            AppError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
+        };
+        (status, Json(serde_json::json!({ "error": msg }))).into_response()
+    }
+}
+
+impl From<rusqlite::Error> for AppError {
+    fn from(e: rusqlite::Error) -> Self {
+        tracing::error!(error = %e, "Database error");
+        AppError::Internal("Database error".to_string())
+    }
+}
+
+// ── State ────────────────────────────────────────────────────────────────────
+
 /// Shared application state injected into all handlers via axum State extractor.
-///
-/// Both fields are Arc-wrapped: Db has its own internal Arc<Mutex<Connection>>;
-/// ServeConfig is cloned cheaply (just the Arc pointer).
 #[derive(Clone)]
 pub struct AppState {
     pub db: Db,
     pub config: Arc<ServeConfig>,
 }
 
-/// Askama template for the human-facing document view.
-///
-/// `content` must be pre-rendered HTML (not raw markdown).
-/// `|safe` filter in the template marks it as trusted HTML — caller is responsible.
+// ── Templates ────────────────────────────────────────────────────────────────
+
+/// Askama template for the human-facing document view (clean theme).
 #[derive(Template)]
 #[template(path = "document.html")]
-struct DocumentTemplate<'a> {
+struct CleanTemplate<'a> {
     title: &'a str,
     content: &'a str,
 }
 
-/// JSON response body for a successful POST /api/v1/documents.
+/// Dark theme template.
+#[derive(Template)]
+#[template(path = "dark.html")]
+struct DarkTemplate<'a> {
+    title: &'a str,
+    content: &'a str,
+}
+
+/// Paper theme template.
+#[derive(Template)]
+#[template(path = "paper.html")]
+struct PaperTemplate<'a> {
+    title: &'a str,
+    content: &'a str,
+}
+
+/// Minimal theme template.
+#[derive(Template)]
+#[template(path = "minimal.html")]
+struct MinimalTemplate<'a> {
+    title: &'a str,
+    content: &'a str,
+}
+
+/// Password prompt template.
+#[derive(Template)]
+#[template(path = "password.html")]
+struct PasswordTemplate<'a> {
+    slug: &'a str,
+    error: Option<&'a str>,
+}
+
+// ── Response Types ───────────────────────────────────────────────────────────
+
+/// JSON response body for a successful POST/PUT.
 #[derive(Serialize)]
 pub struct CreateResponse {
     pub url: String,
     pub slug: String,
     pub api_url: String,
     pub title: String,
+    pub description: Option<String>,
     pub created_at: String,
+    pub expires_at: Option<String>,
 }
 
 /// Query parameters for GET /:slug
@@ -66,185 +133,405 @@ pub struct SlugQuery {
     pub raw: Option<String>,
 }
 
-// ---------------------------------------------------------------------------
-// POST /api/v1/documents
-// ---------------------------------------------------------------------------
+/// Form data for password unlock
+#[derive(Deserialize)]
+pub struct UnlockForm {
+    pub password: String,
+}
+
+// ── POST /api/v1/documents ───────────────────────────────────────────────────
 
 /// Handle document creation.
 ///
-/// Auth: validates Bearer token via constant-time comparison (subtle crate).
+/// Auth: validates Bearer token via constant-time comparison FIRST (before body parsing).
+/// Body: raw bytes (Content-Type: text/markdown).
 ///
-/// Body: raw bytes (Content-Type: text/markdown). Body size is enforced upstream
-/// by RequestBodyLimitLayer before this handler runs.
-///
-/// Returns 201 with CreateResponse JSON on success.
-/// Returns 400 for empty body.
-/// Returns 401 for missing/invalid auth.
+/// v0.2: parses frontmatter for title, slug, theme, expiry, password, description.
 pub async fn post_document(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
-) -> Response {
-    // --- Auth ---
-    let provided = match extract_bearer(&headers) {
-        Some(t) => t,
-        None => return (StatusCode::UNAUTHORIZED, "Missing Authorization header").into_response(),
-    };
-    if !constant_time_eq(provided.as_bytes(), state.config.token.as_bytes()) {
-        return (StatusCode::UNAUTHORIZED, "Invalid bearer token").into_response();
-    }
+) -> Result<Response, AppError> {
+    // Auth FIRST — 401 before 400/413
+    check_auth(&state, &headers).await?;
 
-    // --- Body validation ---
+    // Body validation
     if body.is_empty() {
-        return (StatusCode::BAD_REQUEST, "Request body must not be empty").into_response();
+        return Err(AppError::BadRequest("Request body must not be empty".to_string()));
     }
 
-    let raw_content = match std::str::from_utf8(&body) {
-        Ok(s) => s.to_string(),
-        Err(_) => {
-            return (StatusCode::BAD_REQUEST, "Request body must be valid UTF-8").into_response()
-        }
+    let raw_content = std::str::from_utf8(&body)
+        .map_err(|_| AppError::BadRequest("Request body must be valid UTF-8".to_string()))?
+        .to_string();
+
+    // Parse frontmatter
+    let fm_result = extract_frontmatter(&raw_content)
+        .map_err(|e| AppError::BadRequest(e))?;
+
+    let meta = fm_result.meta.unwrap_or_default();
+    let body_text = &fm_result.body;
+
+    // Determine slug
+    let slug = if let Some(ref custom_slug) = meta.slug {
+        validate_slug(custom_slug)
+            .map_err(|e| AppError::BadRequest(e))?;
+        custom_slug.clone()
+    } else {
+        nanoid::nanoid!(10, &SLUG_ALPHABET)
     };
 
-    // --- Build document record ---
-    let slug = nanoid::nanoid!(21, &SLUG_ALPHABET);
-    let title = extract_title(&raw_content, &slug);
+    // Determine title: frontmatter > H1 > slug
+    let title = meta.title.unwrap_or_else(|| extract_title(body_text, &slug));
+
+    // Determine theme
+    let theme = meta.theme.unwrap_or_else(|| state.config.default_theme.clone());
+
+    // Parse expiry
     let now = chrono_now();
+    let expires_at = match meta.expiry.as_deref() {
+        Some(exp) => {
+            let seconds = parse_expiry(exp)
+                .map_err(|e| AppError::BadRequest(e))?;
+            Some(add_seconds_to_now(&now, seconds))
+        }
+        None => None,
+    };
+
+    // Hash password if provided
+    let password_hash = match meta.password.as_deref() {
+        Some(pw) if !pw.is_empty() => Some(hash_password(pw)?),
+        _ => None,
+    };
 
     let doc = DocumentRecord {
         id: slug.clone(),
         slug: slug.clone(),
         title: title.clone(),
         raw_content,
+        theme,
+        password: password_hash,
+        description: meta.description.clone(),
         created_at: now.clone(),
+        expires_at: expires_at.clone(),
         updated_at: now.clone(),
     };
 
-    // --- Persist (with slug-collision retry-once) ---
-    let mut final_slug = slug;
-    let mut final_doc = doc;
-    match state.db.insert_document(&final_doc) {
+    // Insert (handle slug collision)
+    match state.db.insert_document(&doc) {
         Ok(()) => {}
         Err(e) if is_unique_violation(&e) => {
-            // Extremely rare with 21-char nanoid (~1 in 10^30) — retry once.
-            let new_slug = nanoid::nanoid!(21, &SLUG_ALPHABET);
-            let new_title = if final_doc.title == final_slug {
-                new_slug.clone() // title was the slug-fallback — track new slug
-            } else {
-                final_doc.title.clone()
-            };
-            final_doc = DocumentRecord {
+            // Custom slug collision -> 409 Conflict
+            if meta.slug.is_some() {
+                return Err(AppError::Conflict(
+                    format!("Slug '{}' is already in use", slug),
+                ));
+            }
+            // Random slug collision (extremely rare) -> retry once
+            let new_slug = nanoid::nanoid!(10, &SLUG_ALPHABET);
+            let retry_doc = DocumentRecord {
                 id: new_slug.clone(),
                 slug: new_slug.clone(),
-                title: new_title,
-                raw_content: final_doc.raw_content,
-                created_at: final_doc.created_at,
-                updated_at: final_doc.updated_at,
+                ..doc
             };
-            final_slug = new_slug;
-            if let Err(e2) = state.db.insert_document(&final_doc) {
-                tracing::error!(error = %e2, "Slug collision retry failed");
-                return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to allocate unique slug").into_response();
-            }
+            state.db.insert_document(&retry_doc)
+                .map_err(|e2| {
+                    tracing::error!(error = %e2, "Slug collision retry failed");
+                    AppError::Internal("Failed to allocate unique slug".to_string())
+                })?;
+            let base = state.config.base_url.trim_end_matches('/');
+            return Ok((StatusCode::CREATED, Json(CreateResponse {
+                url: format!("{base}/{new_slug}"),
+                slug: new_slug.clone(),
+                api_url: format!("{base}/api/v1/documents/{new_slug}"),
+                title: retry_doc.title,
+                description: retry_doc.description,
+                created_at: retry_doc.created_at,
+                expires_at: retry_doc.expires_at,
+            })).into_response());
         }
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to insert document");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response();
-        }
+        Err(e) => return Err(AppError::from(e)),
     }
 
-    // --- Response ---
+    // Response
     let base = state.config.base_url.trim_end_matches('/');
     let response = CreateResponse {
-        url: format!("{base}/{final_slug}"),
-        slug: final_slug.clone(),
-        api_url: format!("{base}/api/v1/documents/{final_slug}"),
-        title: final_doc.title,
-        created_at: final_doc.created_at,
+        url: format!("{base}/{slug}"),
+        slug: slug.clone(),
+        api_url: format!("{base}/api/v1/documents/{slug}"),
+        title: doc.title,
+        description: doc.description,
+        created_at: doc.created_at,
+        expires_at: doc.expires_at,
     };
 
-    (StatusCode::CREATED, Json(response)).into_response()
+    Ok((StatusCode::CREATED, Json(response)).into_response())
 }
 
-// ---------------------------------------------------------------------------
-// GET /:slug  (human view or raw depending on ?raw=1)
-// ---------------------------------------------------------------------------
+// ── PUT /api/v1/documents/:slug ──────────────────────────────────────────────
+
+/// Handle document update.
+pub async fn put_document(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    // Auth first
+    check_auth(&state, &headers).await?;
+
+    // Body validation
+    if body.is_empty() {
+        return Err(AppError::BadRequest("Request body must not be empty".to_string()));
+    }
+
+    let raw_content = std::str::from_utf8(&body)
+        .map_err(|_| AppError::BadRequest("Request body must be valid UTF-8".to_string()))?
+        .to_string();
+
+    // Check document exists and is not expired
+    let existing = state.db.get_by_slug(&slug)?
+        .ok_or(AppError::NotFound)?;
+
+    if is_expired(&existing) {
+        return Err(AppError::Gone);
+    }
+
+    // Parse frontmatter
+    let fm_result = extract_frontmatter(&raw_content)
+        .map_err(|e| AppError::BadRequest(e))?;
+
+    let meta = fm_result.meta.unwrap_or_default();
+    let body_text = &fm_result.body;
+
+    // Title: frontmatter > H1 > slug (slug from URL, NOT frontmatter)
+    let title = meta.title.unwrap_or_else(|| extract_title(body_text, &slug));
+
+    // Theme
+    let theme = meta.theme.unwrap_or_else(|| state.config.default_theme.clone());
+
+    // Expiry (can be added, changed, or removed on PUT)
+    let now = chrono_now();
+    let expires_at = match meta.expiry.as_deref() {
+        Some(exp) => {
+            let seconds = parse_expiry(exp)
+                .map_err(|e| AppError::BadRequest(e))?;
+            Some(add_seconds_to_now(&now, seconds))
+        }
+        None => None, // Remove expiry if not in frontmatter
+    };
+
+    // Password: update or clear
+    let password_hash = match meta.password.as_deref() {
+        Some(pw) if !pw.is_empty() => Some(hash_password(pw)?),
+        Some(_) => None, // empty password = clear
+        None => None,    // no password field = clear
+    };
+
+    let updated_doc = DocumentRecord {
+        id: existing.id,
+        slug: slug.clone(),
+        title: title.clone(),
+        raw_content,
+        theme,
+        password: password_hash,
+        description: meta.description.clone(),
+        created_at: existing.created_at.clone(),
+        expires_at: expires_at.clone(),
+        updated_at: now.clone(),
+    };
+
+    state.db.update_document(&slug, &updated_doc)?;
+
+    let base = state.config.base_url.trim_end_matches('/');
+    let response = CreateResponse {
+        url: format!("{base}/{slug}"),
+        slug: slug.clone(),
+        api_url: format!("{base}/api/v1/documents/{slug}"),
+        title: updated_doc.title,
+        description: updated_doc.description,
+        created_at: existing.created_at,
+        expires_at: updated_doc.expires_at,
+    };
+
+    Ok((StatusCode::OK, Json(response)).into_response())
+}
+
+// ── DELETE /api/v1/documents/:slug ───────────────────────────────────────────
+
+/// Handle document deletion.
+pub async fn delete_document(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    // Auth first
+    check_auth(&state, &headers).await?;
+
+    // Check document exists
+    let existing = state.db.get_by_slug(&slug)?
+        .ok_or(AppError::NotFound)?;
+
+    // Expired documents: still delete them (cleanup), return 204
+    // Non-expired: normal delete, return 204
+    let _ = is_expired(&existing); // We delete regardless
+
+    state.db.delete_by_slug(&slug)?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+// ── GET /:slug (human view) ──────────────────────────────────────────────────
 
 /// Handle human view and raw-shortcut view.
 ///
-/// Without `?raw=1`: renders the human corpus as HTML via Askama template.
-/// With `?raw=1`: returns the full raw source (identical to agent API endpoint).
+/// Without `?raw=1`: renders the human corpus as themed HTML.
+/// With `?raw=1`: returns the full raw source.
+/// Password-protected documents show a password prompt.
 pub async fn get_human(
     State(state): State<AppState>,
     Path(slug): Path<String>,
     Query(params): Query<SlugQuery>,
-) -> Response {
-    let doc = match state.db.get_by_slug(&slug) {
-        Ok(Some(d)) => d,
-        Ok(None) => return (StatusCode::NOT_FOUND, "Document not found").into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, slug = %slug, "DB error fetching document");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response();
-        }
-    };
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let doc = state.db.get_by_slug(&slug)?
+        .ok_or(AppError::NotFound)?;
 
-    // ?raw=1 → return full source, same as agent API
-    if params.raw.as_deref() == Some("1") {
-        return markdown_response(&doc.raw_content);
+    // Expiry check (410 takes priority over password)
+    if is_expired(&doc) {
+        return Err(AppError::Gone);
     }
 
-    // Human view: parse, render, template
-    let parse_result = parse_document(&doc.raw_content, &slug);
+    // Password check (if document is protected)
+    if doc.password.is_some() {
+        if !is_password_authed(&headers, &slug, &state.config.token) {
+            let template = PasswordTemplate { slug: &slug, error: None };
+            return Ok(Html(template.render().map_err(|e| {
+                AppError::Internal(format!("Template error: {e}"))
+            })?).into_response());
+        }
+    }
+
+    // ?raw=1 -> return full source
+    if params.raw.as_deref() == Some("1") {
+        return Ok(markdown_response(&doc.raw_content));
+    }
+
+    // Human view: extract body (strip frontmatter), parse markers, render
+    let fm_result = extract_frontmatter(&doc.raw_content)
+        .unwrap_or_else(|_| crate::parser::FrontmatterResult {
+            meta: None,
+            body: doc.raw_content.clone(),
+        });
+
+    let parse_result = parse_document(&fm_result.body, &slug);
     let rendered_html = render_markdown(&parse_result.human);
 
-    let template = DocumentTemplate {
-        title: &doc.title,
-        content: &rendered_html,
+    render_themed(&doc.title, &rendered_html, &doc.theme)
+}
+
+// ── POST /:slug/unlock ───────────────────────────────────────────────────────
+
+/// Handle password verification and cookie setting.
+pub async fn post_unlock(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+    Form(form): Form<UnlockForm>,
+) -> Result<Response, AppError> {
+    let doc = state.db.get_by_slug(&slug)?
+        .ok_or(AppError::NotFound)?;
+
+    if is_expired(&doc) {
+        return Err(AppError::Gone);
+    }
+
+    let stored_hash = match &doc.password {
+        Some(h) => h,
+        None => {
+            // No password — redirect to document
+            return Ok(Redirect::to(&format!("/{slug}")).into_response());
+        }
     };
 
-    match template.render() {
-        Ok(html) => Html(html).into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, "Template render error");
-            (StatusCode::INTERNAL_SERVER_ERROR, "Template error").into_response()
-        }
+    // Verify password
+    if verify_password(&form.password, stored_hash) {
+        // Set auth cookie and redirect
+        let cookie_value = make_auth_cookie(&slug, &state.config.token);
+        let cookie_header = format!(
+            "twofold_auth_{}={}; Path=/{}; HttpOnly; SameSite=Strict; Max-Age=3600",
+            slug, cookie_value, slug
+        );
+        Ok((
+            StatusCode::SEE_OTHER,
+            [
+                (axum::http::header::LOCATION, format!("/{slug}")),
+                (axum::http::header::SET_COOKIE, cookie_header),
+            ],
+            "",
+        ).into_response())
+    } else {
+        // Wrong password — show form again with error
+        let template = PasswordTemplate {
+            slug: &slug,
+            error: Some("Incorrect password"),
+        };
+        Ok(Html(template.render().map_err(|e| {
+            AppError::Internal(format!("Template error: {e}"))
+        })?).into_response())
     }
 }
 
-// ---------------------------------------------------------------------------
-// GET /api/v1/documents/:slug  (agent view — full raw markdown)
-// ---------------------------------------------------------------------------
+// ── GET /api/v1/documents/:slug (agent view) ─────────────────────────────────
 
 /// Return the full raw source markdown.
-///
-/// Content-Type: text/markdown; charset=utf-8
-/// Body: byte-for-byte identical to what was POSTed.
-pub async fn get_agent(State(state): State<AppState>, Path(slug): Path<String>) -> Response {
-    let doc = match state.db.get_by_slug(&slug) {
-        Ok(Some(d)) => d,
-        Ok(None) => return (StatusCode::NOT_FOUND, "Document not found").into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, slug = %slug, "DB error fetching document");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response();
-        }
-    };
+/// Agent view is NOT password-gated.
+pub async fn get_agent(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+) -> Result<Response, AppError> {
+    let doc = state.db.get_by_slug(&slug)?
+        .ok_or(AppError::NotFound)?;
 
-    markdown_response(&doc.raw_content)
+    if is_expired(&doc) {
+        return Err(AppError::Gone);
+    }
+
+    Ok(markdown_response(&doc.raw_content))
 }
 
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
+// ── Internal helpers ─────────────────────────────────────────────────────────
+
+/// Auth check: admin token (constant-time) OR managed token (argon2 verify).
+async fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
+    let provided = extract_bearer(headers)
+        .ok_or(AppError::Unauthorized)?;
+
+    // Check admin token first (constant-time)
+    if constant_time_eq(provided.as_bytes(), state.config.token.as_bytes()) {
+        return Ok(());
+    }
+
+    // Check managed tokens
+    let tokens = state.db.get_active_tokens()
+        .map_err(|_| AppError::Internal("Failed to check tokens".to_string()))?;
+
+    for token_record in &tokens {
+        if verify_password(provided, &token_record.hash) {
+            // Update last_used
+            let now = chrono_now();
+            let _ = state.db.touch_token(&token_record.id, &now);
+            return Ok(());
+        }
+    }
+
+    Err(AppError::Unauthorized)
+}
 
 /// Extract the Bearer token from the Authorization header.
-///
-/// Returns None if the header is absent or malformed.
 fn extract_bearer(headers: &HeaderMap) -> Option<&str> {
     let auth = headers.get("authorization")?.to_str().ok()?;
     auth.strip_prefix("Bearer ")
 }
 
-/// Build a `text/markdown; charset=utf-8` response from a string body.
+/// Build a `text/markdown; charset=utf-8` response.
 fn markdown_response(content: &str) -> Response {
     (
         StatusCode::OK,
@@ -257,75 +544,66 @@ fn markdown_response(content: &str) -> Response {
         .into_response()
 }
 
-/// Render markdown to HTML using comrak with GFM extensions enabled.
-///
-/// Structural decision: comrak Options created per call. Cost is stack allocation
-/// of a small struct — accepted because optimization would add complexity for no
-/// measurable gain at this scale.
+/// Render markdown to HTML using comrak with GFM extensions.
 fn render_markdown(source: &str) -> String {
     let mut options = Options::default();
-    // GFM extensions: tables, strikethrough, autolinks, task lists
     options.extension.table = true;
     options.extension.strikethrough = true;
     options.extension.autolink = true;
     options.extension.tasklist = true;
-    // Raw HTML passthrough enabled. XSS mitigated by:
-    //   (1) Bearer token auth limits publishers to trusted operators.
-    //   (2) CSP header (Content-Security-Policy: script-src 'none') blocks
-    //       script execution in the human view.
-    // If multi-user tokens are added in a future version, re-evaluate this
-    // setting — any authenticated publisher would then be able to inject
-    // arbitrary HTML visible to other users.
     options.render.unsafe_ = true;
     markdown_to_html(source, &options)
 }
 
-/// Return current UTC time as ISO 8601 string.
-///
-/// Uses std::time::SystemTime to avoid a chrono/time dependency.
-fn chrono_now() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+/// Render a themed HTML response.
+fn render_themed(title: &str, content: &str, theme: &str) -> Result<Response, AppError> {
+    let html = match theme {
+        "dark" => {
+            let t = DarkTemplate { title, content };
+            t.render()
+        }
+        "paper" => {
+            let t = PaperTemplate { title, content };
+            t.render()
+        }
+        "minimal" => {
+            let t = MinimalTemplate { title, content };
+            t.render()
+        }
+        _ => {
+            // "clean" or unknown -> default
+            let t = CleanTemplate { title, content };
+            t.render()
+        }
+    };
 
-    // Format as ISO 8601 UTC: YYYY-MM-DDTHH:MM:SSZ
-    // Manual formatting avoids pulling in chrono or time crate.
-    let s = secs;
-    let sec = s % 60;
-    let min = (s / 60) % 60;
-    let hour = (s / 3600) % 24;
-    let days = s / 86400;
-
-    // Days since epoch to calendar date (Gregorian proleptic)
-    let (year, month, day) = days_to_ymd(days);
-
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z")
+    html.map(|h| Html(h).into_response())
+        .map_err(|e| AppError::Internal(format!("Template render error: {e}")))
 }
 
-/// Convert days-since-Unix-epoch to (year, month, day).
-///
-/// Algorithm: Julian Day Number arithmetic. No unsafe. No external crates.
-fn days_to_ymd(days: u64) -> (u64, u64, u64) {
-    // Algorithm from https://www.researchgate.net/publication/316558298
-    // Richards (2013) civil calendar algorithm — public domain
-    let jdn = days + 2440588; // Unix epoch = JDN 2440588
-    let f = jdn + 1401 + (((4 * jdn + 274277) / 146097) * 3) / 4 - 38;
-    let e = 4 * f + 3;
-    let g = (e % 1461) / 4;
-    let h = 5 * g + 2;
-    let day = (h % 153) / 5 + 1;
-    let month = (h / 153 + 2) % 12 + 1;
-    let year = e / 1461 - 4716 + (14 - month) / 12;
-    (year, month, day)
+/// Check if a document has expired.
+fn is_expired(doc: &DocumentRecord) -> bool {
+    match &doc.expires_at {
+        Some(exp) => {
+            let now = chrono_now();
+            exp.as_str() < now.as_str()
+        }
+        None => false,
+    }
 }
 
-/// Constant-time byte comparison against the configured token.
-///
-/// Length mismatch returns false without ct_eq (one bit leak — token length
-/// is not secret). Equal-length pairs are compared via `subtle::ConstantTimeEq`,
-/// which folds across all bytes regardless of where the first mismatch occurs.
+/// Current UTC time as ISO 8601 string.
+pub fn chrono_now() -> String {
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+/// Add seconds to a timestamp string and return new ISO 8601 string.
+fn add_seconds_to_now(_now: &str, seconds: u64) -> String {
+    let future = chrono::Utc::now() + chrono::Duration::seconds(seconds as i64);
+    future.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+/// Constant-time byte comparison.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     use subtle::ConstantTimeEq;
     if a.len() != b.len() {
@@ -335,9 +613,6 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// Check whether a rusqlite error is a UNIQUE constraint violation.
-///
-/// Used for slug collision detection in post_document. Inspects the raw
-/// SQLite error code without requiring a custom DbError enum.
 fn is_unique_violation(e: &rusqlite::Error) -> bool {
     matches!(
         e,
@@ -345,35 +620,173 @@ fn is_unique_violation(e: &rusqlite::Error) -> bool {
     )
 }
 
+/// Hash a password with argon2.
+pub fn hash_password(password: &str) -> Result<String, AppError> {
+    use argon2::{Argon2, password_hash::{SaltString, PasswordHasher, rand_core::OsRng}};
+
+    let salt = SaltString::generate(&mut OsRng);
+    let argon2 = Argon2::default();
+    let hash = argon2
+        .hash_password(password.as_bytes(), &salt)
+        .map_err(|e| AppError::Internal(format!("Password hashing failed: {e}")))?;
+    Ok(hash.to_string())
+}
+
+/// Verify a password against an argon2 hash.
+pub fn verify_password(password: &str, hash: &str) -> bool {
+    use argon2::{Argon2, PasswordHash, PasswordVerifier};
+
+    let parsed = match PasswordHash::new(hash) {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+    Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .is_ok()
+}
+
+/// Generate an HMAC-based auth cookie value for a slug.
+fn make_auth_cookie(slug: &str, server_secret: &str) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    use base64::Engine;
+
+    let expiry = chrono::Utc::now() + chrono::Duration::hours(1);
+    let expiry_str = expiry.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+
+    let mut mac = Hmac::<Sha256>::new_from_slice(server_secret.as_bytes())
+        .expect("HMAC can take key of any size");
+    mac.update(slug.as_bytes());
+    mac.update(expiry_str.as_bytes());
+    let signature = mac.finalize().into_bytes();
+
+    let sig_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature);
+    format!("{}:{}", sig_b64, expiry_str)
+}
+
+/// Check if the request has a valid password auth cookie.
+fn is_password_authed(headers: &HeaderMap, slug: &str, server_secret: &str) -> bool {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    use base64::Engine;
+
+    let cookie_name = format!("twofold_auth_{}", slug);
+
+    let cookies = match headers.get("cookie").and_then(|v| v.to_str().ok()) {
+        Some(c) => c,
+        None => return false,
+    };
+
+    // Find our cookie in the cookie string
+    let cookie_value = cookies
+        .split(';')
+        .map(|s| s.trim())
+        .find_map(|pair| {
+            let mut parts = pair.splitn(2, '=');
+            let name = parts.next()?;
+            let value = parts.next()?;
+            if name == cookie_name { Some(value) } else { None }
+        });
+
+    let cookie_value = match cookie_value {
+        Some(v) => v,
+        None => return false,
+    };
+
+    // Parse "signature:expiry"
+    let mut parts = cookie_value.splitn(2, ':');
+    let sig_b64 = match parts.next() {
+        Some(s) => s,
+        None => return false,
+    };
+    let expiry_str = match parts.next() {
+        Some(s) => s,
+        None => return false,
+    };
+
+    // Check expiry
+    let now = chrono_now();
+    if expiry_str < now.as_str() {
+        return false; // expired cookie
+    }
+
+    // Verify HMAC
+    let mut mac = match Hmac::<Sha256>::new_from_slice(server_secret.as_bytes()) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    mac.update(slug.as_bytes());
+    mac.update(expiry_str.as_bytes());
+    let expected_sig = mac.finalize().into_bytes();
+
+    let provided_sig = match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(sig_b64) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    // Constant-time comparison of signatures
+    constant_time_eq(&provided_sig, &expected_sig)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::days_to_ymd;
+    use super::*;
 
     #[test]
-    fn days_to_ymd_epoch() {
-        // Day 0 = 1970-01-01 (Unix epoch)
-        assert_eq!(days_to_ymd(0), (1970, 1, 1));
+    fn test_is_expired_none() {
+        let doc = DocumentRecord {
+            id: "test".to_string(),
+            slug: "test".to_string(),
+            title: "Test".to_string(),
+            raw_content: "content".to_string(),
+            theme: "clean".to_string(),
+            password: None,
+            description: None,
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            expires_at: None,
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+        };
+        assert!(!is_expired(&doc));
     }
 
     #[test]
-    fn days_to_ymd_day_zero_is_epoch() {
-        // Explicit alias: day 0 is the epoch, same as above.
-        // Kept separate so the failure message is distinct.
-        let (y, m, d) = days_to_ymd(0);
-        assert_eq!((y, m, d), (1970, 1, 1), "day 0 must be 1970-01-01");
+    fn test_is_expired_past() {
+        let doc = DocumentRecord {
+            id: "test".to_string(),
+            slug: "test".to_string(),
+            title: "Test".to_string(),
+            raw_content: "content".to_string(),
+            theme: "clean".to_string(),
+            password: None,
+            description: None,
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            expires_at: Some("2020-01-01T00:00:00Z".to_string()),
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+        };
+        assert!(is_expired(&doc));
     }
 
     #[test]
-    fn days_to_ymd_known_recent_date() {
-        // 2024-03-15 = 19797 days since epoch
-        // Verified: (2024 - 1970) * 365 + leap days = 19797
-        assert_eq!(days_to_ymd(19797), (2024, 3, 15));
+    fn test_is_expired_future() {
+        let doc = DocumentRecord {
+            id: "test".to_string(),
+            slug: "test".to_string(),
+            title: "Test".to_string(),
+            raw_content: "content".to_string(),
+            theme: "clean".to_string(),
+            password: None,
+            description: None,
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            expires_at: Some("2099-01-01T00:00:00Z".to_string()),
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+        };
+        assert!(!is_expired(&doc));
     }
 
     #[test]
-    fn days_to_ymd_leap_year_feb29() {
-        // 2024 is a leap year. Feb 29, 2024 = day 19782.
-        // 2024-01-01 = 19723 days since epoch; Jan has 31 days, Feb 1 = 19754, Feb 29 = 19782.
-        assert_eq!(days_to_ymd(19782), (2024, 2, 29));
+    fn test_hash_and_verify_password() {
+        let hash = hash_password("hunter2").unwrap();
+        assert!(verify_password("hunter2", &hash));
+        assert!(!verify_password("wrong", &hash));
     }
 }

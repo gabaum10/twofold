@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ title }}</title>
+    <style>
+/* twofold — minimal theme
+   Ultra-sparse. No borders. Maximum whitespace. Almost brutalist.
+   Zero external requests. */
+
+:root {
+    --bg: #ffffff;
+    --fg: #111111;
+    --fg-secondary: #555555;
+    --fg-muted: #999999;
+    --border: #eeeeee;
+    --accent: #111111;
+    --link: #111111;
+    --link-hover: #555555;
+    --code-bg: #f7f7f7;
+    --code-fg: #333333;
+    --table-stripe: #fafafa;
+
+    --font-body: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    --font-heading: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Consolas, monospace;
+    --font-size: 1rem;
+    --line-height: 1.7;
+    --max-width: 600px;
+
+    --space-sm: 0.5rem;
+    --space-md: 1rem;
+    --space-lg: 2rem;
+    --space-xl: 3rem;
+    --space-xxl: 5rem;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --bg: #111111;
+        --fg: #eeeeee;
+        --fg-secondary: #aaaaaa;
+        --fg-muted: #666666;
+        --border: #333333;
+        --accent: #eeeeee;
+        --link: #eeeeee;
+        --link-hover: #aaaaaa;
+        --code-bg: #1a1a1a;
+        --code-fg: #cccccc;
+        --table-stripe: #161616;
+    }
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+html { font-size: 16px; }
+
+body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--font-body);
+    font-size: var(--font-size);
+    line-height: var(--line-height);
+    overflow-wrap: break-word;
+    -webkit-font-smoothing: antialiased;
+}
+
+main {
+    max-width: var(--max-width);
+    margin: 0 auto;
+    padding: var(--space-xxl) var(--space-lg);
+}
+
+h1, h2, h3, h4, h5, h6 {
+    font-family: var(--font-heading);
+    font-weight: 600;
+    line-height: 1.2;
+    color: var(--fg);
+    margin-bottom: var(--space-sm);
+}
+
+h1 {
+    font-size: 1.5rem;
+    margin-top: 0;
+    margin-bottom: var(--space-xl);
+    font-weight: 400;
+}
+
+h2 {
+    font-size: 1.125rem;
+    margin-top: var(--space-xl);
+    font-weight: 600;
+}
+
+h3 {
+    font-size: 1rem;
+    margin-top: var(--space-lg);
+    color: var(--fg-secondary);
+}
+
+h4, h5, h6 {
+    font-size: 0.875rem;
+    margin-top: var(--space-lg);
+    color: var(--fg-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+}
+
+p { margin: 0 0 var(--space-md); }
+
+strong { font-weight: 600; }
+
+a {
+    color: var(--link);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+}
+a:hover { color: var(--link-hover); }
+
+ul, ol { margin: 0 0 var(--space-md); padding-left: 1.2em; }
+li { margin: 0.2em 0; }
+
+blockquote {
+    margin: var(--space-lg) 0;
+    padding: 0 0 0 var(--space-lg);
+    border-left: none;
+    color: var(--fg-secondary);
+    font-style: italic;
+}
+blockquote p:last-child { margin-bottom: 0; }
+
+code {
+    font-family: var(--font-mono);
+    font-size: 0.85em;
+    background: var(--code-bg);
+    color: var(--code-fg);
+    padding: 0.1em 0.3em;
+    border-radius: 2px;
+}
+
+pre {
+    background: var(--code-bg);
+    padding: var(--space-md);
+    overflow-x: auto;
+    margin: var(--space-lg) 0;
+    border-radius: 2px;
+}
+
+pre code {
+    background: none;
+    padding: 0;
+    font-size: 0.8125rem;
+    line-height: 1.6;
+}
+
+table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: var(--space-lg) 0;
+    font-size: 0.875rem;
+}
+th {
+    padding: var(--space-sm) var(--space-md);
+    text-align: left;
+    font-weight: 600;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--fg-muted);
+    border-bottom: 1px solid var(--border);
+}
+td {
+    padding: var(--space-sm) var(--space-md);
+    border-bottom: 1px solid var(--border);
+}
+tbody tr:nth-child(even) { background: var(--table-stripe); }
+table { display: block; overflow-x: auto; }
+thead, tbody, tr, th, td { display: revert; }
+
+hr {
+    border: none;
+    height: 0;
+    margin: var(--space-xxl) 0;
+}
+
+img { max-width: 100%; height: auto; }
+
+footer {
+    max-width: var(--max-width);
+    margin: 0 auto;
+    padding: var(--space-xl) var(--space-lg);
+    text-align: center;
+}
+footer small {
+    color: var(--fg-muted);
+    font-size: 0.6875rem;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+}
+
+@media (max-width: 600px) {
+    main { padding: var(--space-xl) var(--space-md); }
+    h1 { font-size: 1.25rem; }
+}
+
+::selection {
+    background: rgba(0, 0, 0, 0.1);
+}
+@media (prefers-color-scheme: dark) {
+    ::selection { background: rgba(255, 255, 255, 0.15); }
+}
+    </style>
+</head>
+<body>
+    <main>
+        <article>
+            {{ content|safe }}
+        </article>
+    </main>
+    <footer>
+        <small>shared via twofold</small>
+    </footer>
+</body>
+</html>

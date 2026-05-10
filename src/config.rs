@@ -14,6 +14,10 @@ pub struct ServeConfig {
     pub base_url: String,
     /// Max request body size in bytes (TWOFOLD_MAX_SIZE — default: 1048576)
     pub max_size: usize,
+    /// Reaper interval in seconds (TWOFOLD_REAPER_INTERVAL — default: 60)
+    pub reaper_interval: u64,
+    /// Default theme when none specified (TWOFOLD_DEFAULT_THEME — default: clean)
+    pub default_theme: String,
 }
 
 impl ServeConfig {
@@ -48,12 +52,24 @@ impl ServeConfig {
             Err(_) => 1_048_576,
         };
 
+        let reaper_interval = match std::env::var("TWOFOLD_REAPER_INTERVAL") {
+            Ok(s) => s.parse::<u64>().map_err(|_| {
+                format!("TWOFOLD_REAPER_INTERVAL must be a positive integer, got: {s}")
+            })?,
+            Err(_) => 60,
+        };
+
+        let default_theme = std::env::var("TWOFOLD_DEFAULT_THEME")
+            .unwrap_or_else(|_| "clean".to_string());
+
         Ok(ServeConfig {
             token,
             bind,
             db_path,
             base_url,
             max_size,
+            reaper_interval,
+            default_theme,
         })
     }
 }

@@ -1,4 +1,4 @@
-use rusqlite::{Connection, Result};
+use rusqlite::{Connection, Result, params};
 use std::sync::{Arc, Mutex};
 
 /// A stored document record (maps 1:1 to the `documents` table row).
@@ -8,8 +8,23 @@ pub struct DocumentRecord {
     pub slug: String,
     pub title: String,
     pub raw_content: String,
-    pub created_at: String, // ISO 8601 UTC
+    pub theme: String,
+    pub password: Option<String>,   // argon2 hash, None = public
+    pub description: Option<String>,
+    pub created_at: String,         // ISO 8601 UTC
+    pub expires_at: Option<String>, // ISO 8601 UTC, None = no expiry
     pub updated_at: String,
+}
+
+/// A stored token record.
+#[derive(Debug, Clone)]
+pub struct TokenRecord {
+    pub id: String,
+    pub name: String,
+    pub hash: String,     // argon2 hash of the token
+    pub created_at: String,
+    pub last_used: Option<String>,
+    pub revoked: bool,
 }
 
 /// Thread-safe database handle.
@@ -24,20 +39,27 @@ pub struct Db {
 impl Db {
     /// Open or create the SQLite database at `path`, running schema initialization.
     ///
-    /// Uses rusqlite "bundled" feature — no external libsqlite3 required.
+    /// Enables WAL mode and sets busy_timeout for production concurrency.
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
+
+        // Production hardening: WAL mode for concurrent readers + busy_timeout
+        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+
         let db = Db {
             conn: Arc::new(Mutex::new(conn)),
         };
         db.initialize_schema()?;
+        db.migrate()?;
         Ok(db)
     }
 
-    /// Create the schema if it does not exist.
+    /// Create the base schema if it does not exist.
     ///
-    /// v0.1 schema: single `documents` table + slug index.
-    /// No migration system — schema is idempotent via IF NOT EXISTS.
+    /// For fresh databases: creates full v0.2 schema.
+    /// For existing databases: creates only missing tables (documents table
+    /// already exists from v0.1 — migration handles adding columns).
     fn initialize_schema(&self) -> Result<()> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         conn.execute_batch(
@@ -46,11 +68,62 @@ impl Db {
                 slug        TEXT UNIQUE NOT NULL,
                 title       TEXT NOT NULL,
                 raw_content TEXT NOT NULL,
+                theme       TEXT NOT NULL DEFAULT 'clean',
+                password    TEXT,
+                description TEXT,
                 created_at  TEXT NOT NULL,
+                expires_at  TEXT,
                 updated_at  TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_documents_slug ON documents(slug);",
+            CREATE INDEX IF NOT EXISTS idx_documents_slug ON documents(slug);
+
+            CREATE TABLE IF NOT EXISTS tokens (
+                id         TEXT PRIMARY KEY,
+                name       TEXT UNIQUE NOT NULL,
+                hash       TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                last_used  TEXT,
+                revoked    INTEGER NOT NULL DEFAULT 0
+            );",
         )?;
+        Ok(())
+    }
+
+    /// Migrate v0.1 databases to v0.2 schema.
+    ///
+    /// Uses PRAGMA table_info to check if columns exist before altering.
+    /// Safe to run on fresh databases (no-ops if columns already exist).
+    fn migrate(&self) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+
+        // Check which columns exist on documents table
+        let mut stmt = conn.prepare("PRAGMA table_info(documents)")?;
+        let columns: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt); // Release the statement before executing DDL
+
+        if !columns.contains(&"theme".to_string()) {
+            conn.execute_batch(
+                "ALTER TABLE documents ADD COLUMN theme TEXT NOT NULL DEFAULT 'clean';"
+            )?;
+        }
+        if !columns.contains(&"password".to_string()) {
+            conn.execute_batch("ALTER TABLE documents ADD COLUMN password TEXT;")?;
+        }
+        if !columns.contains(&"description".to_string()) {
+            conn.execute_batch("ALTER TABLE documents ADD COLUMN description TEXT;")?;
+        }
+        if !columns.contains(&"expires_at".to_string()) {
+            conn.execute_batch("ALTER TABLE documents ADD COLUMN expires_at TEXT;")?;
+        }
+
+        // Create expires_at index (safe now that column is guaranteed to exist)
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_documents_expires_at ON documents(expires_at);"
+        )?;
+
         Ok(())
     }
 
@@ -60,33 +133,66 @@ impl Db {
     pub fn insert_document(&self, doc: &DocumentRecord) -> Result<()> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         conn.execute(
-            "INSERT INTO documents (id, slug, title, raw_content, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![
+            "INSERT INTO documents (id, slug, title, raw_content, theme, password, description, created_at, expires_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
                 doc.id,
                 doc.slug,
                 doc.title,
                 doc.raw_content,
+                doc.theme,
+                doc.password,
+                doc.description,
                 doc.created_at,
+                doc.expires_at,
                 doc.updated_at,
             ],
         )?;
         Ok(())
     }
 
+    /// Update an existing document by slug.
+    pub fn update_document(&self, slug: &str, doc: &DocumentRecord) -> Result<bool> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let rows = conn.execute(
+            "UPDATE documents SET title = ?1, raw_content = ?2, theme = ?3, password = ?4,
+             description = ?5, expires_at = ?6, updated_at = ?7
+             WHERE slug = ?8",
+            params![
+                doc.title,
+                doc.raw_content,
+                doc.theme,
+                doc.password,
+                doc.description,
+                doc.expires_at,
+                doc.updated_at,
+                slug,
+            ],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Delete a document by slug. Returns true if a row was deleted.
+    pub fn delete_by_slug(&self, slug: &str) -> Result<bool> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let rows = conn.execute(
+            "DELETE FROM documents WHERE slug = ?1",
+            params![slug],
+        )?;
+        Ok(rows > 0)
+    }
+
     /// Fetch a document by slug.
     ///
     /// Returns Ok(None) if no row matches the slug (caller maps to 404).
-    /// Returns Ok(Some(DocumentRecord)) on success.
-    /// Returns Err on database error.
     pub fn get_by_slug(&self, slug: &str) -> Result<Option<DocumentRecord>> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let mut stmt = conn.prepare(
-            "SELECT id, slug, title, raw_content, created_at, updated_at
+            "SELECT id, slug, title, raw_content, theme, password, description, created_at, expires_at, updated_at
              FROM documents WHERE slug = ?1",
         )?;
 
-        let mut rows = stmt.query(rusqlite::params![slug])?;
+        let mut rows = stmt.query(params![slug])?;
         match rows.next()? {
             None => Ok(None),
             Some(row) => Ok(Some(DocumentRecord {
@@ -94,9 +200,119 @@ impl Db {
                 slug: row.get(1)?,
                 title: row.get(2)?,
                 raw_content: row.get(3)?,
-                created_at: row.get(4)?,
-                updated_at: row.get(5)?,
+                theme: row.get(4)?,
+                password: row.get(5)?,
+                description: row.get(6)?,
+                created_at: row.get(7)?,
+                expires_at: row.get(8)?,
+                updated_at: row.get(9)?,
             })),
         }
+    }
+
+    /// Delete all expired documents. Returns count of deleted rows.
+    pub fn delete_expired(&self, now: &str) -> Result<usize> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let rows = conn.execute(
+            "DELETE FROM documents WHERE expires_at IS NOT NULL AND expires_at < ?1",
+            params![now],
+        )?;
+        Ok(rows)
+    }
+
+    // ── Token operations ─────────────────────────────────────────────────────
+
+    /// Insert a new token record.
+    pub fn insert_token(&self, token: &TokenRecord) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            "INSERT INTO tokens (id, name, hash, created_at, last_used, revoked)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                token.id,
+                token.name,
+                token.hash,
+                token.created_at,
+                token.last_used,
+                token.revoked as i32,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get all non-revoked token hashes for auth verification.
+    pub fn get_active_tokens(&self) -> Result<Vec<TokenRecord>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT id, name, hash, created_at, last_used, revoked
+             FROM tokens WHERE revoked = 0",
+        )?;
+        let tokens = stmt
+            .query_map([], |row| {
+                Ok(TokenRecord {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    hash: row.get(2)?,
+                    created_at: row.get(3)?,
+                    last_used: row.get(4)?,
+                    revoked: row.get::<_, i32>(5)? != 0,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(tokens)
+    }
+
+    /// List all tokens (for CLI display).
+    pub fn list_tokens(&self) -> Result<Vec<TokenRecord>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT id, name, hash, created_at, last_used, revoked
+             FROM tokens ORDER BY created_at DESC",
+        )?;
+        let tokens = stmt
+            .query_map([], |row| {
+                Ok(TokenRecord {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    hash: row.get(2)?,
+                    created_at: row.get(3)?,
+                    last_used: row.get(4)?,
+                    revoked: row.get::<_, i32>(5)? != 0,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(tokens)
+    }
+
+    /// Revoke a token by name. Returns true if a row was updated.
+    pub fn revoke_token(&self, name: &str) -> Result<bool> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let rows = conn.execute(
+            "UPDATE tokens SET revoked = 1 WHERE name = ?1 AND revoked = 0",
+            params![name],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Update last_used timestamp for a token.
+    pub fn touch_token(&self, id: &str, now: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            "UPDATE tokens SET last_used = ?1 WHERE id = ?2",
+            params![now, id],
+        )?;
+        Ok(())
+    }
+
+    /// Check if a token name already exists.
+    pub fn token_name_exists(&self, name: &str) -> Result<bool> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT COUNT(*) FROM tokens WHERE name = ?1",
+        )?;
+        let count: i64 = stmt.query_row(params![name], |row| row.get(0))?;
+        Ok(count > 0)
     }
 }

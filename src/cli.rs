@@ -21,6 +21,8 @@ pub enum Commands {
     ///   TWOFOLD_DB_PATH (optional) SQLite path (default: ./twofold.db)
     ///   TWOFOLD_BASE_URL (optional) Base URL (default: http://localhost:3000)
     ///   TWOFOLD_MAX_SIZE (optional) Max body bytes (default: 1048576)
+    ///   TWOFOLD_REAPER_INTERVAL (optional) Reaper interval seconds (default: 60)
+    ///   TWOFOLD_DEFAULT_THEME (optional) Default theme (default: clean)
     Serve,
 
     /// Publish a markdown document to a twofold server.
@@ -28,6 +30,9 @@ pub enum Commands {
     /// Reads the file at PATH (or stdin if PATH is `-`) and POSTs it to the
     /// server. Prints the resulting URL to stdout on success. Exits 1 on failure.
     Publish(PublishArgs),
+
+    /// Manage API tokens.
+    Token(TokenArgs),
 }
 
 /// Arguments for the `publish` subcommand.
@@ -44,4 +49,44 @@ pub struct PublishArgs {
     /// Defaults to the TWOFOLD_TOKEN environment variable.
     #[arg(long)]
     pub token: Option<String>,
+}
+
+/// Arguments for the `token` subcommand.
+#[derive(clap::Args, Debug)]
+pub struct TokenArgs {
+    #[command(subcommand)]
+    pub action: TokenAction,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TokenAction {
+    /// Create a new API token.
+    Create {
+        /// Human-readable name for the token.
+        #[arg(long)]
+        name: String,
+
+        /// Path to the SQLite database.
+        /// Defaults to TWOFOLD_DB_PATH or ./twofold.db.
+        #[arg(long)]
+        db: Option<String>,
+    },
+
+    /// List all tokens.
+    List {
+        /// Path to the SQLite database.
+        #[arg(long)]
+        db: Option<String>,
+    },
+
+    /// Revoke a token by name.
+    Revoke {
+        /// Name of the token to revoke.
+        #[arg(long)]
+        name: String,
+
+        /// Path to the SQLite database.
+        #[arg(long)]
+        db: Option<String>,
+    },
 }

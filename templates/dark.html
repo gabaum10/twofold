@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ title }}</title>
+    <style>
+/* twofold — dark theme
+   Always dark. Higher contrast. Monospace headings. Terminal energy.
+   Zero external requests. */
+
+:root {
+    --bg: #0d0d0d;
+    --bg-subtle: #1a1a1a;
+    --fg: #e0e0e0;
+    --fg-secondary: #a0a0a0;
+    --fg-muted: #666666;
+    --border: #2a2a2a;
+    --border-strong: #444444;
+    --accent: #00cc88;
+    --accent-hover: #00ffaa;
+    --link: #5599dd;
+    --link-visited: #8877bb;
+    --link-hover: #77bbff;
+    --code-bg: #1a1a1a;
+    --code-border: #333333;
+    --code-fg: #cccccc;
+    --mark-bg: #334400;
+    --table-stripe: #141414;
+    --shadow: rgba(0, 0, 0, 0.4);
+
+    --font-body: 'SF Mono', ui-monospace, SFMono-Regular, Consolas, 'Liberation Mono', Menlo, monospace;
+    --font-heading: 'SF Mono', ui-monospace, SFMono-Regular, Consolas, 'Liberation Mono', Menlo, monospace;
+    --font-mono: 'SF Mono', ui-monospace, SFMono-Regular, Consolas, 'Liberation Mono', Menlo, monospace;
+    --font-size: 0.9375rem;
+    --line-height: 1.7;
+    --max-width: 720px;
+
+    --space-xs: 0.25rem;
+    --space-sm: 0.5rem;
+    --space-md: 1rem;
+    --space-lg: 1.75rem;
+    --space-xl: 2.5rem;
+    --space-xxl: 4rem;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html {
+    font-size: 16px;
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+}
+
+body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--font-body);
+    font-size: var(--font-size);
+    line-height: var(--line-height);
+    overflow-wrap: break-word;
+}
+
+main {
+    max-width: var(--max-width);
+    margin: 0 auto;
+    padding: var(--space-xxl) var(--space-lg);
+}
+
+h1, h2, h3, h4, h5, h6 {
+    font-family: var(--font-heading);
+    font-weight: 700;
+    line-height: 1.2;
+    color: var(--accent);
+    margin-bottom: var(--space-sm);
+}
+
+h1 {
+    font-size: 1.75rem;
+    margin-top: 0;
+    margin-bottom: var(--space-lg);
+    border-bottom: 2px solid var(--accent);
+    padding-bottom: var(--space-sm);
+}
+
+h2 {
+    font-size: 1.25rem;
+    margin-top: var(--space-xxl);
+    color: var(--fg);
+}
+
+h3 {
+    font-size: 1.0625rem;
+    margin-top: var(--space-xl);
+    color: var(--fg-secondary);
+}
+
+h4, h5, h6 {
+    font-size: var(--font-size);
+    margin-top: var(--space-lg);
+    color: var(--fg-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+}
+
+p { margin: 0 0 var(--space-md); }
+
+a {
+    color: var(--link);
+    text-decoration: none;
+    border-bottom: 1px solid transparent;
+    transition: border-color 0.15s;
+}
+a:visited { color: var(--link-visited); }
+a:hover { border-bottom-color: var(--link-hover); color: var(--link-hover); }
+
+ul, ol { margin: 0 0 var(--space-md); padding-left: 1.5em; }
+li { margin: 0.3em 0; }
+
+blockquote {
+    margin: var(--space-lg) 0;
+    padding: var(--space-sm) var(--space-lg);
+    border-left: 3px solid var(--accent);
+    background: var(--bg-subtle);
+    color: var(--fg-secondary);
+}
+blockquote p:last-child { margin-bottom: 0; }
+
+code {
+    font-family: var(--font-mono);
+    font-size: 0.9em;
+    background: var(--code-bg);
+    color: var(--accent);
+    border: 1px solid var(--code-border);
+    border-radius: 3px;
+    padding: 0.1em 0.3em;
+}
+
+pre {
+    background: var(--code-bg);
+    border: 1px solid var(--code-border);
+    border-radius: 4px;
+    padding: var(--space-md);
+    overflow-x: auto;
+    margin: 0 0 var(--space-lg);
+}
+
+pre code {
+    background: none;
+    border: none;
+    padding: 0;
+    color: var(--code-fg);
+    font-size: 0.85rem;
+    line-height: 1.6;
+}
+
+table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: var(--space-lg) 0;
+    font-size: 0.85rem;
+}
+thead { border-bottom: 2px solid var(--accent); }
+th {
+    padding: var(--space-sm) var(--space-md);
+    text-align: left;
+    font-weight: 700;
+    color: var(--accent);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-size: 0.75rem;
+}
+td {
+    padding: var(--space-sm) var(--space-md);
+    border-bottom: 1px solid var(--border);
+}
+tbody tr:nth-child(even) { background: var(--table-stripe); }
+table { display: block; overflow-x: auto; }
+thead, tbody, tr, th, td { display: revert; }
+
+hr {
+    border: none;
+    height: 1px;
+    background: var(--border-strong);
+    margin: var(--space-xxl) 0;
+}
+
+img { max-width: 100%; height: auto; border-radius: 3px; }
+
+footer {
+    max-width: var(--max-width);
+    margin: 0 auto;
+    padding: var(--space-lg);
+    text-align: center;
+}
+footer::before {
+    content: "";
+    display: block;
+    width: 2rem;
+    height: 1px;
+    background: var(--border);
+    margin: 0 auto var(--space-lg);
+}
+footer small {
+    color: var(--fg-muted);
+    font-size: 0.75rem;
+    font-family: var(--font-mono);
+}
+
+@media (max-width: 600px) {
+    :root { --font-size: 0.875rem; }
+    main { padding: var(--space-xl) var(--space-md); }
+    h1 { font-size: 1.4rem; }
+}
+
+::selection {
+    background: rgba(0, 204, 136, 0.3);
+    color: var(--fg);
+}
+    </style>
+</head>
+<body>
+    <main>
+        <article>
+            {{ content|safe }}
+        </article>
+    </main>
+    <footer>
+        <small>shared via twofold</small>
+    </footer>
+</body>
+</html>
