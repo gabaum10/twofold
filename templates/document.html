@@ -726,6 +726,9 @@ footer small a:hover {
                 <button class="doc-btn" id="btn-copy-url" title="Copy link to clipboard">
                     Copy link
                 </button>
+                <button class="doc-btn" id="btn-copy-md" title="Copy markdown source to clipboard">
+                    Copy markdown
+                </button>
                 <a class="doc-btn" id="btn-view-raw" href="#" title="View raw markdown source">
                     View raw
                 </a>
@@ -786,6 +789,20 @@ footer small a:hover {
             }).catch(function () {
                 showToast('Copy failed');
             });
+        });
+
+        document.getElementById('btn-copy-md').addEventListener('click', function () {
+            fetch('/' + slug + '?raw=1')
+                .then(function (r) { return r.text(); })
+                .then(function (text) {
+                    return navigator.clipboard.writeText(text);
+                })
+                .then(function () {
+                    showToast('Copied markdown!');
+                })
+                .catch(function () {
+                    showToast('Copy failed');
+                });
         });
     })();
     </script>

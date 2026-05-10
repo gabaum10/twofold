@@ -230,16 +230,140 @@ footer small a:hover {
 @media (prefers-color-scheme: dark) {
     ::selection { background: rgba(255, 255, 255, 0.15); }
 }
+
+.doc-toolbar {
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    gap: 0.4rem;
+    margin-bottom: var(--space-lg);
+    flex-wrap: wrap;
+}
+
+.doc-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25em;
+    padding: 0.2em 0.65em;
+    font-family: var(--font-heading);
+    font-size: 0.75rem;
+    font-weight: 450;
+    color: var(--fg-muted);
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    cursor: pointer;
+    text-decoration: none;
+    transition: color 0.15s ease, border-color 0.15s ease;
+    letter-spacing: 0.01em;
+    white-space: nowrap;
+    line-height: 1.6;
+}
+
+.doc-btn:hover {
+    color: var(--fg-secondary);
+    text-decoration: none;
+}
+
+.doc-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+.doc-toast {
+    position: fixed;
+    bottom: var(--space-lg);
+    right: var(--space-lg);
+    padding: 0.4em 0.85em;
+    background: var(--fg);
+    color: var(--bg);
+    font-family: var(--font-heading);
+    font-size: 0.8rem;
+    border-radius: 5px;
+    pointer-events: none;
+    opacity: 0;
+    transform: translateY(6px);
+    transition: opacity 0.18s ease, transform 0.18s ease;
+    z-index: 9999;
+}
+
+.doc-toast.doc-toast--visible {
+    opacity: 1;
+    transform: translateY(0);
+}
+
+@media print {
+    .doc-toolbar, .doc-toast { display: none; }
+}
     </style>
 </head>
 <body>
     <main>
         <article>
+            <div class="doc-toolbar">
+                <button class="doc-btn" id="btn-copy-url" title="Copy link to clipboard">
+                    Copy link
+                </button>
+                <button class="doc-btn" id="btn-copy-md" title="Copy markdown source to clipboard">
+                    Copy markdown
+                </button>
+                <a class="doc-btn" id="btn-view-raw" href="#" title="View raw markdown source">
+                    View raw
+                </a>
+            </div>
             {{ content|safe }}
         </article>
     </main>
     <footer>
         <small>shared via <a href="https://github.com/gabaum10/twofold">twofold</a></small>
     </footer>
+
+    <div class="doc-toast" id="doc-toast" aria-live="polite"></div>
+
+    <script>
+    (function () {
+        'use strict';
+
+        var toast = document.getElementById('doc-toast');
+        var toastTimer = null;
+
+        function showToast(msg) {
+            if (toastTimer) clearTimeout(toastTimer);
+            toast.textContent = msg;
+            toast.classList.add('doc-toast--visible');
+            toastTimer = setTimeout(function () {
+                toast.classList.remove('doc-toast--visible');
+            }, 2000);
+        }
+
+        var pathParts = window.location.pathname.replace(/^\//, '').split('/');
+        var slug = pathParts[0];
+        var rawUrl = window.location.origin + '/' + slug + '?raw=1';
+
+        document.getElementById('btn-view-raw').href = rawUrl;
+
+        document.getElementById('btn-copy-url').addEventListener('click', function () {
+            navigator.clipboard.writeText(window.location.href).then(function () {
+                showToast('Copied!');
+            }).catch(function () {
+                showToast('Copy failed');
+            });
+        });
+
+        document.getElementById('btn-copy-md').addEventListener('click', function () {
+            fetch('/' + slug + '?raw=1')
+                .then(function (r) { return r.text(); })
+                .then(function (text) {
+                    return navigator.clipboard.writeText(text);
+                })
+                .then(function () {
+                    showToast('Copied markdown!');
+                })
+                .catch(function () {
+                    showToast('Copy failed');
+                });
+        });
+    })();
+    </script>
 </body>
 </html>
