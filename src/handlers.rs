@@ -14,7 +14,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     config::ServeConfig,
     db::{Db, DocumentRecord},
+    highlight,
     parser::{extract_frontmatter, extract_title, parse_document, parse_expiry, validate_slug},
+    webhook,
 };
 
 /// URL-safe slug alphabet: alphanumeric + hyphen.
@@ -155,6 +157,22 @@ pub struct UnlockForm {
     pub password: String,
 }
 
+/// Query parameters for GET /api/v1/documents (list)
+#[derive(Deserialize)]
+pub struct ListQuery {
+    pub limit: Option<u32>,
+    pub offset: Option<u32>,
+}
+
+/// JSON response body for the list endpoint.
+#[derive(Serialize)]
+pub struct ListResponse {
+    pub documents: Vec<crate::db::DocumentSummary>,
+    pub total: u64,
+    pub limit: u32,
+    pub offset: u32,
+}
+
 // ── POST /api/v1/documents ───────────────────────────────────────────────────
 
 /// Handle document creation.
@@ -274,11 +292,28 @@ pub async fn post_document(
         url: format!("{base}/{slug}"),
         slug: slug.clone(),
         api_url: format!("{base}/api/v1/documents/{slug}"),
-        title: doc.title,
-        description: doc.description,
-        created_at: doc.created_at,
-        expires_at: doc.expires_at,
+        title: doc.title.clone(),
+        description: doc.description.clone(),
+        created_at: doc.created_at.clone(),
+        expires_at: doc.expires_at.clone(),
     };
+
+    // Dispatch webhook fire-and-forget AFTER building response.
+    // Webhook failure never affects the 201 response.
+    if let Some(ref wh_url) = state.config.webhook_url {
+        webhook::dispatch_webhook(
+            wh_url.clone(),
+            state.config.webhook_secret.clone(),
+            "document.created",
+            now,
+            webhook::WebhookDocument {
+                slug: slug.clone(),
+                title: doc.title.clone(),
+                url: response.url.clone(),
+                api_url: response.api_url.clone(),
+            },
+        );
+    }
 
     Ok((StatusCode::CREATED, Json(response)).into_response())
 }
@@ -363,11 +398,27 @@ pub async fn put_document(
         url: format!("{base}/{slug}"),
         slug: slug.clone(),
         api_url: format!("{base}/api/v1/documents/{slug}"),
-        title: updated_doc.title,
-        description: updated_doc.description,
+        title: updated_doc.title.clone(),
+        description: updated_doc.description.clone(),
         created_at: existing.created_at,
-        expires_at: updated_doc.expires_at,
+        expires_at: updated_doc.expires_at.clone(),
     };
+
+    // Webhook: document.updated
+    if let Some(ref wh_url) = state.config.webhook_url {
+        webhook::dispatch_webhook(
+            wh_url.clone(),
+            state.config.webhook_secret.clone(),
+            "document.updated",
+            now,
+            webhook::WebhookDocument {
+                slug: slug.clone(),
+                title: updated_doc.title.clone(),
+                url: response.url.clone(),
+                api_url: response.api_url.clone(),
+            },
+        );
+    }
 
     Ok((StatusCode::OK, Json(response)).into_response())
 }
@@ -383,16 +434,109 @@ pub async fn delete_document(
     // Auth first
     check_auth(&state, &headers).await?;
 
-    // Check document exists
+    // Check document exists — capture title/slug for webhook before delete.
     let existing = state.db.get_by_slug(&slug)?
         .ok_or(AppError::NotFound)?;
 
     // Expired documents: still delete them (cleanup), return 204
-    // Non-expired: normal delete, return 204
-    let _ = is_expired(&existing); // We delete regardless
+    // Non-expired: normal delete, return 204.
+    // We delete regardless of expiry status.
 
     state.db.delete_by_slug(&slug)?;
+
+    // Webhook: document.deleted — dispatched after successful delete.
+    // Metadata captured from existing record before deletion.
+    if let Some(ref wh_url) = state.config.webhook_url {
+        let base = state.config.base_url.trim_end_matches('/');
+        let now = chrono_now();
+        webhook::dispatch_webhook(
+            wh_url.clone(),
+            state.config.webhook_secret.clone(),
+            "document.deleted",
+            now,
+            webhook::WebhookDocument {
+                slug: existing.slug.clone(),
+                title: existing.title.clone(),
+                url: format!("{base}/{}", existing.slug),
+                api_url: format!("{base}/api/v1/documents/{}", existing.slug),
+            },
+        );
+    }
+
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+// ── GET /api/v1/documents (list) ─────────────────────────────────────────────
+
+/// List documents with pagination.
+///
+/// Requires bearer auth. Does NOT return raw_content.
+/// Limit capped at 100 server-side; offset must be >=0 (enforced by type u32).
+/// Expired documents excluded at SQL level.
+pub async fn list_documents(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<ListQuery>,
+) -> Result<Response, AppError> {
+    check_auth(&state, &headers).await?;
+
+    // Default limit 20, max 100. Cap is enforced in db::list_documents.
+    let limit = params.limit.unwrap_or(20);
+    let offset = params.offset.unwrap_or(0);
+
+    let (documents, total) = state.db.list_documents(limit, offset)
+        .map_err(AppError::from)?;
+
+    // Report the effective (capped) limit in the response.
+    let effective_limit = limit.min(100);
+
+    Ok(Json(ListResponse {
+        documents,
+        total,
+        limit: effective_limit,
+        offset,
+    }).into_response())
+}
+
+// ── GET /api/v1/openapi.yaml ─────────────────────────────────────────────────
+
+/// Serve the OpenAPI spec as YAML.
+///
+/// Content included at compile time via include_str! — no runtime file I/O,
+/// no startup panic if file is missing (compile error instead).
+pub async fn serve_openapi_yaml() -> impl IntoResponse {
+    // include_str! embeds the file at compile time. The path is relative to src/.
+    let yaml = include_str!("../docs/openapi.yaml");
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/yaml; charset=utf-8")],
+        yaml,
+    )
+}
+
+/// Serve the OpenAPI spec as JSON.
+///
+/// Converted from YAML at first call, cached via OnceLock.
+/// serde_yaml → serde_json at startup eliminates repeated conversion cost.
+pub async fn serve_openapi_json() -> impl IntoResponse {
+    use std::sync::OnceLock;
+    static OPENAPI_JSON: OnceLock<String> = OnceLock::new();
+
+    let json = OPENAPI_JSON.get_or_init(|| {
+        let yaml = include_str!("../docs/openapi.yaml");
+        match serde_yaml::from_str::<serde_json::Value>(yaml) {
+            Ok(val) => serde_json::to_string(&val).unwrap_or_else(|e| {
+                format!("{{\"error\":\"JSON serialization failed: {e}\"}}")
+            }),
+            Err(e) => format!("{{\"error\":\"YAML parse failed: {e}\"}}"),
+        }
+    });
+
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json; charset=utf-8")],
+        json.as_str(),
+    )
 }
 
 // ── GET /:slug (human view) ──────────────────────────────────────────────────
@@ -431,17 +575,34 @@ pub async fn get_human(
         return Ok(markdown_response(&doc.raw_content));
     }
 
-    // Human view: extract body (strip frontmatter), parse markers, render
-    let fm_result = extract_frontmatter(&doc.raw_content)
-        .unwrap_or_else(|_| crate::parser::FrontmatterResult {
-            meta: None,
-            body: doc.raw_content.clone(),
-        });
+    // Human view: extract body (strip frontmatter), parse markers, render.
+    //
+    // Rendering is moved to spawn_blocking because syntect's syntax highlighting
+    // can use significant stack depth during the first load (OnceLock init) and
+    // during regex-based tokenization. Release builds with LTO can optimize away
+    // stack frames but still require deep call chains. spawn_blocking runs on a
+    // dedicated thread pool with larger stacks, avoiding stack overflow in the
+    // async worker thread.
+    let raw_content = doc.raw_content.clone();
+    let title = doc.title.clone();
+    let theme = doc.theme.clone();
+    let slug_owned = slug.clone();
 
-    let parse_result = parse_document(&fm_result.body, &slug);
-    let rendered_html = render_markdown(&parse_result.human);
+    let html_result = tokio::task::spawn_blocking(move || {
+        let fm_result = extract_frontmatter(&raw_content)
+            .unwrap_or_else(|_| crate::parser::FrontmatterResult {
+                meta: None,
+                body: raw_content.clone(),
+            });
 
-    render_themed(&doc.title, &rendered_html, &slug, &doc.theme, false)
+        let parse_result = parse_document(&fm_result.body, &slug_owned);
+        let rendered_html = render_markdown(&parse_result.human);
+        render_themed_sync(&title, &rendered_html, &slug_owned, &theme, false)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("Render task failed: {e}")))?;
+
+    html_result
 }
 
 // ── POST /:slug/unlock ───────────────────────────────────────────────────────
@@ -524,17 +685,27 @@ pub async fn get_full(
         }
     }
 
-    // Strip frontmatter, then strip marker comment lines (keep content), render full
-    let fm_result = extract_frontmatter(&doc.raw_content)
-        .unwrap_or_else(|_| crate::parser::FrontmatterResult {
-            meta: None,
-            body: doc.raw_content.clone(),
-        });
+    // Same spawn_blocking pattern as get_human — syntect needs a larger stack.
+    let raw_content = doc.raw_content.clone();
+    let title = doc.title.clone();
+    let theme = doc.theme.clone();
+    let slug_owned = slug.clone();
 
-    let stripped = strip_marker_comments(&fm_result.body);
-    let rendered_html = render_markdown(&stripped);
+    let html_result = tokio::task::spawn_blocking(move || {
+        let fm_result = extract_frontmatter(&raw_content)
+            .unwrap_or_else(|_| crate::parser::FrontmatterResult {
+                meta: None,
+                body: raw_content.clone(),
+            });
 
-    render_themed(&doc.title, &rendered_html, &slug, &doc.theme, true)
+        let stripped = strip_marker_comments(&fm_result.body);
+        let rendered_html = render_markdown(&stripped);
+        render_themed_sync(&title, &rendered_html, &slug_owned, &theme, true)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("Render task failed: {e}")))?;
+
+    html_result
 }
 
 // ── GET /api/v1/documents/:slug (agent view) ─────────────────────────────────
@@ -667,31 +838,43 @@ fn render_markdown(source: &str) -> String {
     markdown_to_html(source, &options)
 }
 
-/// Render a themed HTML response.
+/// Render a themed HTML response with syntax highlighting.
 ///
 /// `full_view`: when true, the clean-theme toolbar shows "Summary view" instead of "Full detail".
 /// Has no effect on themes that don't render a toolbar.
-fn render_themed(title: &str, content: &str, slug: &str, theme: &str, full_view: bool) -> Result<Response, AppError> {
+///
+/// `content` is already-rendered HTML from comrak. Syntax highlighting post-processes
+/// this HTML, finding <pre><code class="language-X"> blocks and replacing them with
+/// syntect-highlighted spans. Dark theme uses dark syntax palette; all others use light.
+///
+/// Named `_sync` because it is called from `spawn_blocking` contexts (not directly from async).
+/// This avoids stack overflow in async worker threads during syntect init/tokenization.
+fn render_themed_sync(title: &str, content: &str, slug: &str, theme: &str, full_view: bool) -> Result<Response, AppError> {
+    // Apply syntax highlighting to the pre-rendered HTML.
+    // Dark theme gets dark syntax palette; all others get light.
+    let is_dark = theme == "dark";
+    let highlighted = highlight::apply_syntax_highlighting(content, is_dark);
+
     let html = match theme {
         "dark" => {
-            let t = DarkTemplate { title, content, slug };
+            let t = DarkTemplate { title, content: &highlighted, slug };
             t.render()
         }
         "paper" => {
-            let t = PaperTemplate { title, content, slug };
+            let t = PaperTemplate { title, content: &highlighted, slug };
             t.render()
         }
         "minimal" => {
-            let t = MinimalTemplate { title, content, slug };
+            let t = MinimalTemplate { title, content: &highlighted, slug };
             t.render()
         }
         "hearth" => {
-            let t = HearthTemplate { title, content, slug, full_view };
+            let t = HearthTemplate { title, content: &highlighted, slug, full_view };
             t.render()
         }
         _ => {
             // "clean" or unknown -> default
-            let t = CleanTemplate { title, content, slug, full_view };
+            let t = CleanTemplate { title, content: &highlighted, slug, full_view };
             t.render()
         }
     };

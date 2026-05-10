@@ -18,6 +18,10 @@ pub struct ServeConfig {
     pub reaper_interval: u64,
     /// Default theme when none specified (TWOFOLD_DEFAULT_THEME — default: clean)
     pub default_theme: String,
+    /// Webhook endpoint URL (TWOFOLD_WEBHOOK_URL — optional, no webhook if unset)
+    pub webhook_url: Option<String>,
+    /// HMAC-SHA256 signing secret for webhooks (TWOFOLD_WEBHOOK_SECRET — optional)
+    pub webhook_secret: Option<String>,
 }
 
 impl ServeConfig {
@@ -62,6 +66,15 @@ impl ServeConfig {
         let default_theme = std::env::var("TWOFOLD_DEFAULT_THEME")
             .unwrap_or_else(|_| "clean".to_string());
 
+        // Webhook configuration — both are optional. No webhook fired if URL is unset.
+        let webhook_url = std::env::var("TWOFOLD_WEBHOOK_URL")
+            .ok()
+            .and_then(|s| if s.is_empty() { None } else { Some(s) });
+
+        let webhook_secret = std::env::var("TWOFOLD_WEBHOOK_SECRET")
+            .ok()
+            .and_then(|s| if s.is_empty() { None } else { Some(s) });
+
         Ok(ServeConfig {
             token,
             bind,
@@ -70,6 +83,8 @@ impl ServeConfig {
             max_size,
             reaper_interval,
             default_theme,
+            webhook_url,
+            webhook_secret,
         })
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "twofold"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 description = "One document, two views. Markdown share service for humans and agents."
@@ -33,3 +33,4 @@ base64 = "0.22"
 hmac = "0.12"
 sha2 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
+syntect = "5"

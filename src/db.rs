@@ -315,4 +315,70 @@ impl Db {
         let count: i64 = stmt.query_row(params![name], |row| row.get(0))?;
         Ok(count > 0)
     }
+
+    /// List non-expired documents with pagination.
+    ///
+    /// Returns (documents, total_count).
+    ///
+    /// SQL-level expired filter: `expires_at IS NULL OR expires_at > now`.
+    /// Using the same ISO 8601 format as the rest of the codebase.
+    ///
+    /// Limit is enforced server-side: callers requesting limit > 100 are silently
+    /// capped at 100. Offset is u32 (cannot be negative by type).
+    ///
+    /// Two queries: count first, then paginated data. The mutex is released between
+    /// them — in theory the count could race with concurrent writes. At v0.3 usage
+    /// patterns this is acceptable; a window-function approach would eliminate it.
+    pub fn list_documents(&self, limit: u32, offset: u32) -> Result<(Vec<DocumentSummary>, u64)> {
+        // Server-side cap: callers asking for >100 get 100, no error.
+        let capped_limit = limit.min(100);
+
+        let conn = self.conn.lock().expect("db mutex poisoned");
+
+        // Count all non-expired documents (for pagination total).
+        // Filter: expires_at IS NULL (no expiry) OR expires_at > now (not yet expired).
+        let total: u64 = {
+            let mut stmt = conn.prepare(
+                "SELECT COUNT(*) FROM documents \
+                 WHERE expires_at IS NULL OR expires_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
+            )?;
+            stmt.query_row([], |row| row.get::<_, i64>(0))
+                .map(|n| n as u64)?
+        };
+
+        // Paginated document summaries, newest first.
+        // ?1 = capped_limit, ?2 = offset — named by position, no string interpolation.
+        let mut stmt = conn.prepare(
+            "SELECT slug, title, description, created_at, expires_at \
+             FROM documents \
+             WHERE expires_at IS NULL OR expires_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now') \
+             ORDER BY created_at DESC \
+             LIMIT ?1 OFFSET ?2",
+        )?;
+
+        let docs = stmt
+            .query_map(params![capped_limit, offset], |row| {
+                Ok(DocumentSummary {
+                    slug: row.get(0)?,
+                    title: row.get(1)?,
+                    description: row.get(2)?,
+                    created_at: row.get(3)?,
+                    expires_at: row.get(4)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok((docs, total))
+    }
+}
+
+/// Document summary for the list endpoint (no raw_content — metadata only).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DocumentSummary {
+    pub slug: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub created_at: String,
+    pub expires_at: Option<String>,
 }

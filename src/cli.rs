@@ -23,6 +23,8 @@ pub enum Commands {
     ///   TWOFOLD_MAX_SIZE (optional) Max body bytes (default: 1048576)
     ///   TWOFOLD_REAPER_INTERVAL (optional) Reaper interval seconds (default: 60)
     ///   TWOFOLD_DEFAULT_THEME (optional) Default theme (default: clean)
+    ///   TWOFOLD_WEBHOOK_URL (optional) Webhook endpoint URL
+    ///   TWOFOLD_WEBHOOK_SECRET (optional) HMAC signing secret for webhooks
     Serve,
 
     /// Publish a markdown document to a twofold server.
@@ -31,8 +33,21 @@ pub enum Commands {
     /// server. Prints the resulting URL to stdout on success. Exits 1 on failure.
     Publish(PublishArgs),
 
+    /// List published documents on a twofold server.
+    List(ListArgs),
+
+    /// Delete a document by slug.
+    Delete(DeleteArgs),
+
     /// Manage API tokens.
     Token(TokenArgs),
+
+    /// Start the MCP server (stdio JSON-RPC).
+    ///
+    /// Reads:
+    ///   TWOFOLD_MCP_SERVER  Server URL (default: http://localhost:3000)
+    ///   TWOFOLD_MCP_TOKEN   Bearer token (falls back to TWOFOLD_TOKEN)
+    Mcp,
 }
 
 /// Arguments for the `publish` subcommand.
@@ -40,6 +55,55 @@ pub enum Commands {
 pub struct PublishArgs {
     /// Path to the markdown file to publish, or `-` to read from stdin.
     pub path: String,
+
+    /// Server base URL.
+    #[arg(long, default_value = "http://localhost:3000")]
+    pub server: String,
+
+    /// Bearer token for authentication.
+    /// Defaults to the TWOFOLD_TOKEN environment variable.
+    #[arg(long)]
+    pub token: Option<String>,
+
+    /// Document title (prepended as frontmatter).
+    #[arg(long)]
+    pub title: Option<String>,
+
+    /// Custom slug (prepended as frontmatter).
+    #[arg(long)]
+    pub slug: Option<String>,
+
+    /// Theme (clean, dark, paper, minimal).
+    #[arg(long)]
+    pub theme: Option<String>,
+
+    /// Expiry duration (e.g., 7d, 24h, 30m, 2w).
+    #[arg(long)]
+    pub expiry: Option<String>,
+}
+
+/// Arguments for the `list` subcommand.
+#[derive(clap::Args, Debug)]
+pub struct ListArgs {
+    /// Server base URL.
+    #[arg(long, default_value = "http://localhost:3000")]
+    pub server: String,
+
+    /// Bearer token for authentication.
+    /// Defaults to the TWOFOLD_TOKEN environment variable.
+    #[arg(long)]
+    pub token: Option<String>,
+
+    /// Maximum number of documents to show.
+    #[arg(long, default_value = "20")]
+    pub limit: u32,
+}
+
+/// Arguments for the `delete` subcommand.
+#[derive(clap::Args, Debug)]
+pub struct DeleteArgs {
+    /// Slug of the document to delete.
+    pub slug: String,
 
     /// Server base URL.
     #[arg(long, default_value = "http://localhost:3000")]
