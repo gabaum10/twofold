@@ -217,13 +217,15 @@ footer small {
 }
 
 footer small a {
-    color: var(--fg-muted);
-    text-decoration: none;
+    color: var(--link);
+    text-decoration: underline;
+    text-decoration-thickness: 1px;
+    text-underline-offset: 2px;
     transition: color 0.15s;
 }
 
 footer small a:hover {
-    color: var(--fg-secondary);
+    color: var(--link-hover);
 }
 
 @media (max-width: 600px) {
