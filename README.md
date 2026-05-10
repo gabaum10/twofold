@@ -85,12 +85,17 @@ cat report.md | ./target/release/twofold publish --server http://localhost:3000 
 
 ## Features
 
-- **Frontmatter** -- title, slug, theme, expiry, password, description
+- **Frontmatter** -- title, slug, theme, expiry, password, description (YAML in `---` fences)
 - **Custom slugs** -- choose your URL or let nanoid generate one
-- **Expiry** -- documents self-destruct (`30m`, `24h`, `7d`, `2w`)
-- **Password protection** -- per-document, argon2-hashed
-- **Themes** -- clean (default), dark, paper, minimal
+- **Expiry** -- documents self-destruct (`30m`, `24h`, `7d`, `2w`) with background reaper
+- **Password protection** -- per-document, argon2-hashed, cookie-based session
+- **Themes** -- clean (default), dark, paper, minimal, hearth
+- **Syntax highlighting** -- syntect-powered, theme-aware (light/dark palettes)
 - **Full CRUD** -- create, read, update, delete via REST
+- **MCP server** -- agents publish and retrieve natively via JSON-RPC over stdio
+- **Webhooks** -- fire on create/update/delete, HMAC-signed
+- **Agent discovery** -- `<link rel="alternate" type="text/markdown">` in every HTML page
+- **OpenAPI spec** -- served live at `/api/v1/openapi.yaml` and `/api/v1/openapi.json`
 - **Token management** -- create/list/revoke API tokens via CLI
 - **Single binary** -- no runtime dependencies, SQLite embedded
 
@@ -99,14 +104,54 @@ cat report.md | ./target/release/twofold publish --server http://localhost:3000 
 | Method | Endpoint | Auth | Description |
 |--------|----------|------|-------------|
 | `POST` | `/api/v1/documents` | Bearer | Create document (body: `text/markdown`) |
-| `GET` | `/:slug` | -- | Human view (styled HTML, agent sections stripped) |
-| `GET` | `/:slug/full` | -- | Full rendered view (all sections visible) |
-| `GET` | `/:slug?raw=1` | -- | Raw markdown source |
-| `GET` | `/api/v1/documents/:slug` | -- | Agent API (full raw markdown + frontmatter) |
+| `GET` | `/api/v1/documents` | Bearer | List documents (paginated, metadata only) |
+| `GET` | `/api/v1/documents/:slug` | -- | Agent view (full raw markdown + frontmatter) |
 | `PUT` | `/api/v1/documents/:slug` | Bearer | Update document |
 | `DELETE` | `/api/v1/documents/:slug` | Bearer | Delete document (returns 204) |
+| `GET` | `/api/v1/openapi.yaml` | -- | OpenAPI spec (YAML) |
+| `GET` | `/api/v1/openapi.json` | -- | OpenAPI spec (JSON) |
+| `GET` | `/:slug` | -- | Human view (styled HTML, agent sections stripped) |
+| `GET` | `/:slug?raw=1` | -- | Raw markdown source |
+| `GET` | `/:slug/full` | -- | Full rendered view (all content, markers stripped) |
+| `POST` | `/:slug/unlock` | -- | Password verification (form POST) |
 
-Password-protected documents gate the human view and raw view. The agent API endpoint is not gated.
+Password-protected documents gate the human view, raw view, and full view. The agent API endpoint is not gated.
+
+## MCP Server
+
+Twofold ships an MCP (Model Context Protocol) server for direct agent integration. Agents publish, retrieve, list, and delete documents without shelling out to curl.
+
+```bash
+twofold mcp
+```
+
+Runs on stdio (JSON-RPC, newline-delimited). Wire it into Claude Code or any MCP-compatible tool:
+
+```json
+{
+  "mcpServers": {
+    "twofold": {
+      "command": "/path/to/twofold",
+      "args": ["mcp"],
+      "env": {
+        "TWOFOLD_MCP_SERVER": "http://localhost:3000",
+        "TWOFOLD_MCP_TOKEN": "your-token"
+      }
+    }
+  }
+}
+```
+
+### MCP Tools
+
+| Tool | Description |
+|------|-------------|
+| `twofold_publish` | Publish markdown. Accepts `content` (required), `title`, `slug`. Returns URL and slug. |
+| `twofold_get` | Retrieve raw markdown by slug. |
+| `twofold_list` | List published documents. Optional `limit` (default 20, max 100). |
+| `twofold_delete` | Delete a document by slug. |
+
+Environment: `TWOFOLD_MCP_SERVER` (default `http://localhost:3000`), `TWOFOLD_MCP_TOKEN` (falls back to `TWOFOLD_TOKEN`).
 
 ## Authoring Format
 
@@ -119,6 +164,14 @@ Content only agents see.
 ```
 
 Everything outside markers is visible to both humans and agents. Everything inside is agent-only.
+
+A third marker pair hides content from ALL rendered views (human, full, and agent HTML) while keeping it in the raw source:
+
+```
+<!-- @instructions -->
+Meta-instructions for agents reading raw source. Never rendered.
+<!-- @end-instructions -->
+```
 
 **Why HTML comments?**
 
@@ -145,8 +198,37 @@ theme: dark
 | `dark` | Always dark, monospace, terminal energy |
 | `paper` | Warm serif, book-like, light only |
 | `minimal` | Ultra-sparse, brutalist |
+| `hearth` | Warm, interior, campfire tone |
 
 Unknown theme names fall back to `clean` silently.
+
+## Webhooks
+
+Configure a URL; twofold fires JSON on document lifecycle events.
+
+```bash
+export TWOFOLD_WEBHOOK_URL="https://your-service.com/hook"
+export TWOFOLD_WEBHOOK_SECRET="your-hmac-secret"  # optional
+```
+
+Events: `document.created`, `document.updated`, `document.deleted`.
+
+Payload:
+
+```json
+{
+  "event": "document.created",
+  "timestamp": "2026-05-10T03:22:00Z",
+  "document": {
+    "slug": "q1-revenue",
+    "title": "Q1 Revenue Report",
+    "url": "http://localhost:3000/q1-revenue",
+    "api_url": "http://localhost:3000/api/v1/documents/q1-revenue"
+  }
+}
+```
+
+When `TWOFOLD_WEBHOOK_SECRET` is set, requests include an `X-Twofold-Signature: sha256=<hex>` header (HMAC-SHA256 of the JSON body). Fire-and-forget: webhook failure never affects API responses.
 
 ## Configuration
 
@@ -161,16 +243,32 @@ All config is via environment variables. No config files.
 | `TWOFOLD_MAX_SIZE` | `1048576` | Max request body in bytes (1MB) |
 | `TWOFOLD_REAPER_INTERVAL` | `60` | Seconds between expired document cleanup |
 | `TWOFOLD_DEFAULT_THEME` | `clean` | Default theme when none specified |
+| `TWOFOLD_WEBHOOK_URL` | -- | Webhook endpoint (no webhook if unset) |
+| `TWOFOLD_WEBHOOK_SECRET` | -- | HMAC-SHA256 signing secret for webhooks |
 
 ## CLI
 
 ```bash
 twofold serve                                    # Start server
 twofold publish <file|-> --server URL --token T  # Publish document
+twofold publish <file> --title "..." --slug X    # Publish with frontmatter flags
+twofold list --server URL --token T              # List documents
+twofold delete <slug> --server URL --token T     # Delete a document
 twofold token create --name "deploy-bot"         # Create API token
 twofold token list                               # List tokens
 twofold token revoke --name "deploy-bot"         # Revoke token
+twofold mcp                                      # Start MCP server (stdio)
 ```
+
+## Agent Discovery
+
+Every HTML page includes a `<link>` tag pointing to the raw markdown API endpoint:
+
+```html
+<link rel="alternate" type="text/markdown" href="/api/v1/documents/{slug}" title="Full document (markdown)">
+```
+
+Agents that parse HTML can find the full document without knowing the API URL structure.
 
 ## What This Is NOT
 
