@@ -181,6 +181,12 @@ tbody tr:nth-child(even) { background: var(--table-stripe); }
 table { display: block; overflow-x: auto; }
 thead, tbody, tr, th, td { display: revert; }
 
+/* Code inside cells stays on one line; table scrolls horizontally instead */
+td code, th code {
+    white-space: nowrap;
+    word-break: keep-all;
+}
+
 hr {
     border: none;
     height: 1px;

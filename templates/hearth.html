@@ -311,7 +311,7 @@ code {
     border: 1px solid var(--code-border);
     border-radius: 3px;
     padding: 0.15em 0.4em;
-    word-break: break-word;
+    word-break: normal;
 }
 
 pre {
@@ -407,6 +407,12 @@ table {
 
 thead, tbody, tr, th, td {
     display: revert;
+}
+
+/* Code inside cells stays on one line; table scrolls horizontally instead */
+td code, th code {
+    white-space: nowrap;
+    word-break: keep-all;
 }
 
 /* ═══════════════════════════════════════════
