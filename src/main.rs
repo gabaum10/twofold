@@ -121,6 +121,7 @@ async fn run_server() {
             .put(handlers::put_document)
             .delete(handlers::delete_document))
         .route("/:slug/unlock", post(handlers::post_unlock))
+        .route("/:slug/full", get(handlers::get_full))
         .route("/:slug", get(handlers::get_human))
         .layer(SetResponseHeaderLayer::overriding(
             axum::http::header::CONTENT_SECURITY_POLICY,

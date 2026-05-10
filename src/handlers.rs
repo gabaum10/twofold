@@ -479,6 +479,48 @@ pub async fn post_unlock(
     }
 }
 
+// ── GET /:slug/full (rendered full view) ─────────────────────────────────────
+
+/// Render the full document (including agent sections) as themed HTML.
+///
+/// The marker comments themselves (`<!-- @agent -->` / `<!-- @end -->`) are stripped
+/// so they don't appear as visible HTML comments, but their content is included.
+/// Password-protected documents still require authentication.
+pub async fn get_full(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let doc = state.db.get_by_slug(&slug)?
+        .ok_or(AppError::NotFound)?;
+
+    if is_expired(&doc) {
+        return Err(AppError::Gone);
+    }
+
+    // Password check
+    if doc.password.is_some() {
+        if !is_password_authed(&headers, &slug, &state.config.token) {
+            let template = PasswordTemplate { slug: &slug, error: None };
+            return Ok(Html(template.render().map_err(|e| {
+                AppError::Internal(format!("Template error: {e}"))
+            })?).into_response());
+        }
+    }
+
+    // Strip frontmatter, then strip marker comment lines (keep content), render full
+    let fm_result = extract_frontmatter(&doc.raw_content)
+        .unwrap_or_else(|_| crate::parser::FrontmatterResult {
+            meta: None,
+            body: doc.raw_content.clone(),
+        });
+
+    let stripped = strip_marker_comments(&fm_result.body);
+    let rendered_html = render_markdown(&stripped);
+
+    render_themed(&doc.title, &rendered_html, &doc.theme)
+}
+
 // ── GET /api/v1/documents/:slug (agent view) ─────────────────────────────────
 
 /// Return the full raw source markdown.
@@ -542,6 +584,26 @@ fn markdown_response(content: &str) -> Response {
         content.to_string(),
     )
         .into_response()
+}
+
+/// Strip `<!-- @agent -->` and `<!-- @end -->` marker comment lines from source.
+///
+/// Removes only the marker lines themselves; all content between them is preserved.
+/// Uses the same detection logic as `parser::is_marker` (whitespace-tolerant).
+fn strip_marker_comments(source: &str) -> String {
+    source
+        .lines()
+        .filter(|line| {
+            let t = line.trim();
+            if !t.starts_with("<!--") || !t.ends_with("-->") {
+                return true;
+            }
+            let inner = &t["<!--".len()..t.len() - "-->".len()];
+            let tag = inner.trim();
+            tag != "@agent" && tag != "@end"
+        })
+        .collect::<Vec<&str>>()
+        .join("\n")
 }
 
 /// Render markdown to HTML using comrak with GFM extensions.

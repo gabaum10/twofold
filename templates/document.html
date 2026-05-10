@@ -707,11 +707,11 @@ footer small {
                 <button class="doc-btn" id="btn-copy-url" title="Copy link to clipboard">
                     Copy link
                 </button>
-                <button class="doc-btn" id="btn-copy-md" title="Copy raw markdown to clipboard">
-                    Copy markdown
-                </button>
-                <a class="doc-btn" id="btn-agent-view" href="#" title="Full rendered agent view with all sections">
-                    Agent view &rarr;
+                <a class="doc-btn" id="btn-view-raw" href="#" title="View raw markdown source">
+                    View raw
+                </a>
+                <a class="doc-btn" id="btn-full-detail" href="#" title="Full rendered view with all sections">
+                    Full detail &rarr;
                 </a>
             </div>
             {{ content|safe }}
@@ -742,10 +742,11 @@ footer small {
         // Derive slug from current path: /:slug
         var slug = window.location.pathname.replace(/^\//, '').split('/')[0];
         var rawUrl = window.location.origin + '/' + slug + '?raw=1';
-        var agentUrl = window.location.origin + '/api/v1/documents/' + slug;
+        var fullUrl = window.location.origin + '/' + slug + '/full';
 
-        // Wire up "Agent view" link
-        document.getElementById('btn-agent-view').href = agentUrl;
+        // Wire up link buttons
+        document.getElementById('btn-view-raw').href = rawUrl;
+        document.getElementById('btn-full-detail').href = fullUrl;
 
         // Copy URL button
         document.getElementById('btn-copy-url').addEventListener('click', function () {
@@ -754,24 +755,6 @@ footer small {
             }).catch(function () {
                 showToast('Copy failed');
             });
-        });
-
-        // Copy markdown button
-        document.getElementById('btn-copy-md').addEventListener('click', function () {
-            fetch(rawUrl)
-                .then(function (r) {
-                    if (!r.ok) throw new Error('fetch failed');
-                    return r.text();
-                })
-                .then(function (md) {
-                    return navigator.clipboard.writeText(md);
-                })
-                .then(function () {
-                    showToast('Copied markdown!');
-                })
-                .catch(function () {
-                    showToast('Copy failed');
-                });
         });
     })();
     </script>
