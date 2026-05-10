@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ title }}</title>
+    <style>
+/* sharesvc v0.1 — hand-rolled classless stylesheet
+   Requirements: responsive, dark/light via prefers-color-scheme, readable typography,
+   zero external requests (all CSS inlined here). */
+
+:root {
+    --bg: #ffffff;
+    --fg: #1a1a1a;
+    --muted: #6b7280;
+    --border: #e5e7eb;
+    --code-bg: #f3f4f6;
+    --link: #2563eb;
+    --link-visited: #7c3aed;
+    --max-width: 720px;
+    --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --bg: #111827;
+        --fg: #f9fafb;
+        --muted: #9ca3af;
+        --border: #374151;
+        --code-bg: #1f2937;
+        --link: #60a5fa;
+        --link-visited: #a78bfa;
+    }
+}
+
+*, *::before, *::after {
+    box-sizing: border-box;
+}
+
+html {
+    font-size: 16px;
+    -webkit-text-size-adjust: 100%;
+}
+
+body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--font-sans);
+    line-height: 1.7;
+}
+
+main {
+    max-width: var(--max-width);
+    margin: 0 auto;
+    padding: 2rem 1.5rem 4rem;
+}
+
+article {
+    min-width: 0;
+}
+
+/* Typography */
+
+h1, h2, h3, h4, h5, h6 {
+    margin: 1.5em 0 0.5em;
+    line-height: 1.25;
+    font-weight: 700;
+}
+
+h1 { font-size: 2rem; margin-top: 0; }
+h2 { font-size: 1.5rem; }
+h3 { font-size: 1.25rem; }
+h4 { font-size: 1.1rem; }
+
+p {
+    margin: 0 0 1em;
+}
+
+a {
+    color: var(--link);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+}
+
+a:visited {
+    color: var(--link-visited);
+}
+
+a:hover {
+    text-decoration: none;
+}
+
+/* Code */
+
+code {
+    font-family: var(--font-mono);
+    font-size: 0.875em;
+    background: var(--code-bg);
+    border-radius: 4px;
+    padding: 0.15em 0.35em;
+}
+
+pre {
+    background: var(--code-bg);
+    border-radius: 6px;
+    padding: 1em 1.25em;
+    overflow-x: auto;
+    margin: 0 0 1.25em;
+}
+
+pre code {
+    background: none;
+    padding: 0;
+    font-size: 0.875em;
+    line-height: 1.6;
+}
+
+/* Lists */
+
+ul, ol {
+    margin: 0 0 1em;
+    padding-left: 1.75em;
+}
+
+li {
+    margin: 0.25em 0;
+}
+
+/* Blockquote */
+
+blockquote {
+    margin: 0 0 1em;
+    padding: 0.5em 0 0.5em 1.25em;
+    border-left: 4px solid var(--border);
+    color: var(--muted);
+}
+
+blockquote p:last-child {
+    margin-bottom: 0;
+}
+
+/* Table */
+
+table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 0 0 1.25em;
+    font-size: 0.9em;
+}
+
+th, td {
+    border: 1px solid var(--border);
+    padding: 0.5em 0.75em;
+    text-align: left;
+}
+
+th {
+    background: var(--code-bg);
+    font-weight: 600;
+}
+
+/* Horizontal rule */
+
+hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 2em 0;
+}
+
+/* Images */
+
+img {
+    max-width: 100%;
+    height: auto;
+    border-radius: 4px;
+}
+
+/* Footer */
+
+footer {
+    max-width: var(--max-width);
+    margin: 0 auto;
+    padding: 0 1.5rem 2rem;
+    border-top: 1px solid var(--border);
+}
+
+footer small {
+    color: var(--muted);
+    font-size: 0.8rem;
+}
+
+/* Responsive */
+
+@media (max-width: 600px) {
+    main {
+        padding: 1.5rem 1rem 3rem;
+    }
+
+    h1 { font-size: 1.6rem; }
+    h2 { font-size: 1.3rem; }
+
+    pre {
+        font-size: 0.8em;
+    }
+}
+    </style>
+</head>
+<body>
+    <main>
+        <article>
+            {{ content|safe }}
+        </article>
+    </main>
+    <footer>
+        <small>shared via sharesvc</small>
+    </footer>
+</body>
+</html>
