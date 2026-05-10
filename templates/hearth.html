@@ -9,7 +9,7 @@
    The fire in the dark. Warm amber on charcoal. Serif body (Pagella-informed).
    Sans headings (structural clarity). The same palette as the Typst PDFs —
    ember, char, smoke, ash, stone, linen, flame.
-   Dark/light via prefers-color-scheme. Zero external requests. */
+   Always light — the brand is the brand. Zero external requests. */
 
 /* ═══════════════════════════════════════════
    COLOR SYSTEM
@@ -54,33 +54,6 @@
     --space-lg: 1.75rem;
     --space-xl: 2.5rem;
     --space-xxl: 4rem;
-}
-
-@media (prefers-color-scheme: dark) {
-    :root {
-        /* Dark mode — char background, ember breaking through */
-        --bg: #1E1A17;
-        --bg-subtle: #2C2420;
-        --fg: #EDE6DE;
-        --fg-secondary: #A89888;
-        --fg-muted: #6B5D52;
-        --border: #3D352E;
-        --border-strong: #5C4F44;
-        --accent: #D4943C;
-        --accent-hover: #E8A84E;
-        --accent-soft: #C4762B;
-        --link: #D4943C;
-        --link-visited: #C4A070;
-        --link-hover: #E8A84E;
-        --code-bg: #2C2420;
-        --code-border: #3D352E;
-        --code-fg: #EDE6DE;
-        --mark-bg: rgba(196, 118, 43, 0.2);
-        --table-stripe: #241F1C;
-        --table-header-bg: #C4762B;
-        --table-header-fg: #F5F0EB;
-        --shadow: rgba(0, 0, 0, 0.3);
-    }
 }
 
 /* ═══════════════════════════════════════════
@@ -362,14 +335,6 @@ pre code {
     color: var(--code-fg);
 }
 
-/* Dark mode code: char background, the dark IS the container */
-@media (prefers-color-scheme: dark) {
-    pre {
-        background: #1A1614;
-        border-color: var(--border);
-    }
-}
-
 /* Syntax highlighting — hearth-warm palette */
 pre code .comment,
 pre code .prolog { color: var(--fg-muted); font-style: italic; }
@@ -391,23 +356,6 @@ pre code .punctuation { color: var(--fg-secondary); }
 
 pre code .property,
 pre code .attr-name { color: #A89888; }
-
-@media (prefers-color-scheme: dark) {
-    pre code .keyword,
-    pre code .tag { color: #E8A84E; }
-
-    pre code .string,
-    pre code .attr-value { color: #A0BC82; }
-
-    pre code .function,
-    pre code .class-name { color: #D4943C; }
-
-    pre code .number,
-    pre code .boolean { color: #E8A84E; }
-
-    pre code .property,
-    pre code .attr-name { color: #C4A070; }
-}
 
 /* ═══════════════════════════════════════════
    TABLES — hearth branded
