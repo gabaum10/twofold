@@ -216,6 +216,16 @@ footer small {
     font-family: var(--font-mono);
 }
 
+footer small a {
+    color: var(--fg-muted);
+    text-decoration: none;
+    transition: color 0.15s;
+}
+
+footer small a:hover {
+    color: var(--fg-secondary);
+}
+
 @media (max-width: 600px) {
     :root { --font-size: 0.875rem; }
     main { padding: var(--space-xl) var(--space-md); }
@@ -235,7 +245,7 @@ footer small {
         </article>
     </main>
     <footer>
-        <small>shared via twofold</small>
+        <small>shared via <a href="https://github.com/gabaum10/twofold">twofold</a></small>
     </footer>
 </body>
 </html>

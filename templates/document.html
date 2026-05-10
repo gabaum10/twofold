@@ -533,6 +533,17 @@ footer small {
     text-transform: lowercase;
 }
 
+footer small a {
+    color: var(--fg-muted);
+    text-decoration: none;
+    text-decoration-color: transparent;
+    transition: color 0.15s ease;
+}
+
+footer small a:hover {
+    color: var(--fg-secondary);
+}
+
 /* ═══════════════════════════════════════════
    RESPONSIVE
    ═══════════════════════════════════════════ */
@@ -731,7 +742,7 @@ footer small {
         </article>
     </main>
     <footer>
-        <small>shared via twofold</small>
+        <small>shared via <a href="https://github.com/gabaum10/twofold">twofold</a></small>
     </footer>
 
     <div class="doc-toast" id="doc-toast" aria-live="polite"></div>
