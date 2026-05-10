@@ -107,6 +107,15 @@ struct MinimalTemplate<'a> {
     content: &'a str,
 }
 
+/// Hearth theme template.
+#[derive(Template)]
+#[template(path = "hearth.html")]
+struct HearthTemplate<'a> {
+    title: &'a str,
+    content: &'a str,
+    full_view: bool,
+}
+
 /// Password prompt template.
 #[derive(Template)]
 #[template(path = "password.html")]
@@ -669,6 +678,10 @@ fn render_themed(title: &str, content: &str, theme: &str, full_view: bool) -> Re
         }
         "minimal" => {
             let t = MinimalTemplate { title, content };
+            t.render()
+        }
+        "hearth" => {
+            let t = HearthTemplate { title, content, full_view };
             t.render()
         }
         _ => {
