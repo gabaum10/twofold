@@ -79,6 +79,7 @@ pub struct AppState {
 struct CleanTemplate<'a> {
     title: &'a str,
     content: &'a str,
+    slug: &'a str,
     /// When true, toolbar shows "Summary view" instead of "Full detail".
     full_view: bool,
 }
@@ -89,6 +90,7 @@ struct CleanTemplate<'a> {
 struct DarkTemplate<'a> {
     title: &'a str,
     content: &'a str,
+    slug: &'a str,
 }
 
 /// Paper theme template.
@@ -97,6 +99,7 @@ struct DarkTemplate<'a> {
 struct PaperTemplate<'a> {
     title: &'a str,
     content: &'a str,
+    slug: &'a str,
 }
 
 /// Minimal theme template.
@@ -105,6 +108,7 @@ struct PaperTemplate<'a> {
 struct MinimalTemplate<'a> {
     title: &'a str,
     content: &'a str,
+    slug: &'a str,
 }
 
 /// Hearth theme template.
@@ -113,6 +117,7 @@ struct MinimalTemplate<'a> {
 struct HearthTemplate<'a> {
     title: &'a str,
     content: &'a str,
+    slug: &'a str,
     full_view: bool,
 }
 
@@ -436,7 +441,7 @@ pub async fn get_human(
     let parse_result = parse_document(&fm_result.body, &slug);
     let rendered_html = render_markdown(&parse_result.human);
 
-    render_themed(&doc.title, &rendered_html, &doc.theme, false)
+    render_themed(&doc.title, &rendered_html, &slug, &doc.theme, false)
 }
 
 // ── POST /:slug/unlock ───────────────────────────────────────────────────────
@@ -529,7 +534,7 @@ pub async fn get_full(
     let stripped = strip_marker_comments(&fm_result.body);
     let rendered_html = render_markdown(&stripped);
 
-    render_themed(&doc.title, &rendered_html, &doc.theme, true)
+    render_themed(&doc.title, &rendered_html, &slug, &doc.theme, true)
 }
 
 // ── GET /api/v1/documents/:slug (agent view) ─────────────────────────────────
@@ -666,27 +671,27 @@ fn render_markdown(source: &str) -> String {
 ///
 /// `full_view`: when true, the clean-theme toolbar shows "Summary view" instead of "Full detail".
 /// Has no effect on themes that don't render a toolbar.
-fn render_themed(title: &str, content: &str, theme: &str, full_view: bool) -> Result<Response, AppError> {
+fn render_themed(title: &str, content: &str, slug: &str, theme: &str, full_view: bool) -> Result<Response, AppError> {
     let html = match theme {
         "dark" => {
-            let t = DarkTemplate { title, content };
+            let t = DarkTemplate { title, content, slug };
             t.render()
         }
         "paper" => {
-            let t = PaperTemplate { title, content };
+            let t = PaperTemplate { title, content, slug };
             t.render()
         }
         "minimal" => {
-            let t = MinimalTemplate { title, content };
+            let t = MinimalTemplate { title, content, slug };
             t.render()
         }
         "hearth" => {
-            let t = HearthTemplate { title, content, full_view };
+            let t = HearthTemplate { title, content, slug, full_view };
             t.render()
         }
         _ => {
             // "clean" or unknown -> default
-            let t = CleanTemplate { title, content, full_view };
+            let t = CleanTemplate { title, content, slug, full_view };
             t.render()
         }
     };
