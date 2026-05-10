@@ -11,7 +11,8 @@ use axum::{
     Router,
 };
 use clap::Parser;
-use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
+use axum::http::HeaderValue;
+use tower_http::{limit::RequestBodyLimitLayer, set_header::SetResponseHeaderLayer, trace::TraceLayer};
 use tracing_subscriber::EnvFilter;
 
 use cli::{Cli, Commands};
@@ -85,10 +86,18 @@ async fn run_server() {
     //
     // RequestBodyLimitLayer is applied globally; it returns 413 automatically
     // when the body exceeds max_size bytes.
+    let csp = HeaderValue::from_static(
+        "default-src 'self'; script-src 'none'; style-src 'unsafe-inline'",
+    );
+
     let app = Router::new()
         .route("/api/v1/documents", post(handlers::post_document))
-        .route("/api/v1/documents/:slug", get(handlers::get_agent))
-        .route("/:slug", get(handlers::get_human))
+        .route("/api/v1/documents/{slug}", get(handlers::get_agent))
+        .route("/{slug}", get(handlers::get_human))
+        .layer(SetResponseHeaderLayer::overriding(
+            axum::http::header::CONTENT_SECURITY_POLICY,
+            csp,
+        ))
         .layer(RequestBodyLimitLayer::new(max_size))
         .layer(TraceLayer::new_for_http())
         .with_state(state);

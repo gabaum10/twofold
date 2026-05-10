@@ -20,10 +20,9 @@ Twofold accepts markdown documents with optional `<!-- @agent -->` / `<!-- @end 
 ## Architecture
 
 - `src/main.rs` — server setup, routes
-- `src/splitter.rs` — marker parsing, dual-corpus generation
+- `src/parser.rs` — marker parsing, dual-corpus generation
 - `src/db.rs` — SQLite operations
-- `templates/` — Askama HTML templates
-- `static/` — CSS themes
+- `templates/` — Askama HTML templates (CSS inlined in template)
 
 ## Key Design Decisions
 

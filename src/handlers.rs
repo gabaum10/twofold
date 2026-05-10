@@ -269,7 +269,13 @@ fn render_markdown(source: &str) -> String {
     options.extension.strikethrough = true;
     options.extension.autolink = true;
     options.extension.tasklist = true;
-    // Allow passthrough of raw HTML in source (e.g., comments)
+    // Raw HTML passthrough enabled. XSS mitigated by:
+    //   (1) Bearer token auth limits publishers to trusted operators.
+    //   (2) CSP header (Content-Security-Policy: script-src 'none') blocks
+    //       script execution in the human view.
+    // If multi-user tokens are added in a future version, re-evaluate this
+    // setting — any authenticated publisher would then be able to inject
+    // arbitrary HTML visible to other users.
     options.render.unsafe_ = true;
     markdown_to_html(source, &options)
 }
@@ -337,4 +343,37 @@ fn is_unique_violation(e: &rusqlite::Error) -> bool {
         e,
         rusqlite::Error::SqliteFailure(err, _) if err.code == rusqlite::ErrorCode::ConstraintViolation
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::days_to_ymd;
+
+    #[test]
+    fn days_to_ymd_epoch() {
+        // Day 0 = 1970-01-01 (Unix epoch)
+        assert_eq!(days_to_ymd(0), (1970, 1, 1));
+    }
+
+    #[test]
+    fn days_to_ymd_day_zero_is_epoch() {
+        // Explicit alias: day 0 is the epoch, same as above.
+        // Kept separate so the failure message is distinct.
+        let (y, m, d) = days_to_ymd(0);
+        assert_eq!((y, m, d), (1970, 1, 1), "day 0 must be 1970-01-01");
+    }
+
+    #[test]
+    fn days_to_ymd_known_recent_date() {
+        // 2024-03-15 = 19797 days since epoch
+        // Verified: (2024 - 1970) * 365 + leap days = 19797
+        assert_eq!(days_to_ymd(19797), (2024, 3, 15));
+    }
+
+    #[test]
+    fn days_to_ymd_leap_year_feb29() {
+        // 2024 is a leap year. Feb 29, 2024 = day 19782.
+        // 2024-01-01 = 19723 days since epoch; Jan has 31 days, Feb 1 = 19754, Feb 29 = 19782.
+        assert_eq!(days_to_ymd(19782), (2024, 2, 29));
+    }
 }
