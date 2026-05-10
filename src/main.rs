@@ -107,8 +107,12 @@ async fn run_server() {
     //
     // Route ordering matters: API routes must be registered BEFORE the
     // slug catch-all, otherwise axum would try to parse "api" as a slug.
+    // XSS threat model: only trusted publishers can POST content (bearer token auth).
+    // We control all HTML output, so inline scripts are safe here.
+    // 'unsafe-inline' is required for our own toolbar buttons (clipboard, toast, slug derivation).
+    // External script sources are still blocked by default-src 'self'.
     let csp = HeaderValue::from_static(
-        "default-src 'self'; script-src 'none'; style-src 'unsafe-inline'",
+        "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'",
     );
 
     let app = Router::new()

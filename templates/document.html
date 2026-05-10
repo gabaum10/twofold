@@ -711,6 +711,9 @@ footer small {
                 <a class="doc-btn" id="btn-view-source" href="#" title="View full source">
                     View source &rarr;
                 </a>
+                <a class="doc-btn" id="btn-agent-view" href="#" title="Full rendered agent view with all sections">
+                    Agent view &rarr;
+                </a>
             </div>
             {{ content|safe }}
         </article>
@@ -740,10 +743,14 @@ footer small {
         // Derive slug from current path: /:slug
         var slug = window.location.pathname.replace(/^\//, '').split('/')[0];
         var rawUrl = window.location.origin + '/' + slug + '?raw=1';
+        var agentUrl = window.location.origin + '/api/v1/documents/' + slug;
 
         // Wire up "View source" link
         var viewSourceBtn = document.getElementById('btn-view-source');
         viewSourceBtn.href = rawUrl;
+
+        // Wire up "Agent view" link
+        document.getElementById('btn-agent-view').href = agentUrl;
 
         // Copy URL button
         document.getElementById('btn-copy-url').addEventListener('click', function () {
