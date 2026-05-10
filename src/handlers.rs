@@ -79,6 +79,8 @@ pub struct AppState {
 struct CleanTemplate<'a> {
     title: &'a str,
     content: &'a str,
+    /// When true, toolbar shows "Summary view" instead of "Full detail".
+    full_view: bool,
 }
 
 /// Dark theme template.
@@ -425,7 +427,7 @@ pub async fn get_human(
     let parse_result = parse_document(&fm_result.body, &slug);
     let rendered_html = render_markdown(&parse_result.human);
 
-    render_themed(&doc.title, &rendered_html, &doc.theme)
+    render_themed(&doc.title, &rendered_html, &doc.theme, false)
 }
 
 // ── POST /:slug/unlock ───────────────────────────────────────────────────────
@@ -518,7 +520,7 @@ pub async fn get_full(
     let stripped = strip_marker_comments(&fm_result.body);
     let rendered_html = render_markdown(&stripped);
 
-    render_themed(&doc.title, &rendered_html, &doc.theme)
+    render_themed(&doc.title, &rendered_html, &doc.theme, true)
 }
 
 // ── GET /api/v1/documents/:slug (agent view) ─────────────────────────────────
@@ -586,24 +588,58 @@ fn markdown_response(content: &str) -> Response {
         .into_response()
 }
 
-/// Strip `<!-- @agent -->` and `<!-- @end -->` marker comment lines from source.
+/// Strip marker comment lines and agent-instructions blocks from source.
 ///
-/// Removes only the marker lines themselves; all content between them is preserved.
-/// Uses the same detection logic as `parser::is_marker` (whitespace-tolerant).
+/// Two stripping behaviors:
+///
+/// 1. `<!-- @agent -->` and `<!-- @end -->` lines are removed (their content is KEPT).
+///    These delimit agent-only sections in the source but the full view still renders
+///    the content between them.
+///
+/// 2. `<!-- @instructions -->` / `<!-- @end-instructions -->` blocks are removed
+///    entirely — both the marker lines AND everything between them.
+///    Use this for meta-instructions directed at agents reading raw source that
+///    should never appear in any rendered view (human or full).
+///
+/// Uses whitespace-tolerant matching (same logic as `parser::is_marker`).
 fn strip_marker_comments(source: &str) -> String {
-    source
-        .lines()
-        .filter(|line| {
-            let t = line.trim();
-            if !t.starts_with("<!--") || !t.ends_with("-->") {
-                return true;
-            }
+    let mut result: Vec<&str> = Vec::new();
+    let mut in_instructions = false;
+
+    for line in source.lines() {
+        let t = line.trim();
+        let tag = if t.starts_with("<!--") && t.ends_with("-->") {
             let inner = &t["<!--".len()..t.len() - "-->".len()];
-            let tag = inner.trim();
-            tag != "@agent" && tag != "@end"
-        })
-        .collect::<Vec<&str>>()
-        .join("\n")
+            Some(inner.trim())
+        } else {
+            None
+        };
+
+        match tag {
+            // Enter instructions block — skip marker, skip all content until close
+            Some("@instructions") => {
+                in_instructions = true;
+                // marker line itself is dropped
+            }
+            // Exit instructions block — skip the closing marker
+            Some("@end-instructions") if in_instructions => {
+                in_instructions = false;
+                // marker line itself is dropped
+            }
+            // Strip agent/end marker lines but keep content outside them
+            Some("@agent") | Some("@end") if !in_instructions => {
+                // marker line dropped, surrounding content preserved
+            }
+            // Inside an instructions block — drop content
+            _ if in_instructions => {}
+            // Normal line — keep it
+            _ => {
+                result.push(line);
+            }
+        }
+    }
+
+    result.join("\n")
 }
 
 /// Render markdown to HTML using comrak with GFM extensions.
@@ -618,7 +654,10 @@ fn render_markdown(source: &str) -> String {
 }
 
 /// Render a themed HTML response.
-fn render_themed(title: &str, content: &str, theme: &str) -> Result<Response, AppError> {
+///
+/// `full_view`: when true, the clean-theme toolbar shows "Summary view" instead of "Full detail".
+/// Has no effect on themes that don't render a toolbar.
+fn render_themed(title: &str, content: &str, theme: &str, full_view: bool) -> Result<Response, AppError> {
     let html = match theme {
         "dark" => {
             let t = DarkTemplate { title, content };
@@ -634,7 +673,7 @@ fn render_themed(title: &str, content: &str, theme: &str) -> Result<Response, Ap
         }
         _ => {
             // "clean" or unknown -> default
-            let t = CleanTemplate { title, content };
+            let t = CleanTemplate { title, content, full_view };
             t.render()
         }
     };

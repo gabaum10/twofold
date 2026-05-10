@@ -710,9 +710,15 @@ footer small {
                 <a class="doc-btn" id="btn-view-raw" href="#" title="View raw markdown source">
                     View raw
                 </a>
-                <a class="doc-btn" id="btn-full-detail" href="#" title="Full rendered view with all sections">
+                {% if full_view %}
+                <a class="doc-btn" id="btn-toggle-view" href="#" title="Summary view">
+                    &larr; Summary
+                </a>
+                {% else %}
+                <a class="doc-btn" id="btn-toggle-view" href="#" title="Full rendered view with all sections">
                     Full detail &rarr;
                 </a>
+                {% endif %}
             </div>
             {{ content|safe }}
         </article>
@@ -739,14 +745,20 @@ footer small {
             }, 2000);
         }
 
-        // Derive slug from current path: /:slug
-        var slug = window.location.pathname.replace(/^\//, '').split('/')[0];
+        // Derive slug from current path: /:slug or /:slug/full
+        var pathParts = window.location.pathname.replace(/^\//, '').split('/');
+        var slug = pathParts[0];
         var rawUrl = window.location.origin + '/' + slug + '?raw=1';
+        var summaryUrl = window.location.origin + '/' + slug;
         var fullUrl = window.location.origin + '/' + slug + '/full';
 
         // Wire up link buttons
         document.getElementById('btn-view-raw').href = rawUrl;
-        document.getElementById('btn-full-detail').href = fullUrl;
+        {% if full_view %}
+        document.getElementById('btn-toggle-view').href = summaryUrl;
+        {% else %}
+        document.getElementById('btn-toggle-view').href = fullUrl;
+        {% endif %}
 
         // Copy URL button
         document.getElementById('btn-copy-url').addEventListener('click', function () {
