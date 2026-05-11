@@ -16,20 +16,28 @@ jobs:
       - run: cargo test
       - run: cargo build --release
 
-  deploy:
-    name: Deploy to Flint
+  publish:
+    name: Publish to crates.io
     runs-on: ubuntu-latest
     needs: [test]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
-      - name: Deploy to Flint
-        uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ secrets.FLINT_HOST }}
-          username: gabaum10
-          key: ${{ secrets.FLINT_SSH_KEY }}
-          script: |
-            cd ~/projects/twofold
-            git pull
-            cargo build --release
-            sudo systemctl restart twofold
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check if version is already published
+        id: version_check
+        run: |
+          LOCAL=$(cargo metadata --no-deps --format-version 1 | python3 -c "import sys,json; print(json.load(sys.stdin)['packages'][0]['version'])")
+          PUBLISHED=$(curl -s https://crates.io/api/v1/crates/twofold | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['crate']['newest_version'])" 2>/dev/null || echo "none")
+          echo "local=$LOCAL" >> $GITHUB_OUTPUT
+          echo "published=$PUBLISHED" >> $GITHUB_OUTPUT
+          if [ "$LOCAL" = "$PUBLISHED" ]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+      - name: Publish
+        if: steps.version_check.outputs.skip == 'false'
+        run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
