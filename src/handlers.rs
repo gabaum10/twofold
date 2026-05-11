@@ -85,6 +85,7 @@ struct CleanTemplate<'a> {
     /// When true, toolbar shows "Summary view" instead of "Full detail".
     full_view: bool,
     body_empty: bool,
+    expires_at: Option<String>,
 }
 
 /// Dark theme template.
@@ -95,6 +96,7 @@ struct DarkTemplate<'a> {
     content: &'a str,
     slug: &'a str,
     body_empty: bool,
+    expires_at: Option<String>,
 }
 
 /// Paper theme template.
@@ -105,6 +107,7 @@ struct PaperTemplate<'a> {
     content: &'a str,
     slug: &'a str,
     body_empty: bool,
+    expires_at: Option<String>,
 }
 
 /// Minimal theme template.
@@ -115,6 +118,7 @@ struct MinimalTemplate<'a> {
     content: &'a str,
     slug: &'a str,
     body_empty: bool,
+    expires_at: Option<String>,
 }
 
 /// Hearth theme template.
@@ -126,6 +130,7 @@ struct HearthTemplate<'a> {
     slug: &'a str,
     full_view: bool,
     body_empty: bool,
+    expires_at: Option<String>,
 }
 
 /// Password prompt template.
@@ -592,6 +597,7 @@ pub async fn get_human(
     let title = doc.title.clone();
     let theme = doc.theme.clone();
     let slug_owned = slug.clone();
+    let expires_at = doc.expires_at.clone();
 
     let html_result = tokio::task::spawn_blocking(move || {
         let fm_result = extract_frontmatter(&raw_content)
@@ -602,7 +608,7 @@ pub async fn get_human(
 
         let parse_result = parse_document(&fm_result.body, &slug_owned);
         let rendered_html = render_markdown(&parse_result.human);
-        render_themed_sync(&title, &rendered_html, &slug_owned, &theme, false)
+        render_themed_sync(&title, &rendered_html, &slug_owned, &theme, false, expires_at)
     })
     .await
     .map_err(|e| AppError::Internal(format!("Render task failed: {e}")))?;
@@ -695,6 +701,7 @@ pub async fn get_full(
     let title = doc.title.clone();
     let theme = doc.theme.clone();
     let slug_owned = slug.clone();
+    let expires_at = doc.expires_at.clone();
 
     let html_result = tokio::task::spawn_blocking(move || {
         let fm_result = extract_frontmatter(&raw_content)
@@ -705,7 +712,7 @@ pub async fn get_full(
 
         let stripped = strip_marker_comments(&fm_result.body);
         let rendered_html = render_markdown(&stripped);
-        render_themed_sync(&title, &rendered_html, &slug_owned, &theme, true)
+        render_themed_sync(&title, &rendered_html, &slug_owned, &theme, true, expires_at)
     })
     .await
     .map_err(|e| AppError::Internal(format!("Render task failed: {e}")))?;
@@ -854,7 +861,7 @@ fn render_markdown(source: &str) -> String {
 ///
 /// Named `_sync` because it is called from `spawn_blocking` contexts (not directly from async).
 /// This avoids stack overflow in async worker threads during syntect init/tokenization.
-fn render_themed_sync(title: &str, content: &str, slug: &str, theme: &str, full_view: bool) -> Result<Response, AppError> {
+fn render_themed_sync(title: &str, content: &str, slug: &str, theme: &str, full_view: bool, expires_at: Option<String>) -> Result<Response, AppError> {
     // Apply syntax highlighting to the pre-rendered HTML.
     // Dark theme gets dark syntax palette; all others get light.
     let is_dark = theme == "dark";
@@ -864,24 +871,24 @@ fn render_themed_sync(title: &str, content: &str, slug: &str, theme: &str, full_
 
     let html = match theme {
         "dark" => {
-            let t = DarkTemplate { title, content: &highlighted, slug, body_empty };
+            let t = DarkTemplate { title, content: &highlighted, slug, body_empty, expires_at };
             t.render()
         }
         "paper" => {
-            let t = PaperTemplate { title, content: &highlighted, slug, body_empty };
+            let t = PaperTemplate { title, content: &highlighted, slug, body_empty, expires_at };
             t.render()
         }
         "minimal" => {
-            let t = MinimalTemplate { title, content: &highlighted, slug, body_empty };
+            let t = MinimalTemplate { title, content: &highlighted, slug, body_empty, expires_at };
             t.render()
         }
         "hearth" => {
-            let t = HearthTemplate { title, content: &highlighted, slug, full_view, body_empty };
+            let t = HearthTemplate { title, content: &highlighted, slug, full_view, body_empty, expires_at };
             t.render()
         }
         _ => {
             // "clean" or unknown -> default
-            let t = CleanTemplate { title, content: &highlighted, slug, full_view, body_empty };
+            let t = CleanTemplate { title, content: &highlighted, slug, full_view, body_empty, expires_at };
             t.render()
         }
     };

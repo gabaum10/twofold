@@ -302,6 +302,20 @@ footer small a:hover {
     transform: translateY(0);
 }
 
+/* Expiry countdown */
+.doc-expiry {
+    font-family: var(--font-heading);
+    font-size: 0.72rem;
+    color: var(--fg-muted);
+    letter-spacing: 0.01em;
+    white-space: nowrap;
+    margin-right: auto;
+}
+
+.doc-expiry.expiry-urgent {
+    color: #e57373;
+}
+
 @media print {
     @page { margin: 2cm; }
 
@@ -360,7 +374,7 @@ footer small a:hover {
         border-left-color: #999 !important;
     }
 
-    .doc-toolbar, .doc-toast { display: none; }
+    .doc-toolbar, .doc-toast, .doc-expiry { display: none; }
 }
     </style>
 </head>
@@ -368,6 +382,11 @@ footer small a:hover {
     <main>
         <article>
             <div class="doc-toolbar">
+                {% if let Some(exp) = expires_at %}
+                <div class="doc-expiry" data-expires="{{ exp }}">
+                    <span class="expiry-label">Expires in </span><span class="expiry-countdown"></span>
+                </div>
+                {% endif %}
                 <button class="doc-btn" id="btn-copy-url" title="Copy link to clipboard">
                     Copy link
                 </button>
@@ -438,6 +457,33 @@ footer small a:hover {
                 window.print();
             });
         }
+    })();
+
+    (function() {
+        var el = document.querySelector('.doc-expiry');
+        if (!el) return;
+        var exp = new Date(el.dataset.expires);
+
+        function update() {
+            var now = new Date();
+            var diff = exp - now;
+            if (diff <= 0) {
+                el.querySelector('.expiry-countdown').textContent = 'expired';
+                el.classList.add('expired');
+                return;
+            }
+            var h = Math.floor(diff / 3600000);
+            var m = Math.floor((diff % 3600000) / 60000);
+            var s = Math.floor((diff % 60000) / 1000);
+            var text = '';
+            if (h > 0) text += h + 'h ';
+            if (h > 0 || m > 0) text += m + 'm ';
+            text += s + 's';
+            el.querySelector('.expiry-countdown').textContent = text;
+            if (diff < 300000) el.classList.add('expiry-urgent');
+            requestAnimationFrame(update);
+        }
+        update();
     })();
     </script>
 </body>
