@@ -258,6 +258,32 @@ fn handle_tools_list(id: Value) -> Response {
                     },
                     "required": ["slug"]
                 }
+            },
+            {
+                "name": "twofold_update",
+                "description": "Update an existing document. Returns 404 if the slug does not exist. Use twofold_publish to create new documents.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "slug": {
+                            "type": "string",
+                            "description": "Slug of the document to update."
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "New markdown content for the document."
+                        },
+                        "title": {
+                            "type": "string",
+                            "description": "Optional new title (prepended as frontmatter if content has none)."
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "Optional new description."
+                        }
+                    },
+                    "required": ["slug", "content"]
+                }
             }
         ]
     }))
@@ -287,6 +313,7 @@ fn handle_tools_call(
         "twofold_get" => tool_get(client, server_url, token, &args),
         "twofold_list" => tool_list(client, server_url, token, &args),
         "twofold_delete" => tool_delete(client, server_url, token, &args),
+        "twofold_update" => tool_update(client, server_url, token, &args),
         _ => tool_result_err(format!("Unknown tool: {tool_name}")),
     };
 
@@ -466,6 +493,86 @@ fn tool_delete(
             }
         }
         Err(e) => tool_result_err(format!("Request failed: {e}")),
+    }
+}
+
+/// twofold_update: PUT to /api/v1/documents/:slug.
+///
+/// Builds body the same way as tool_publish (optional frontmatter injection),
+/// then sends a PUT request. Returns 404 if the slug does not exist.
+fn tool_update(
+    client: &reqwest::blocking::Client,
+    server_url: &str,
+    token: &str,
+    args: &Value,
+) -> Value {
+    let slug = match args.get("slug").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return tool_result_err("Missing required argument: slug".to_string()),
+    };
+
+    let content = match args.get("content").and_then(|v| v.as_str()) {
+        Some(c) => c,
+        None => return tool_result_err("Missing required argument: content".to_string()),
+    };
+
+    let title = args.get("title").and_then(|v| v.as_str());
+    let description = args.get("description").and_then(|v| v.as_str());
+
+    // Inject frontmatter for title/description if content has none.
+    // If content already starts with `---`, caller controls frontmatter.
+    let body = if !content.trim_start().starts_with("---") && (title.is_some() || description.is_some()) {
+        let mut fm = String::from("---\n");
+        if let Some(t) = title {
+            fm.push_str(&format!("title: {}\n", yaml_escape_value(t)));
+        }
+        if let Some(d) = description {
+            fm.push_str(&format!("description: {}\n", yaml_escape_value(d)));
+        }
+        fm.push_str("---\n");
+        fm.push_str(content);
+        fm
+    } else {
+        content.to_string()
+    };
+
+    let url = format!("{server_url}/api/v1/documents/{slug}");
+
+    match client
+        .put(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Content-Type", "text/markdown")
+        .body(body)
+        .send()
+    {
+        Ok(resp) => {
+            let status = resp.status();
+            let body_text = resp.text().unwrap_or_default();
+
+            if status.is_success() {
+                match serde_json::from_str::<Value>(&body_text) {
+                    Ok(json) => {
+                        let text = serde_json::to_string_pretty(&json).unwrap_or(body_text);
+                        tool_result_ok(text)
+                    }
+                    Err(_) => tool_result_ok(body_text),
+                }
+            } else if status.as_u16() == 404 {
+                tool_result_err(format!("Document not found: {slug}"))
+            } else if status.as_u16() == 410 {
+                tool_result_err(format!("Document has expired: {slug}"))
+            } else {
+                tool_result_err(format!("HTTP {}: {}", status.as_u16(), body_text))
+            }
+        }
+        Err(e) => {
+            let msg = if e.is_connect() || e.is_timeout() {
+                format!("Cannot reach twofold server at {server_url}: {e}")
+            } else {
+                format!("Request failed: {e}")
+            };
+            tool_result_err(msg)
+        }
     }
 }
 
