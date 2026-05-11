@@ -1,0 +1,35 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test
+      - run: cargo build --release
+
+  deploy:
+    name: Deploy to Flint
+    runs-on: ubuntu-latest
+    needs: [test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Deploy to Flint
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.FLINT_HOST }}
+          username: gabaum10
+          key: ${{ secrets.FLINT_SSH_KEY }}
+          script: |
+            cd ~/projects/twofold
+            git pull
+            cargo build --release
+            sudo systemctl restart twofold
