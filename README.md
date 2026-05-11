@@ -58,14 +58,12 @@ The markers are HTML comments. They're invisible in any standard markdown render
 ## Quick Start
 
 ```bash
-# Build from source
-git clone https://github.com/gabaum10/twofold.git
-cd twofold
-cargo build --release
+# Install from crates.io
+cargo install twofold
 
 # Run it
 export TWOFOLD_TOKEN="your-secret-token"
-./target/release/twofold serve
+twofold serve
 
 # Publish a document
 curl -X POST http://localhost:3000/api/v1/documents \
@@ -80,16 +78,26 @@ curl -X POST http://localhost:3000/api/v1/documents \
 Or pipe from stdin:
 
 ```bash
-cat report.md | ./target/release/twofold publish --server http://localhost:3000 --token $TWOFOLD_TOKEN
+cat report.md | twofold publish --server http://localhost:3000 --token $TWOFOLD_TOKEN
+```
+
+**Build from source:**
+
+```bash
+git clone https://github.com/gabaum10/twofold.git
+cd twofold
+cargo build --release
+./target/release/twofold serve
 ```
 
 ## Features
 
 - **Frontmatter** -- title, slug, theme, expiry, password, description (YAML in `---` fences)
 - **Custom slugs** -- choose your URL or let nanoid generate one
-- **Expiry** -- documents self-destruct (`30m`, `24h`, `7d`, `2w`) with background reaper
+- **Expiry** -- documents self-destruct (`30m`, `24h`, `7d`, `2w`) with background reaper; live countdown timer on the human view
 - **Password protection** -- per-document, argon2-hashed, cookie-based session
-- **Themes** -- clean (default), dark, paper, minimal, hearth
+- **Themes** -- clean (default), dark, paper, minimal, hearth; wider content layout (850px) with enhanced print CSS across all five themes
+- **PDF download** -- toolbar button triggers browser print-to-PDF
 - **Syntax highlighting** -- syntect-powered, theme-aware (light/dark palettes)
 - **Full CRUD** -- create, read, update, delete via REST
 - **MCP server** -- agents publish and retrieve natively via JSON-RPC over stdio
@@ -146,7 +154,8 @@ Runs on stdio (JSON-RPC, newline-delimited). Wire it into Claude Code or any MCP
 
 | Tool | Description |
 |------|-------------|
-| `twofold_publish` | Publish markdown. Accepts `content` (required), `title`, `slug`. Returns URL and slug. |
+| `twofold_publish` | Publish markdown. Accepts `content` (required), `title`, `slug`, `password`, `expiry`, `theme`, `description`. Returns URL and slug. |
+| `twofold_update` | Update a document by slug. Accepts `slug` (required), `content` (required), `title`, `description`, `password`, `expiry`, `theme`. |
 | `twofold_get` | Retrieve raw markdown by slug. |
 | `twofold_list` | List published documents. Optional `limit` (default 20, max 100). |
 | `twofold_delete` | Delete a document by slug. |
@@ -249,15 +258,17 @@ All config is via environment variables. No config files.
 ## CLI
 
 ```bash
-twofold serve                                    # Start server
-twofold publish <file|-> --server URL --token T  # Publish document
-twofold publish <file> --title "..." --slug X    # Publish with frontmatter flags
-twofold list --server URL --token T              # List documents
-twofold delete <slug> --server URL --token T     # Delete a document
-twofold token create --name "deploy-bot"         # Create API token
-twofold token list                               # List tokens
-twofold token revoke --name "deploy-bot"         # Revoke token
-twofold mcp                                      # Start MCP server (stdio)
+twofold serve                                              # Start server
+twofold publish <file|-> --server URL --token T            # Publish document
+twofold publish <file> --title "..." --slug X              # Publish with frontmatter flags
+twofold publish <file> --theme dark --expiry 7d            # Set theme and expiry
+twofold publish <file> --password secret --expiry 24h      # Password-protect with expiry
+twofold list --server URL --token T                        # List documents
+twofold delete <slug> --server URL --token T               # Delete a document
+twofold token create --name "deploy-bot"                   # Create API token
+twofold token list                                         # List tokens
+twofold token revoke --name "deploy-bot"                   # Revoke token
+twofold mcp                                                # Start MCP server (stdio)
 ```
 
 ## Agent Discovery
