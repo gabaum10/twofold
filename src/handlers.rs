@@ -84,6 +84,7 @@ struct CleanTemplate<'a> {
     slug: &'a str,
     /// When true, toolbar shows "Summary view" instead of "Full detail".
     full_view: bool,
+    body_empty: bool,
 }
 
 /// Dark theme template.
@@ -93,6 +94,7 @@ struct DarkTemplate<'a> {
     title: &'a str,
     content: &'a str,
     slug: &'a str,
+    body_empty: bool,
 }
 
 /// Paper theme template.
@@ -102,6 +104,7 @@ struct PaperTemplate<'a> {
     title: &'a str,
     content: &'a str,
     slug: &'a str,
+    body_empty: bool,
 }
 
 /// Minimal theme template.
@@ -111,6 +114,7 @@ struct MinimalTemplate<'a> {
     title: &'a str,
     content: &'a str,
     slug: &'a str,
+    body_empty: bool,
 }
 
 /// Hearth theme template.
@@ -121,6 +125,7 @@ struct HearthTemplate<'a> {
     content: &'a str,
     slug: &'a str,
     full_view: bool,
+    body_empty: bool,
 }
 
 /// Password prompt template.
@@ -855,26 +860,28 @@ fn render_themed_sync(title: &str, content: &str, slug: &str, theme: &str, full_
     let is_dark = theme == "dark";
     let highlighted = highlight::apply_syntax_highlighting(content, is_dark);
 
+    let body_empty = highlighted.trim().is_empty();
+
     let html = match theme {
         "dark" => {
-            let t = DarkTemplate { title, content: &highlighted, slug };
+            let t = DarkTemplate { title, content: &highlighted, slug, body_empty };
             t.render()
         }
         "paper" => {
-            let t = PaperTemplate { title, content: &highlighted, slug };
+            let t = PaperTemplate { title, content: &highlighted, slug, body_empty };
             t.render()
         }
         "minimal" => {
-            let t = MinimalTemplate { title, content: &highlighted, slug };
+            let t = MinimalTemplate { title, content: &highlighted, slug, body_empty };
             t.render()
         }
         "hearth" => {
-            let t = HearthTemplate { title, content: &highlighted, slug, full_view };
+            let t = HearthTemplate { title, content: &highlighted, slug, full_view, body_empty };
             t.render()
         }
         _ => {
             // "clean" or unknown -> default
-            let t = CleanTemplate { title, content: &highlighted, slug, full_view };
+            let t = CleanTemplate { title, content: &highlighted, slug, full_view, body_empty };
             t.render()
         }
     };

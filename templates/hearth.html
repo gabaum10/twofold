@@ -573,6 +573,8 @@ footer small a:hover {
    ═══════════════════════════════════════════ */
 
 @media print {
+    @page { margin: 2cm; }
+
     body {
         background: white;
         color: #2C2420;
@@ -622,6 +624,14 @@ footer small a:hover {
 
     th {
         color: #F5F0EB;
+    }
+
+    pre, blockquote, table {
+        page-break-inside: avoid;
+    }
+
+    h1, h2, h3, h4, h5, h6 {
+        page-break-after: avoid;
     }
 
     footer::before {
@@ -729,6 +739,7 @@ footer small a:hover {
                 <button class="doc-btn" id="btn-copy-md" title="Copy markdown source to clipboard">
                     Copy markdown
                 </button>
+                <button class="doc-btn" id="btn-pdf" title="Save as PDF"{% if body_empty %} hidden{% endif %}>PDF</button>
                 <a class="doc-btn" id="btn-view-raw" href="#" title="View raw markdown source">
                     View raw
                 </a>
@@ -801,6 +812,13 @@ footer small a:hover {
                     showToast('Copy failed');
                 });
         });
+
+        var btnPdf = document.getElementById('btn-pdf');
+        if (btnPdf) {
+            btnPdf.addEventListener('click', function() {
+                window.print();
+            });
+        }
     })();
     </script>
 </body>

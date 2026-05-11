@@ -303,6 +303,44 @@ footer small a:hover {
 }
 
 @media print {
+    @page { margin: 2cm; }
+
+    body {
+        background: white;
+        color: black;
+        font-size: 11pt;
+    }
+
+    main {
+        max-width: none;
+        padding: 0;
+    }
+
+    a {
+        color: inherit;
+        text-decoration: underline;
+    }
+
+    a[href^="http"]::after {
+        content: " (" attr(href) ")";
+        font-size: 0.8em;
+        color: #666;
+    }
+
+    pre, code {
+        background: #f5f5f5;
+        color: black;
+        border: 1px solid #ddd;
+    }
+
+    pre, blockquote, table {
+        page-break-inside: avoid;
+    }
+
+    h1, h2, h3, h4, h5, h6 {
+        page-break-after: avoid;
+    }
+
     .doc-toolbar, .doc-toast { display: none; }
 }
     </style>
@@ -317,6 +355,7 @@ footer small a:hover {
                 <button class="doc-btn" id="btn-copy-md" title="Copy markdown source to clipboard">
                     Copy markdown
                 </button>
+                <button class="doc-btn" id="btn-pdf" title="Save as PDF"{% if body_empty %} hidden{% endif %}>PDF</button>
                 <a class="doc-btn" id="btn-view-raw" href="#" title="View raw markdown source">
                     View raw
                 </a>
@@ -373,6 +412,13 @@ footer small a:hover {
                     showToast('Copy failed');
                 });
         });
+
+        var btnPdf = document.getElementById('btn-pdf');
+        if (btnPdf) {
+            btnPdf.addEventListener('click', function() {
+                window.print();
+            });
+        }
     })();
     </script>
 </body>
