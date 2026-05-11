@@ -572,12 +572,14 @@ pub async fn get_human(
     Query(params): Query<SlugQuery>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let doc = state.db.get_by_slug(&slug)?
-        .ok_or(AppError::NotFound)?;
+    let doc = match state.db.get_by_slug(&slug)? {
+        Some(d) => d,
+        None => return Ok(not_found_response()),
+    };
 
     // Expiry check (410 takes priority over password)
     if is_expired(&doc) {
-        return Err(AppError::Gone);
+        return Ok(gone_response());
     }
 
     // Password check (if document is protected)
@@ -634,11 +636,13 @@ pub async fn post_unlock(
     Path(slug): Path<String>,
     Form(form): Form<UnlockForm>,
 ) -> Result<Response, AppError> {
-    let doc = state.db.get_by_slug(&slug)?
-        .ok_or(AppError::NotFound)?;
+    let doc = match state.db.get_by_slug(&slug)? {
+        Some(d) => d,
+        None => return Ok(not_found_response()),
+    };
 
     if is_expired(&doc) {
-        return Err(AppError::Gone);
+        return Ok(gone_response());
     }
 
     let stored_hash = match &doc.password {
@@ -689,11 +693,13 @@ pub async fn get_full(
     Path(slug): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let doc = state.db.get_by_slug(&slug)?
-        .ok_or(AppError::NotFound)?;
+    let doc = match state.db.get_by_slug(&slug)? {
+        Some(d) => d,
+        None => return Ok(not_found_response()),
+    };
 
     if is_expired(&doc) {
-        return Err(AppError::Gone);
+        return Ok(gone_response());
     }
 
     // Password check
@@ -930,6 +936,329 @@ fn render_themed_sync(title: &str, content: &str, slug: &str, theme: &str, full_
 
     html.map(|h| Html(h).into_response())
         .map_err(|e| AppError::Internal(format!("Template render error: {e}")))
+}
+
+// ── Themed error page HTML ───────────────────────────────────────────────────
+
+/// Return a themed 404 HTML response (hearth palette).
+///
+/// Inlined so no Askama template dependency is needed for two-page error surfaces.
+/// All CSS is inline — zero external requests — matching the hearth.html contract.
+fn not_found_response() -> Response {
+    let html = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Document not found</title>
+    <style>
+/* twofold — error 404 page (hearth palette) */
+:root {
+    --bg: #F5F0EB;
+    --fg: #2C2420;
+    --fg-secondary: #6B5D52;
+    --fg-muted: #A89888;
+    --border: #E8E0D8;
+    --border-strong: #D4C8B8;
+    --accent: #C4762B;
+    --accent-hover: #A86220;
+    --font-body: Charter, 'Bitstream Charter', 'Sitka Text', Cambria, serif;
+    --font-heading: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    --max-width: 850px;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html {
+    font-size: 16px;
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--font-body);
+    font-size: 1.0625rem;
+    line-height: 1.75;
+    border-top: 4px solid var(--accent);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+}
+
+main {
+    flex: 1;
+    max-width: var(--max-width);
+    margin: 0 auto;
+    padding: 4rem 1.75rem 2.5rem;
+    width: 100%;
+}
+
+.error-code {
+    font-family: var(--font-heading);
+    font-size: 0.75rem;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 1rem;
+}
+
+h1 {
+    font-family: var(--font-heading);
+    font-size: 2rem;
+    font-weight: 800;
+    line-height: 1.15;
+    color: var(--accent);
+    margin: 0 0 1rem;
+    letter-spacing: -0.02em;
+    padding-bottom: 0.5rem;
+    border-bottom: 3px solid var(--accent);
+}
+
+p {
+    color: var(--fg-secondary);
+    margin: 0;
+    max-width: 36rem;
+}
+
+footer {
+    max-width: var(--max-width);
+    margin: 0 auto;
+    padding: 1.75rem 1.75rem 2.5rem;
+    text-align: center;
+    border-top: 1px solid var(--border-strong);
+    width: 100%;
+}
+
+footer::before {
+    content: "";
+    display: block;
+    width: 2.5rem;
+    height: 3px;
+    background: var(--accent);
+    margin: 0 auto 1rem;
+    border-radius: 2px;
+}
+
+footer small {
+    color: var(--fg-muted);
+    font-size: 0.7rem;
+    font-family: var(--font-heading);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+
+footer small a {
+    color: var(--accent);
+    text-decoration: underline;
+    text-decoration-thickness: 1px;
+    text-underline-offset: 2px;
+    transition: color 0.15s ease;
+}
+
+footer small a:hover {
+    color: var(--accent-hover);
+}
+
+@media (max-width: 600px) {
+    main { padding: 2.5rem 1rem 1.75rem; }
+    h1 { font-size: 1.625rem; }
+}
+    </style>
+</head>
+<body>
+    <main>
+        <p class="error-code">404</p>
+        <h1>Document not found</h1>
+        <p>This document doesn't exist, or the link may be incorrect.</p>
+    </main>
+    <footer>
+        <small>SHARED VIA FLINT &middot; TWOFOLD</small>
+    </footer>
+</body>
+</html>"#;
+    (
+        StatusCode::NOT_FOUND,
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        html,
+    )
+        .into_response()
+}
+
+/// Return a themed 410 HTML response (hearth palette, muted/faded to signal impermanence).
+///
+/// Visually distinct from 404: muted heading color, reduced accent bar opacity,
+/// and language that explains the document was intentionally time-limited.
+fn gone_response() -> Response {
+    let html = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Document expired</title>
+    <style>
+/* twofold — error 410 page (hearth palette, muted for impermanence) */
+:root {
+    --bg: #F5F0EB;
+    --fg: #2C2420;
+    --fg-secondary: #6B5D52;
+    --fg-muted: #A89888;
+    --border: #E8E0D8;
+    --border-strong: #D4C8B8;
+    --accent: #C4762B;
+    --accent-hover: #A86220;
+    --font-body: Charter, 'Bitstream Charter', 'Sitka Text', Cambria, serif;
+    --font-heading: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    --max-width: 850px;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html {
+    font-size: 16px;
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--font-body);
+    font-size: 1.0625rem;
+    line-height: 1.75;
+    /* Muted top bar — not gone, just quieter. Ember fading to ash. */
+    border-top: 4px solid var(--fg-muted);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+}
+
+main {
+    flex: 1;
+    max-width: var(--max-width);
+    margin: 0 auto;
+    padding: 4rem 1.75rem 2.5rem;
+    width: 100%;
+    /* Slightly washed out — this was here but isn't anymore */
+    opacity: 0.85;
+}
+
+.error-code {
+    font-family: var(--font-heading);
+    font-size: 0.75rem;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--fg-muted);
+    margin: 0 0 1rem;
+}
+
+h1 {
+    font-family: var(--font-heading);
+    font-size: 2rem;
+    font-weight: 800;
+    line-height: 1.15;
+    /* Secondary color instead of accent — the fire has gone out */
+    color: var(--fg-secondary);
+    margin: 0 0 1rem;
+    letter-spacing: -0.02em;
+    padding-bottom: 0.5rem;
+    /* Muted border — a trace of what was */
+    border-bottom: 3px solid var(--border-strong);
+}
+
+p {
+    color: var(--fg-muted);
+    margin: 0 0 1.5rem;
+    max-width: 36rem;
+}
+
+.expiry-mark {
+    display: inline-block;
+    width: 2rem;
+    height: 2px;
+    background: var(--border-strong);
+    border-radius: 2px;
+    vertical-align: middle;
+    margin-right: 0.5rem;
+    opacity: 0.6;
+}
+
+footer {
+    max-width: var(--max-width);
+    margin: 0 auto;
+    padding: 1.75rem 1.75rem 2.5rem;
+    text-align: center;
+    border-top: 1px solid var(--border-strong);
+    width: 100%;
+}
+
+footer::before {
+    content: "";
+    display: block;
+    width: 2.5rem;
+    height: 3px;
+    /* Footer ember stays warm even when document is gone */
+    background: var(--accent);
+    margin: 0 auto 1rem;
+    border-radius: 2px;
+    opacity: 0.5;
+}
+
+footer small {
+    color: var(--fg-muted);
+    font-size: 0.7rem;
+    font-family: var(--font-heading);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+
+footer small a {
+    color: var(--accent);
+    text-decoration: underline;
+    text-decoration-thickness: 1px;
+    text-underline-offset: 2px;
+    transition: color 0.15s ease;
+}
+
+footer small a:hover {
+    color: var(--accent-hover);
+}
+
+@media (max-width: 600px) {
+    main { padding: 2.5rem 1rem 1.75rem; }
+    h1 { font-size: 1.625rem; }
+}
+    </style>
+</head>
+<body>
+    <main>
+        <p class="error-code">410</p>
+        <h1>This document has expired</h1>
+        <p>This document was set to expire and has been removed.</p>
+        <p><span class="expiry-mark" aria-hidden="true"></span>The link is no longer valid.</p>
+    </main>
+    <footer>
+        <small>SHARED VIA FLINT &middot; TWOFOLD</small>
+    </footer>
+</body>
+</html>"#;
+    (
+        StatusCode::GONE,
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        html,
+    )
+        .into_response()
 }
 
 /// Check if a document has expired.
@@ -1182,6 +1511,229 @@ mod tests {
                     .delete(crate::handlers::delete_document),
             )
             .with_state(state)
+    }
+
+    /// Build a test router that includes both API routes AND human-facing routes.
+    ///
+    /// Used for testing themed error pages (404/410) from the human view.
+    fn test_app_full(token: &str) -> Router {
+        let db = crate::db::Db::open(":memory:").expect("in-memory db");
+        let config = Arc::new(crate::config::ServeConfig {
+            token: token.to_string(),
+            db_path: ":memory:".to_string(),
+            bind: "127.0.0.1:0".to_string(),
+            base_url: "http://localhost".to_string(),
+            default_theme: "clean".to_string(),
+            max_size: 1_048_576,
+            webhook_url: None,
+            webhook_secret: None,
+            reaper_interval: 3600,
+        });
+        let state = AppState { db, config };
+        Router::new()
+            .route(
+                "/api/v1/documents",
+                post(crate::handlers::post_document).get(crate::handlers::list_documents),
+            )
+            .route(
+                "/api/v1/documents/:slug",
+                get(crate::handlers::get_agent)
+                    .put(crate::handlers::put_document)
+                    .delete(crate::handlers::delete_document),
+            )
+            .route("/:slug/unlock", post(crate::handlers::post_unlock))
+            .route("/:slug/full", get(crate::handlers::get_full))
+            .route("/:slug", get(crate::handlers::get_human))
+            .with_state(state)
+    }
+
+    // ── Themed error page tests ───────────────────────────────────────────────
+
+    /// GET /:nonexistent-slug → 404 with themed HTML body.
+    #[tokio::test]
+    async fn test_human_get_nonexistent_returns_404_with_html() {
+        let token = "test-token";
+        let app = test_app_full(token);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/this-slug-does-not-exist")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            content_type.contains("text/html"),
+            "404 response should be HTML, got: {content_type}"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+
+        assert!(
+            text.contains("Document not found") || text.contains("not found"),
+            "404 body should contain 'not found' text"
+        );
+        assert!(
+            text.contains("FLINT") || text.contains("flint") || text.contains("twofold"),
+            "404 body should contain footer branding"
+        );
+        assert!(
+            text.contains("<!DOCTYPE html>"),
+            "404 body should be valid HTML"
+        );
+    }
+
+    /// An expired document via GET /:slug → 410 with themed HTML body.
+    #[tokio::test]
+    async fn test_human_get_expired_returns_410_with_html() {
+        let token = "test-token";
+
+        // We need to insert a document with a past expires_at directly — the publish
+        // API only accepts future durations (e.g., "1h"). Build the app with a shared
+        // DB handle so we can pre-seed the expired record.
+
+        let db = crate::db::Db::open(":memory:").expect("in-memory db");
+        let config = Arc::new(crate::config::ServeConfig {
+            token: token.to_string(),
+            db_path: ":memory:".to_string(),
+            bind: "127.0.0.1:0".to_string(),
+            base_url: "http://localhost".to_string(),
+            default_theme: "clean".to_string(),
+            max_size: 1_048_576,
+            webhook_url: None,
+            webhook_secret: None,
+            reaper_interval: 3600,
+        });
+
+        // Insert an already-expired document directly.
+        let expired_doc = crate::db::DocumentRecord {
+            id: "expired-slug".to_string(),
+            slug: "expired-slug".to_string(),
+            title: "Expired Doc".to_string(),
+            raw_content: "# Expired\nThis document has expired.".to_string(),
+            theme: "clean".to_string(),
+            password: None,
+            description: None,
+            created_at: "2020-01-01T00:00:00Z".to_string(),
+            expires_at: Some("2020-06-01T00:00:00Z".to_string()), // firmly in the past
+            updated_at: "2020-01-01T00:00:00Z".to_string(),
+        };
+        db.insert_document(&expired_doc).expect("insert expired doc");
+
+        let state = AppState { db, config };
+        let app = Router::new()
+            .route(
+                "/api/v1/documents",
+                post(crate::handlers::post_document).get(crate::handlers::list_documents),
+            )
+            .route(
+                "/api/v1/documents/:slug",
+                get(crate::handlers::get_agent)
+                    .put(crate::handlers::put_document)
+                    .delete(crate::handlers::delete_document),
+            )
+            .route("/:slug/unlock", post(crate::handlers::post_unlock))
+            .route("/:slug/full", get(crate::handlers::get_full))
+            .route("/:slug", get(crate::handlers::get_human))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/expired-slug")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::GONE);
+
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            content_type.contains("text/html"),
+            "410 response should be HTML, got: {content_type}"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+
+        assert!(
+            text.contains("expired") || text.contains("Expired"),
+            "410 body should contain 'expired' text"
+        );
+        assert!(
+            text.contains("FLINT") || text.contains("flint") || text.contains("twofold"),
+            "410 body should contain footer branding"
+        );
+        assert!(
+            text.contains("<!DOCTYPE html>"),
+            "410 body should be valid HTML"
+        );
+    }
+
+    /// API (agent) route still returns JSON 404 for nonexistent slugs.
+    ///
+    /// This confirms the themed HTML is ONLY for human-facing routes,
+    /// not for the machine API.
+    #[tokio::test]
+    async fn test_api_get_nonexistent_still_returns_json_404() {
+        let token = "test-token";
+        let app = test_app(token);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/documents/does-not-exist")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"].as_str().unwrap(), "Not found");
+    }
+
+    /// Password-protected doc that doesn't exist returns 404 (themed HTML),
+    /// not a password prompt.
+    #[tokio::test]
+    async fn test_nonexistent_protected_slug_returns_404_not_password_prompt() {
+        let token = "test-token";
+        let app = test_app_full(token);
+
+        // Request a slug that was never created — should be 404, not password form.
+        let req = Request::builder()
+            .method("GET")
+            .uri("/nonexistent-protected-slug")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+
+        // Should NOT contain password form elements
+        assert!(
+            !text.contains(r#"type="password""#),
+            "nonexistent slug should not show password prompt"
+        );
+        // Should contain 404 messaging
+        assert!(
+            text.contains("not found") || text.contains("Not found"),
+            "should contain not found message"
+        );
     }
 
     /// POST a document and return the slug from the JSON response.
