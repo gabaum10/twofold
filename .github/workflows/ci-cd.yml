@@ -21,6 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [test]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: Crate Deploy
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
