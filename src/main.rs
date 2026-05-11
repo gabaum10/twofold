@@ -16,7 +16,8 @@ use axum::{
 };
 use clap::Parser;
 use axum::http::HeaderValue;
-use tower_http::{set_header::SetResponseHeaderLayer, trace::TraceLayer};
+use tower::Layer;
+use tower_http::{normalize_path::NormalizePathLayer, set_header::SetResponseHeaderLayer, trace::TraceLayer};
 use tracing_subscriber::EnvFilter;
 
 use cli::{Cli, Commands, TokenAction};
@@ -147,6 +148,13 @@ async fn run_server() {
         .layer(DefaultBodyLimit::max(max_size))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
+
+    // Wrap the entire router with NormalizePath so trailing slashes are stripped
+    // before Axum's router sees the request path. NormalizePathLayer::layer()
+    // produces a Service, not a MakeService, so we call into_make_service() on
+    // the wrapped service via axum::ServiceExt.
+    let app = NormalizePathLayer::trim_trailing_slash().layer(app);
+    let app = axum::ServiceExt::<axum::http::Request<axum::body::Body>>::into_make_service(app);
 
     let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
         Ok(l) => l,
