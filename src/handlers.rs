@@ -41,6 +41,10 @@ pub enum AppError {
     Conflict(String),
     Gone,
     Internal(String),
+    /// Document is password-protected and no password was supplied.
+    DocumentPasswordRequired,
+    /// Document is password-protected and the supplied password was wrong.
+    DocumentPasswordInvalid,
 }
 
 impl IntoResponse for AppError {
@@ -52,6 +56,12 @@ impl IntoResponse for AppError {
             AppError::Conflict(m) => (StatusCode::CONFLICT, m),
             AppError::Gone => (StatusCode::GONE, "Document has expired".to_string()),
             AppError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
+            AppError::DocumentPasswordRequired => {
+                (StatusCode::UNAUTHORIZED, "Password required".to_string())
+            }
+            AppError::DocumentPasswordInvalid => {
+                (StatusCode::UNAUTHORIZED, "Invalid password".to_string())
+            }
         };
         (status, Json(serde_json::json!({ "error": msg }))).into_response()
     }
@@ -722,17 +732,42 @@ pub async fn get_full(
 
 // ── GET /api/v1/documents/:slug (agent view) ─────────────────────────────────
 
+/// Query parameters for GET /api/v1/documents/:slug (agent view).
+#[derive(Deserialize)]
+pub struct AgentQuery {
+    pub password: Option<String>,
+}
+
 /// Return the full raw source markdown.
-/// Agent view is NOT password-gated.
+///
+/// Password-protected documents require the correct password as a query
+/// parameter (`?password=<value>`). Returns 401 with a JSON error body if
+/// the document is protected and the password is missing or incorrect.
 pub async fn get_agent(
     State(state): State<AppState>,
     Path(slug): Path<String>,
+    Query(params): Query<AgentQuery>,
 ) -> Result<Response, AppError> {
     let doc = state.db.get_by_slug(&slug)?
         .ok_or(AppError::NotFound)?;
 
     if is_expired(&doc) {
         return Err(AppError::Gone);
+    }
+
+    // Password gate — same argon2 check as the human view.
+    if let Some(stored_hash) = &doc.password {
+        match params.password.as_deref() {
+            Some(provided) if verify_password(provided, stored_hash) => {
+                // Correct password — fall through to serve content.
+            }
+            Some(_) => {
+                return Err(AppError::DocumentPasswordInvalid);
+            }
+            None => {
+                return Err(AppError::DocumentPasswordRequired);
+            }
+        }
     }
 
     Ok(markdown_response(&doc.raw_content))
@@ -1311,5 +1346,104 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         // Slug in response must match the URL slug, not the frontmatter slug.
         assert_eq!(json["slug"].as_str().unwrap(), "original-slug");
+    }
+
+    // ── GET /api/v1/documents/:slug password gate tests ───────────────────────
+
+    /// Publish a password-protected document and return its slug.
+    async fn publish_protected_doc(app: Router, token: &str, slug: &str, password: &str) -> String {
+        let body = format!("---\nslug: {slug}\npassword: {password}\n---\nSecret content.");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/documents")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "text/markdown")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED, "publish protected doc failed");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        json["slug"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn test_agent_get_protected_doc_correct_password_returns_content() {
+        let token = "test-token";
+        let app = test_app(token);
+
+        let slug = publish_protected_doc(app.clone(), token, "pw-correct", "hunter2").await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/documents/{slug}?password=hunter2"))
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("Secret content."), "body should contain document content");
+    }
+
+    #[tokio::test]
+    async fn test_agent_get_protected_doc_wrong_password_returns_401() {
+        let token = "test-token";
+        let app = test_app(token);
+
+        let slug = publish_protected_doc(app.clone(), token, "pw-wrong", "hunter2").await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/documents/{slug}?password=wrongpass"))
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"].as_str().unwrap(), "Invalid password");
+    }
+
+    #[tokio::test]
+    async fn test_agent_get_protected_doc_no_password_returns_401() {
+        let token = "test-token";
+        let app = test_app(token);
+
+        let slug = publish_protected_doc(app.clone(), token, "pw-none", "hunter2").await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/documents/{slug}"))
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"].as_str().unwrap(), "Password required");
+    }
+
+    #[tokio::test]
+    async fn test_agent_get_unprotected_doc_works_without_password() {
+        let token = "test-token";
+        let app = test_app(token);
+
+        let slug = publish_doc(app.clone(), token, "no-pw-doc", "# Public\nOpen content.").await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/documents/{slug}"))
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("Open content."), "unprotected doc should be served without password");
     }
 }

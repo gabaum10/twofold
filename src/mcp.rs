@@ -190,7 +190,7 @@ fn handle_initialize(id: Value) -> Response {
         "protocolVersion": "2024-11-05",
         "serverInfo": {
             "name": "twofold",
-            "version": "0.3.0"
+            "version": "0.3.5"
         },
         "capabilities": {
             "tools": {}
@@ -245,7 +245,11 @@ fn handle_tools_list(id: Value) -> Response {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "slug": { "type": "string", "description": "Document slug." }
+                        "slug": { "type": "string", "description": "Document slug." },
+                        "password": {
+                            "type": "string",
+                            "description": "Password for protected documents. Required if the document has a password set."
+                        }
                     },
                     "required": ["slug"]
                 }
@@ -453,7 +457,15 @@ fn tool_get(
         None => return tool_result_err("Missing required argument: slug".to_string()),
     };
 
-    let url = format!("{server_url}/api/v1/documents/{slug}");
+    let password = args.get("password").and_then(|v| v.as_str());
+
+    // Append ?password=<value> when the caller supplies one.
+    let url = if let Some(pw) = password {
+        let encoded = percent_encode(pw);
+        format!("{server_url}/api/v1/documents/{slug}?password={encoded}")
+    } else {
+        format!("{server_url}/api/v1/documents/{slug}")
+    };
 
     match client
         .get(&url)
@@ -465,6 +477,8 @@ fn tool_get(
             let body = resp.text().unwrap_or_default();
             if status.is_success() {
                 tool_result_ok(body)
+            } else if status.as_u16() == 401 {
+                tool_result_err(format!("Document is password-protected: {body}"))
             } else if status.as_u16() == 404 {
                 tool_result_err(format!("Document not found: {slug}"))
             } else {
@@ -634,6 +648,24 @@ fn tool_update(
             tool_result_err(msg)
         }
     }
+}
+
+// ── URL helpers ───────────────────────────────────────────────────────────────
+
+/// Percent-encode a string for safe inclusion as a URL query parameter value.
+///
+/// Encodes all characters except unreserved ones (A-Z, a-z, 0-9, `-`, `_`,
+/// `.`, `~`). This covers passwords that contain spaces, `@`, `/`, `+`, etc.
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
+            | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 // ── YAML value escaping ───────────────────────────────────────────────────────
