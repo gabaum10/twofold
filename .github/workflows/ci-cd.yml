@@ -19,25 +19,38 @@ jobs:
     name: Publish to crates.io
     runs-on: ubuntu-latest
     needs: [test]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && !contains(github.event.head_commit.message, '[skip ci]')
     environment: Crate Deploy
     steps:
       - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
-      - name: Check if version is already published
-        id: version_check
+      - name: Auto-bump patch version if already published
         run: |
-          LOCAL=$(cargo metadata --no-deps --format-version 1 | python3 -c "import sys,json; print(json.load(sys.stdin)['packages'][0]['version'])")
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
           PUBLISHED=$(curl -s https://crates.io/api/v1/crates/twofold | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['crate']['newest_version'])" 2>/dev/null || echo "none")
-          echo "local=$LOCAL" >> $GITHUB_OUTPUT
-          echo "published=$PUBLISHED" >> $GITHUB_OUTPUT
-          if [ "$LOCAL" = "$PUBLISHED" ]; then
-            echo "skip=true" >> $GITHUB_OUTPUT
+          echo "Local version:     $VERSION"
+          echo "Published version: $PUBLISHED"
+          if [ "$VERSION" = "$PUBLISHED" ]; then
+            echo "Version already published -- bumping patch..."
+            MAJOR=$(echo $VERSION | cut -d. -f1)
+            MINOR=$(echo $VERSION | cut -d. -f2)
+            PATCH=$(echo $VERSION | cut -d. -f3)
+            NEW_PATCH=$((PATCH + 1))
+            NEW_VERSION="$MAJOR.$MINOR.$NEW_PATCH"
+            echo "New version: $NEW_VERSION"
+            sed -i "s/^version = \"$VERSION\"/version = \"$NEW_VERSION\"/" Cargo.toml
+            cargo check
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add Cargo.toml Cargo.lock
+            git commit -m "chore: bump version to $NEW_VERSION [skip ci]"
+            git push
           else
-            echo "skip=false" >> $GITHUB_OUTPUT
+            echo "Version not yet published -- proceeding with $VERSION"
           fi
       - name: Publish
-        if: steps.version_check.outputs.skip == 'false'
         run: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
