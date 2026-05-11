@@ -32,7 +32,13 @@ jobs:
       - name: Auto-bump patch version if already published
         run: |
           VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-          PUBLISHED=$(curl -s https://crates.io/api/v1/crates/twofold | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['crate']['newest_version'])" 2>/dev/null || echo "none")
+          CRATE_JSON=$(curl -sf -H "User-Agent: twofold-ci (github.com/gabaum10/twofold)" https://crates.io/api/v1/crates/twofold)
+          if [ $? -ne 0 ] || [ -z "$CRATE_JSON" ]; then
+            echo "WARNING: Failed to query crates.io API"
+            PUBLISHED="none"
+          else
+            PUBLISHED=$(echo "$CRATE_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['crate']['newest_version'])" 2>&1) || PUBLISHED="none"
+          fi
           echo "Local version:     $VERSION"
           echo "Published version: $PUBLISHED"
           if [ "$VERSION" = "$PUBLISHED" ]; then
