@@ -95,7 +95,12 @@ async fn run_server() {
         config: Arc::new(config),
     };
 
-    // Spawn the background reaper task for expired documents
+    // Spawn the background reaper task for expired documents.
+    //
+    // Strategy: soft-delete tombstoning. Expired documents are NOT immediately
+    // deleted — the handler's is_expired() check returns 410 for them. The reaper
+    // only hard-deletes documents that expired MORE than 30 days ago, giving the
+    // 410 page a 30-day window before the tombstone is discarded.
     let reaper_db = db.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(
@@ -104,13 +109,13 @@ async fn run_server() {
         loop {
             interval.tick().await;
             let now = handlers::chrono_now();
-            match reaper_db.delete_expired(&now) {
+            match reaper_db.delete_expired_older_than(&now, 30) {
                 Ok(count) if count > 0 => {
-                    tracing::info!(count, "Reaper cleaned up expired documents");
+                    tracing::info!(count, "Reaper garbage-collected tombstones older than 30 days");
                 }
-                Ok(_) => {} // nothing to reap
+                Ok(_) => {} // nothing old enough to reap
                 Err(e) => {
-                    tracing::error!(error = %e, "Reaper failed to delete expired documents");
+                    tracing::error!(error = %e, "Reaper failed to garbage-collect expired documents");
                 }
             }
         }
