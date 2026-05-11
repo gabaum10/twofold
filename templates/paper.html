@@ -354,7 +354,14 @@ footer small a:hover {
     }
 
     pre, code {
+        background: #f5f0e8;
+        color: #444444;
         border: 1px solid #ddd;
+    }
+
+    /* Decorative opening quote clips at page edges in print */
+    blockquote::before {
+        display: none;
     }
 
     pre, blockquote, table {

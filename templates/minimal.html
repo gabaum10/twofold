@@ -296,8 +296,8 @@ footer small a:hover {
     @page { margin: 2cm; }
 
     body {
-        background: white;
-        color: #111111;
+        background: white !important;
+        color: #111111 !important;
         font-size: 11pt;
     }
 
@@ -306,8 +306,13 @@ footer small a:hover {
         padding: 0;
     }
 
+    h1, h2, h3, h4, h5, h6 {
+        color: #111111 !important;
+        page-break-after: avoid;
+    }
+
     a {
-        color: inherit;
+        color: #111111 !important;
         text-decoration: underline;
     }
 
@@ -317,8 +322,19 @@ footer small a:hover {
         color: #666;
     }
 
+    /* Reset syntect inline styles if dark palette was used */
+    pre[style] {
+        background: #f7f7f7 !important;
+        border: 1px solid #eee !important;
+    }
+
+    pre span[style] {
+        color: #333 !important;
+    }
+
     pre, code {
-        background: #f7f7f7;
+        background: #f7f7f7 !important;
+        color: #333 !important;
         border: 1px solid #eee;
     }
 
@@ -326,8 +342,8 @@ footer small a:hover {
         page-break-inside: avoid;
     }
 
-    h1, h2, h3, h4, h5, h6 {
-        page-break-after: avoid;
+    blockquote {
+        color: #555 !important;
     }
 
     .doc-toolbar, .doc-toast { display: none; }
