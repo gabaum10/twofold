@@ -1246,7 +1246,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_put_updated_at_changes() {
+    async fn test_put_response_is_well_formed() {
         let token = "test-token";
         let app = test_app(token);
 
