@@ -218,6 +218,22 @@ fn handle_tools_list(id: Value) -> Response {
                         "slug": {
                             "type": "string",
                             "description": "Optional custom URL slug."
+                        },
+                        "password": {
+                            "type": "string",
+                            "description": "Optional password to protect the document."
+                        },
+                        "expiry": {
+                            "type": "string",
+                            "description": "Optional expiry duration (e.g. '7d', '24h', '2w'). Document is automatically deleted after expiry."
+                        },
+                        "theme": {
+                            "type": "string",
+                            "description": "Optional theme name."
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "Optional document description."
                         }
                     },
                     "required": ["content"]
@@ -279,7 +295,19 @@ fn handle_tools_list(id: Value) -> Response {
                         },
                         "description": {
                             "type": "string",
-                            "description": "Optional new description."
+                            "description": "Optional document description."
+                        },
+                        "password": {
+                            "type": "string",
+                            "description": "Optional password to protect the document."
+                        },
+                        "expiry": {
+                            "type": "string",
+                            "description": "Optional expiry duration (e.g. '7d', '24h', '2w'). Document is automatically deleted after expiry."
+                        },
+                        "theme": {
+                            "type": "string",
+                            "description": "Optional theme name."
                         }
                     },
                     "required": ["slug", "content"]
@@ -340,10 +368,16 @@ fn tool_publish(
 
     let title = args.get("title").and_then(|v| v.as_str());
     let slug = args.get("slug").and_then(|v| v.as_str());
+    let password = args.get("password").and_then(|v| v.as_str());
+    let expiry = args.get("expiry").and_then(|v| v.as_str());
+    let theme = args.get("theme").and_then(|v| v.as_str());
+    let description = args.get("description").and_then(|v| v.as_str());
 
     // Determine whether to inject frontmatter.
     // If content already starts with `---`, the caller controls frontmatter.
-    let body = if !content.trim_start().starts_with("---") && (title.is_some() || slug.is_some()) {
+    let has_fm_args = title.is_some() || slug.is_some() || password.is_some()
+        || expiry.is_some() || theme.is_some() || description.is_some();
+    let body = if !content.trim_start().starts_with("---") && has_fm_args {
         // Build frontmatter block. YAML-escape values to handle special chars.
         let mut fm = String::from("---\n");
         if let Some(t) = title {
@@ -351,6 +385,18 @@ fn tool_publish(
         }
         if let Some(s) = slug {
             fm.push_str(&format!("slug: {}\n", yaml_escape_value(s)));
+        }
+        if let Some(p) = password {
+            fm.push_str(&format!("password: {}\n", yaml_escape_value(p)));
+        }
+        if let Some(ex) = expiry {
+            fm.push_str(&format!("expiry: {}\n", yaml_escape_value(ex)));
+        }
+        if let Some(th) = theme {
+            fm.push_str(&format!("theme: {}\n", yaml_escape_value(th)));
+        }
+        if let Some(d) = description {
+            fm.push_str(&format!("description: {}\n", yaml_escape_value(d)));
         }
         fm.push_str("---\n");
         fm.push_str(content);
@@ -518,16 +564,30 @@ fn tool_update(
 
     let title = args.get("title").and_then(|v| v.as_str());
     let description = args.get("description").and_then(|v| v.as_str());
+    let password = args.get("password").and_then(|v| v.as_str());
+    let expiry = args.get("expiry").and_then(|v| v.as_str());
+    let theme = args.get("theme").and_then(|v| v.as_str());
 
-    // Inject frontmatter for title/description if content has none.
+    // Inject frontmatter for provided fields if content has none.
     // If content already starts with `---`, caller controls frontmatter.
-    let body = if !content.trim_start().starts_with("---") && (title.is_some() || description.is_some()) {
+    let has_fm_args = title.is_some() || description.is_some() || password.is_some()
+        || expiry.is_some() || theme.is_some();
+    let body = if !content.trim_start().starts_with("---") && has_fm_args {
         let mut fm = String::from("---\n");
         if let Some(t) = title {
             fm.push_str(&format!("title: {}\n", yaml_escape_value(t)));
         }
         if let Some(d) = description {
             fm.push_str(&format!("description: {}\n", yaml_escape_value(d)));
+        }
+        if let Some(p) = password {
+            fm.push_str(&format!("password: {}\n", yaml_escape_value(p)));
+        }
+        if let Some(ex) = expiry {
+            fm.push_str(&format!("expiry: {}\n", yaml_escape_value(ex)));
+        }
+        if let Some(th) = theme {
+            fm.push_str(&format!("theme: {}\n", yaml_escape_value(th)));
         }
         fm.push_str("---\n");
         fm.push_str(content);

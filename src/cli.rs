@@ -80,6 +80,10 @@ pub struct PublishArgs {
     /// Expiry duration (e.g., 7d, 24h, 30m, 2w).
     #[arg(long)]
     pub expiry: Option<String>,
+
+    /// Password to protect the document.
+    #[arg(long)]
+    pub password: Option<String>,
 }
 
 /// Arguments for the `list` subcommand.

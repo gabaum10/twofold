@@ -179,7 +179,7 @@ fn run_publish(args: cli::PublishArgs) {
     // Apply frontmatter from CLI flags if any flags were provided.
     // If content already has frontmatter (starts with ---), merge flags in.
     // If no frontmatter and no flags, send as-is.
-    let body = apply_publish_flags(content, args.title, args.slug, args.theme, args.expiry);
+    let body = apply_publish_flags(content, args.title, args.slug, args.theme, args.expiry, args.password);
 
     // POST to the server.
     let url = format!("{}/api/v1/documents", args.server.trim_end_matches('/'));
@@ -244,8 +244,10 @@ fn apply_publish_flags(
     slug: Option<String>,
     theme: Option<String>,
     expiry: Option<String>,
+    password: Option<String>,
 ) -> String {
-    let has_flags = title.is_some() || slug.is_some() || theme.is_some() || expiry.is_some();
+    let has_flags = title.is_some() || slug.is_some() || theme.is_some()
+        || expiry.is_some() || password.is_some();
     if !has_flags {
         return content;
     }
@@ -253,7 +255,7 @@ fn apply_publish_flags(
     let trimmed = content.trim_start();
     if trimmed.starts_with("---") {
         // Content has frontmatter — parse and merge CLI flags.
-        merge_frontmatter_flags(content, title, slug, theme, expiry)
+        merge_frontmatter_flags(content, title, slug, theme, expiry, password)
     } else {
         // No frontmatter — prepend it.
         let mut fm = String::from("---\n");
@@ -268,6 +270,9 @@ fn apply_publish_flags(
         }
         if let Some(ex) = expiry {
             fm.push_str(&format!("expiry: {}\n", crate::mcp::yaml_escape_value_pub(&ex)));
+        }
+        if let Some(pw) = password {
+            fm.push_str(&format!("password: {}\n", crate::mcp::yaml_escape_value_pub(&pw)));
         }
         fm.push_str("---\n");
         fm.push_str(&content);
@@ -287,6 +292,7 @@ fn merge_frontmatter_flags(
     slug: Option<String>,
     theme: Option<String>,
     expiry: Option<String>,
+    password: Option<String>,
 ) -> String {
     let lines: Vec<&str> = content.lines().collect();
 
@@ -317,6 +323,9 @@ fn merge_frontmatter_flags(
             if let Some(ex) = expiry {
                 fm.push_str(&format!("expiry: {}\n", crate::mcp::yaml_escape_value_pub(&ex)));
             }
+            if let Some(pw) = password {
+                fm.push_str(&format!("password: {}\n", crate::mcp::yaml_escape_value_pub(&pw)));
+            }
             fm.push_str("---\n");
             fm.push_str(&content);
             return fm;
@@ -329,6 +338,7 @@ fn merge_frontmatter_flags(
         slug.as_deref().map(|v| ("slug", v)),
         theme.as_deref().map(|v| ("theme", v)),
         expiry.as_deref().map(|v| ("expiry", v)),
+        password.as_deref().map(|v| ("password", v)),
     ]
     .into_iter()
     .flatten()
