@@ -871,9 +871,9 @@ footer small a:hover {
             text += s + 's';
             el.querySelector('.expiry-countdown').textContent = text;
             if (diff < 300000) el.classList.add('expiry-urgent');
-            requestAnimationFrame(update);
         }
         update();
+        setInterval(update, 1000);
     })();
     </script>
 </body>

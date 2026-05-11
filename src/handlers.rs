@@ -380,22 +380,23 @@ pub async fn put_document(
     // Theme
     let theme = meta.theme.unwrap_or_else(|| state.config.default_theme.clone());
 
-    // Expiry (can be added, changed, or removed on PUT)
+    // Expiry: None = keep existing, Some("") = clear, Some(value) = set new
     let now = chrono_now();
     let expires_at = match meta.expiry.as_deref() {
-        Some(exp) => {
+        Some(exp) if !exp.is_empty() => {
             let seconds = parse_expiry(exp)
                 .map_err(|e| AppError::BadRequest(e))?;
             Some(add_seconds_to_now(&now, seconds))
         }
-        None => None, // Remove expiry if not in frontmatter
+        Some(_) => None,                      // empty string = clear
+        None => existing.expires_at.clone(),  // absent = preserve
     };
 
-    // Password: update or clear
+    // Password: None = keep existing, Some("") = clear, Some(value) = set new
     let password_hash = match meta.password.as_deref() {
         Some(pw) if !pw.is_empty() => Some(hash_password(pw)?),
-        Some(_) => None, // empty password = clear
-        None => None,    // no password field = clear
+        Some(_) => None,                      // empty string = clear
+        None => existing.password.clone(),    // absent = preserve
     };
 
     let updated_doc = DocumentRecord {

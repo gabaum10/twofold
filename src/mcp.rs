@@ -190,7 +190,7 @@ fn handle_initialize(id: Value) -> Response {
         "protocolVersion": "2024-11-05",
         "serverInfo": {
             "name": "twofold",
-            "version": "0.3.5"
+            "version": env!("CARGO_PKG_VERSION")
         },
         "capabilities": {
             "tools": {}

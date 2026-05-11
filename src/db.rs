@@ -210,12 +210,18 @@ impl Db {
         }
     }
 
-    /// Delete all expired documents. Returns count of deleted rows.
-    pub fn delete_expired(&self, now: &str) -> Result<usize> {
+    /// Delete documents that expired more than `days` days ago.
+    ///
+    /// Used by the reaper for tombstone garbage collection: expired docs stay
+    /// in the database (returning 410) until they're old enough to discard.
+    /// The cutoff is computed from `now` using SQLite's datetime arithmetic.
+    pub fn delete_expired_older_than(&self, now: &str, days: u32) -> Result<usize> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let rows = conn.execute(
-            "DELETE FROM documents WHERE expires_at IS NOT NULL AND expires_at < ?1",
-            params![now],
+            "DELETE FROM documents \
+             WHERE expires_at IS NOT NULL \
+               AND expires_at < datetime(?1, printf('-%d days', ?2))",
+            params![now, days],
         )?;
         Ok(rows)
     }
