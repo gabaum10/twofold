@@ -22,6 +22,12 @@ pub struct ServeConfig {
     pub webhook_url: Option<String>,
     /// HMAC-SHA256 signing secret for webhooks (TWOFOLD_WEBHOOK_SECRET — optional)
     pub webhook_secret: Option<String>,
+    /// Max read requests per IP per window (TWOFOLD_RATE_LIMIT_READ — default: 60)
+    pub rate_limit_read: u32,
+    /// Max write requests per token per window (TWOFOLD_RATE_LIMIT_WRITE — default: 30)
+    pub rate_limit_write: u32,
+    /// Window duration in seconds for both buckets (TWOFOLD_RATE_LIMIT_WINDOW — default: 60)
+    pub rate_limit_window: u64,
 }
 
 impl ServeConfig {
@@ -75,6 +81,28 @@ impl ServeConfig {
             .ok()
             .and_then(|s| if s.is_empty() { None } else { Some(s) });
 
+        // Rate limiting configuration — all optional with sensible defaults.
+        let rate_limit_read = match std::env::var("TWOFOLD_RATE_LIMIT_READ") {
+            Ok(s) => s.parse::<u32>().map_err(|_| {
+                format!("TWOFOLD_RATE_LIMIT_READ must be a positive integer, got: {s}")
+            })?,
+            Err(_) => 60,
+        };
+
+        let rate_limit_write = match std::env::var("TWOFOLD_RATE_LIMIT_WRITE") {
+            Ok(s) => s.parse::<u32>().map_err(|_| {
+                format!("TWOFOLD_RATE_LIMIT_WRITE must be a positive integer, got: {s}")
+            })?,
+            Err(_) => 30,
+        };
+
+        let rate_limit_window = match std::env::var("TWOFOLD_RATE_LIMIT_WINDOW") {
+            Ok(s) => s.parse::<u64>().map_err(|_| {
+                format!("TWOFOLD_RATE_LIMIT_WINDOW must be a positive integer, got: {s}")
+            })?,
+            Err(_) => 60,
+        };
+
         Ok(ServeConfig {
             token,
             bind,
@@ -85,6 +113,9 @@ impl ServeConfig {
             default_theme,
             webhook_url,
             webhook_secret,
+            rate_limit_read,
+            rate_limit_write,
+            rate_limit_window,
         })
     }
 }
