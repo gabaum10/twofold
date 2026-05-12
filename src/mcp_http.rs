@@ -1,7 +1,7 @@
 /// Remote MCP HTTP transport — `POST /mcp`
 ///
-/// Accepts JSON-RPC messages over HTTP, validates bearer auth, dispatches to
-/// the same `mcp::handle_request` logic used by the stdio transport.
+/// Accepts JSON-RPC messages over HTTP and dispatches to the same
+/// `mcp::handle_request` logic used by the stdio transport.
 ///
 /// Design notes:
 /// - `reqwest::blocking::Client` panics when called inside a Tokio async
@@ -11,31 +11,25 @@
 ///   per the JSON-RPC spec.
 /// - No CORS headers: this endpoint is server-to-server only.
 /// - No SSE: all MCP tools are quick round-trips; streaming is not needed.
-/// - Auth: same bearer token as the document API. The handler checks auth
-///   internally so the route needs no middleware wrapper.
+/// - Auth: none. The endpoint is public. TWOFOLD_MCP_TOKEN is used internally
+///   for the handler's onward calls to the document API.
 use axum::{
     extract::State,
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::{IntoResponse, Response},
 };
 use serde_json::Value;
 
 use crate::{
-    handlers::{check_auth, AppState},
+    handlers::AppState,
     mcp,
 };
 
-/// POST /mcp — remote MCP JSON-RPC endpoint.
+/// POST /mcp — remote MCP JSON-RPC endpoint (unauthenticated).
 pub async fn handle_mcp_post(
-    State(state): State<AppState>,
-    headers: HeaderMap,
+    State(_state): State<AppState>,
     body: axum::body::Bytes,
 ) -> Response {
-    // Auth check first — before touching the body.
-    if let Err(e) = check_auth(&state, &headers).await {
-        return e.into_response();
-    }
-
     // Parse the JSON-RPC request.
     let request: mcp::Request = match serde_json::from_slice(&body) {
         Ok(r) => r,
