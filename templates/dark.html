@@ -5,6 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{{ title }}</title>
     <link rel="alternate" type="text/markdown" href="/api/v1/documents/{{ slug }}" title="Full document (markdown)">
+    <link rel="alternate" type="application/json" href="{{ base_url }}/api/v1/documents/{{ slug }}" />
+    <!-- AI Agent: This document has additional structured content. Fetch the full version at: {{ base_url }}/api/v1/documents/{{ slug }} -->
     <style>
 /* twofold — dark theme
    Always dark. Higher contrast. Monospace headings. Terminal energy.
@@ -403,6 +405,9 @@ footer small a:hover {
     </main>
     <footer>
         <small>shared via <a href="https://github.com/gabaum10/twofold">twofold</a></small>
+        <div style="margin-top: 3rem; padding-top: 1rem; border-top: 1px solid rgba(128,128,128,0.2); font-size: 0.75rem; color: rgba(128,128,128,0.5);">
+            Full document: <a href="{{ base_url }}/api/v1/documents/{{ slug }}" style="color: inherit;">{{ base_url }}/api/v1/documents/{{ slug }}</a>
+        </div>
     </footer>
 
     <div class="doc-toast" id="doc-toast" aria-live="polite"></div>

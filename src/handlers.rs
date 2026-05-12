@@ -148,6 +148,7 @@ struct CleanTemplate<'a> {
     title: &'a str,
     content: &'a str,
     slug: &'a str,
+    base_url: &'a str,
     /// When true, toolbar shows "Summary view" instead of "Full detail".
     full_view: bool,
     body_empty: bool,
@@ -161,6 +162,7 @@ struct DarkTemplate<'a> {
     title: &'a str,
     content: &'a str,
     slug: &'a str,
+    base_url: &'a str,
     body_empty: bool,
     expires_at: Option<String>,
 }
@@ -172,6 +174,7 @@ struct PaperTemplate<'a> {
     title: &'a str,
     content: &'a str,
     slug: &'a str,
+    base_url: &'a str,
     body_empty: bool,
     expires_at: Option<String>,
 }
@@ -183,6 +186,7 @@ struct MinimalTemplate<'a> {
     title: &'a str,
     content: &'a str,
     slug: &'a str,
+    base_url: &'a str,
     body_empty: bool,
     expires_at: Option<String>,
 }
@@ -194,6 +198,7 @@ struct HearthTemplate<'a> {
     title: &'a str,
     content: &'a str,
     slug: &'a str,
+    base_url: &'a str,
     full_view: bool,
     body_empty: bool,
     expires_at: Option<String>,
@@ -697,6 +702,8 @@ pub async fn get_human(
     let theme = doc.theme.clone();
     let slug_owned = slug.clone();
     let expires_at = doc.expires_at.clone();
+    let base_url = state.config.base_url.trim_end_matches('/').to_string();
+    let base_url_clone = base_url.clone();
 
     let html_result = tokio::task::spawn_blocking(move || {
         let fm_result = extract_frontmatter(&raw_content)
@@ -707,12 +714,23 @@ pub async fn get_human(
 
         let parse_result = parse_document(&fm_result.body, &slug_owned);
         let rendered_html = render_markdown(&parse_result.human);
-        render_themed_sync(&title, &rendered_html, &slug_owned, &theme, false, expires_at)
+        render_themed_sync(&title, &rendered_html, &slug_owned, &theme, &base_url_clone, false, expires_at)
     })
     .await
     .map_err(|e| AppError::Internal(format!("Render task failed: {e}")))?;
 
-    html_result
+    // Add Link header pointing to the JSON API endpoint.
+    let link_header = format!(
+        "<{base_url}/api/v1/documents/{slug}>; rel=\"alternate\"; type=\"application/json\"",
+    );
+    let html_response = html_result?;
+    let mut response = html_response.into_response();
+    response.headers_mut().insert(
+        axum::http::header::LINK,
+        axum::http::HeaderValue::from_str(&link_header)
+            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("")),
+    );
+    Ok(response)
 }
 
 // ── POST /:slug/unlock ───────────────────────────────────────────────────────
@@ -807,6 +825,8 @@ pub async fn get_full(
     let theme = doc.theme.clone();
     let slug_owned = slug.clone();
     let expires_at = doc.expires_at.clone();
+    let base_url = state.config.base_url.trim_end_matches('/').to_string();
+    let base_url_clone = base_url.clone();
 
     let html_result = tokio::task::spawn_blocking(move || {
         let fm_result = extract_frontmatter(&raw_content)
@@ -817,12 +837,23 @@ pub async fn get_full(
 
         let stripped = strip_marker_comments(&fm_result.body);
         let rendered_html = render_markdown(&stripped);
-        render_themed_sync(&title, &rendered_html, &slug_owned, &theme, true, expires_at)
+        render_themed_sync(&title, &rendered_html, &slug_owned, &theme, &base_url_clone, true, expires_at)
     })
     .await
     .map_err(|e| AppError::Internal(format!("Render task failed: {e}")))?;
 
-    html_result
+    // Add Link header pointing to the JSON API endpoint.
+    let link_header = format!(
+        "<{base_url}/api/v1/documents/{slug}>; rel=\"alternate\"; type=\"application/json\"",
+    );
+    let html_response = html_result?;
+    let mut response = html_response.into_response();
+    response.headers_mut().insert(
+        axum::http::header::LINK,
+        axum::http::HeaderValue::from_str(&link_header)
+            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("")),
+    );
+    Ok(response)
 }
 
 // ── GET /api/v1/documents/:slug (agent view) ─────────────────────────────────
@@ -1056,7 +1087,7 @@ fn render_markdown(source: &str) -> String {
 ///
 /// Named `_sync` because it is called from `spawn_blocking` contexts (not directly from async).
 /// This avoids stack overflow in async worker threads during syntect init/tokenization.
-fn render_themed_sync(title: &str, content: &str, slug: &str, theme: &str, full_view: bool, expires_at: Option<String>) -> Result<Response, AppError> {
+fn render_themed_sync(title: &str, content: &str, slug: &str, theme: &str, base_url: &str, full_view: bool, expires_at: Option<String>) -> Result<Response, AppError> {
     // Apply syntax highlighting to the pre-rendered HTML.
     // Dark theme gets dark syntax palette; all others get light.
     let is_dark = theme == "dark";
@@ -1066,24 +1097,24 @@ fn render_themed_sync(title: &str, content: &str, slug: &str, theme: &str, full_
 
     let html = match theme {
         "dark" => {
-            let t = DarkTemplate { title, content: &highlighted, slug, body_empty, expires_at };
+            let t = DarkTemplate { title, content: &highlighted, slug, base_url, body_empty, expires_at };
             t.render()
         }
         "paper" => {
-            let t = PaperTemplate { title, content: &highlighted, slug, body_empty, expires_at };
+            let t = PaperTemplate { title, content: &highlighted, slug, base_url, body_empty, expires_at };
             t.render()
         }
         "minimal" => {
-            let t = MinimalTemplate { title, content: &highlighted, slug, body_empty, expires_at };
+            let t = MinimalTemplate { title, content: &highlighted, slug, base_url, body_empty, expires_at };
             t.render()
         }
         "hearth" => {
-            let t = HearthTemplate { title, content: &highlighted, slug, full_view, body_empty, expires_at };
+            let t = HearthTemplate { title, content: &highlighted, slug, base_url, full_view, body_empty, expires_at };
             t.render()
         }
         _ => {
             // "clean" or unknown -> default
-            let t = CleanTemplate { title, content: &highlighted, slug, full_view, body_empty, expires_at };
+            let t = CleanTemplate { title, content: &highlighted, slug, base_url, full_view, body_empty, expires_at };
             t.render()
         }
     };
