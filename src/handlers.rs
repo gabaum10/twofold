@@ -4,17 +4,18 @@ use std::collections::HashMap;
 use askama::Template;
 use axum::{
     body::Bytes,
-    extract::{Path, Query, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
     Form, Json,
 };
+use std::net::SocketAddr;
 use comrak::{markdown_to_html, Options};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     config::ServeConfig,
-    db::{Db, DocumentRecord},
+    db::{AuditEntry, Db, DocumentRecord},
     highlight,
     parser::{extract_frontmatter, extract_title, parse_document, parse_expiry, validate_slug},
     rate_limit::{RateLimitError, RateLimitStore, ReadRateLimit, WriteRateLimit},
@@ -297,6 +298,22 @@ pub struct ListResponse {
     pub offset: u32,
 }
 
+/// Query parameters for GET /api/v1/audit
+#[derive(Deserialize)]
+pub struct AuditQuery {
+    pub limit: Option<u32>,
+    pub offset: Option<u32>,
+}
+
+/// JSON response body for the audit endpoint.
+#[derive(Serialize)]
+pub struct AuditResponse {
+    pub entries: Vec<crate::db::AuditEntry>,
+    pub total: u64,
+    pub limit: u32,
+    pub offset: u32,
+}
+
 // ── POST /api/v1/documents ───────────────────────────────────────────────────
 
 /// Handle document creation.
@@ -309,10 +326,12 @@ pub async fn post_document(
     State(state): State<AppState>,
     _rl: WriteRateLimit,
     headers: HeaderMap,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     body: Bytes,
 ) -> Result<Response, AppError> {
     // Auth FIRST — 401 before 400/413
-    check_auth(&state, &headers).await?;
+    let token_name = check_auth(&state, &headers).await?;
+    let peer_addr = connect_info.map(|c| c.0.to_string());
 
     // Body validation
     if body.is_empty() {
@@ -397,6 +416,19 @@ pub async fn post_document(
                     tracing::error!(error = %e2, "Slug collision retry failed");
                     AppError::Internal("Failed to allocate unique slug".to_string())
                 })?;
+            // Audit entry for retry-path create (final slug after collision).
+            let ip_address = extract_client_ip(&headers, peer_addr.as_deref());
+            let audit_entry = AuditEntry {
+                id: nanoid::nanoid!(10),
+                timestamp: now.clone(),
+                action: "create".to_string(),
+                slug: new_slug.clone(),
+                token_name: token_name.clone(),
+                ip_address,
+            };
+            if let Err(e) = state.db.insert_audit_entry(&audit_entry) {
+                tracing::error!(error = %e, "Failed to write audit entry");
+            }
             let base = state.config.base_url.trim_end_matches('/');
             return Ok((StatusCode::CREATED, Json(CreateResponse {
                 url: format!("{base}/{new_slug}"),
@@ -430,7 +462,7 @@ pub async fn post_document(
             wh_url.clone(),
             state.config.webhook_secret.clone(),
             "document.created",
-            now,
+            now.clone(),
             webhook::WebhookDocument {
                 slug: slug.clone(),
                 title: doc.title.clone(),
@@ -438,6 +470,20 @@ pub async fn post_document(
                 api_url: response.api_url.clone(),
             },
         );
+    }
+
+    // Audit entry — fire-and-forget.
+    let ip_address = extract_client_ip(&headers, peer_addr.as_deref());
+    let audit_entry = AuditEntry {
+        id: nanoid::nanoid!(10),
+        timestamp: now,
+        action: "create".to_string(),
+        slug: slug.clone(),
+        token_name,
+        ip_address,
+    };
+    if let Err(e) = state.db.insert_audit_entry(&audit_entry) {
+        tracing::error!(error = %e, "Failed to write audit entry");
     }
 
     Ok((StatusCode::CREATED, Json(response)).into_response())
@@ -451,10 +497,12 @@ pub async fn put_document(
     _rl: WriteRateLimit,
     Path(slug): Path<String>,
     headers: HeaderMap,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     body: Bytes,
 ) -> Result<Response, AppError> {
     // Auth first
-    check_auth(&state, &headers).await?;
+    let token_name = check_auth(&state, &headers).await?;
+    let peer_addr = connect_info.map(|c| c.0.to_string());
 
     // Body validation
     if body.is_empty() {
@@ -537,7 +585,7 @@ pub async fn put_document(
             wh_url.clone(),
             state.config.webhook_secret.clone(),
             "document.updated",
-            now,
+            now.clone(),
             webhook::WebhookDocument {
                 slug: slug.clone(),
                 title: updated_doc.title.clone(),
@@ -545,6 +593,20 @@ pub async fn put_document(
                 api_url: response.api_url.clone(),
             },
         );
+    }
+
+    // Audit entry — fire-and-forget.
+    let ip_address = extract_client_ip(&headers, peer_addr.as_deref());
+    let audit_entry = AuditEntry {
+        id: nanoid::nanoid!(10),
+        timestamp: now,
+        action: "update".to_string(),
+        slug: slug.clone(),
+        token_name,
+        ip_address,
+    };
+    if let Err(e) = state.db.insert_audit_entry(&audit_entry) {
+        tracing::error!(error = %e, "Failed to write audit entry");
     }
 
     Ok((StatusCode::OK, Json(response)).into_response())
@@ -558,9 +620,11 @@ pub async fn delete_document(
     _rl: WriteRateLimit,
     Path(slug): Path<String>,
     headers: HeaderMap,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
 ) -> Result<Response, AppError> {
     // Auth first
-    check_auth(&state, &headers).await?;
+    let token_name = check_auth(&state, &headers).await?;
+    let peer_addr = connect_info.map(|c| c.0.to_string());
 
     // Check document exists — capture title/slug for webhook before delete.
     let existing = state.db.get_by_slug(&slug)?
@@ -572,16 +636,17 @@ pub async fn delete_document(
 
     state.db.delete_by_slug(&slug)?;
 
+    let now = chrono_now();
+
     // Webhook: document.deleted — dispatched after successful delete.
     // Metadata captured from existing record before deletion.
     if let Some(ref wh_url) = state.config.webhook_url {
         let base = state.config.base_url.trim_end_matches('/');
-        let now = chrono_now();
         webhook::dispatch_webhook(
             wh_url.clone(),
             state.config.webhook_secret.clone(),
             "document.deleted",
-            now,
+            now.clone(),
             webhook::WebhookDocument {
                 slug: existing.slug.clone(),
                 title: existing.title.clone(),
@@ -589,6 +654,20 @@ pub async fn delete_document(
                 api_url: format!("{base}/api/v1/documents/{}", existing.slug),
             },
         );
+    }
+
+    // Audit entry — fire-and-forget.
+    let ip_address = extract_client_ip(&headers, peer_addr.as_deref());
+    let audit_entry = AuditEntry {
+        id: nanoid::nanoid!(10),
+        timestamp: now,
+        action: "delete".to_string(),
+        slug: slug.clone(),
+        token_name,
+        ip_address,
+    };
+    if let Err(e) = state.db.insert_audit_entry(&audit_entry) {
+        tracing::error!(error = %e, "Failed to write audit entry");
     }
 
     Ok(StatusCode::NO_CONTENT.into_response())
@@ -621,6 +700,34 @@ pub async fn list_documents(
 
     Ok(Json(ListResponse {
         documents,
+        total,
+        limit: effective_limit,
+        offset,
+    }).into_response())
+}
+
+// ── GET /api/v1/audit ────────────────────────────────────────────────────────
+
+/// List audit log entries with pagination.
+///
+/// Auth required. Default limit 20, max 100. Newest first.
+pub async fn list_audit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<AuditQuery>,
+) -> Result<Response, AppError> {
+    check_auth(&state, &headers).await?;
+
+    let limit = params.limit.unwrap_or(20);
+    let offset = params.offset.unwrap_or(0);
+
+    let (entries, total) = state.db.list_audit_entries(limit, offset)
+        .map_err(AppError::from)?;
+
+    let effective_limit = limit.min(100);
+
+    Ok(Json(AuditResponse {
+        entries,
         total,
         limit: effective_limit,
         offset,
@@ -1197,7 +1304,7 @@ pub async fn get_agent(
 /// 3. Legacy tokens (prefix IS NULL, created before v0.4): O(n) fallback with
 ///    argon2 per record, also in `spawn_blocking`. Degrades gracefully for
 ///    existing deployments; new tokens never hit this path.
-async fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
+async fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<String, AppError> {
     let provided = extract_bearer(headers)
         .ok_or(AppError::Unauthorized)?;
 
@@ -1208,10 +1315,10 @@ async fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), AppErro
 ///
 /// Extracted so that non-HTTP callers (e.g. oauth.rs) can reuse the same
 /// verification logic without constructing a HeaderMap.
-pub async fn check_auth_token(state: &AppState, provided: &str) -> Result<(), AppError> {
+pub async fn check_auth_token(state: &AppState, provided: &str) -> Result<String, AppError> {
     // Fast path: admin TWOFOLD_TOKEN — constant-time, no argon2.
     if constant_time_eq(provided.as_bytes(), state.config.token.as_bytes()) {
-        return Ok(());
+        return Ok("admin".to_string());
     }
 
     // In-memory access tokens issued to public OAuth clients (UUID tokens).
@@ -1221,7 +1328,7 @@ pub async fn check_auth_token(state: &AppState, provided: &str) -> Result<(), Ap
         let mut tokens = state.access_tokens.lock().unwrap_or_else(|e| e.into_inner());
         tokens.retain(|_, v| v.expires_at.as_str() >= now.as_str());
         if tokens.contains_key(provided) {
-            return Ok(());
+            return Ok("oauth".to_string());
         }
     }
 
@@ -1244,7 +1351,7 @@ pub async fn check_auth_token(state: &AppState, provided: &str) -> Result<(), Ap
         if verified {
             let now = chrono_now();
             let _ = state.db.touch_token(&token_record.id, &now);
-            return Ok(());
+            return Ok(token_record.name.clone());
         }
         // Prefix matched but hash didn't — fall through to legacy check and
         // ultimately return Unauthorized (prefix collision is astronomically rare).
@@ -1260,7 +1367,7 @@ pub async fn check_auth_token(state: &AppState, provided: &str) -> Result<(), Ap
         let result = tokio::task::spawn_blocking(move || {
             for token_record in &legacy_tokens {
                 if verify_password(&provided_owned, &token_record.hash) {
-                    return Some(token_record.id.clone());
+                    return Some((token_record.id.clone(), token_record.name.clone()));
                 }
             }
             None
@@ -1268,14 +1375,29 @@ pub async fn check_auth_token(state: &AppState, provided: &str) -> Result<(), Ap
         .await
         .map_err(|e| AppError::Internal(format!("Auth task failed: {e}")))?;
 
-        if let Some(id) = result {
+        if let Some((id, name)) = result {
             let now = chrono_now();
             let _ = state.db.touch_token(&id, &now);
-            return Ok(());
+            return Ok(name);
         }
     }
 
     Err(AppError::Unauthorized)
+}
+
+/// Extract the client IP address for audit logging.
+///
+/// Priority: X-Forwarded-For (first hop) > peer socket address > "unknown".
+pub fn extract_client_ip(headers: &HeaderMap, fallback: Option<&str>) -> String {
+    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        if let Some(first) = xff.split(',').next() {
+            let ip = first.trim();
+            if !ip.is_empty() {
+                return ip.to_string();
+            }
+        }
+    }
+    fallback.unwrap_or("unknown").to_string()
 }
 
 /// Extract the Bearer token from the Authorization header.
@@ -2903,4 +3025,251 @@ mod tests {
         let body = std::str::from_utf8(&bytes).unwrap();
         assert!(body.contains("Dotmd test"), "expected raw markdown in body");
     }
+
+    // ── Audit log tests ───────────────────────────────────────────────────────
+
+    fn make_test_config(token: &str) -> crate::config::ServeConfig {
+        crate::config::ServeConfig {
+            token: token.to_string(),
+            db_path: ":memory:".to_string(),
+            bind: "127.0.0.1:0".to_string(),
+            base_url: "http://localhost".to_string(),
+            default_theme: "clean".to_string(),
+            max_size: 1_048_576,
+            webhook_url: None,
+            webhook_secret: None,
+            reaper_interval: 3600,
+            rate_limit_read: 1000,
+            rate_limit_write: 1000,
+            rate_limit_window: 60,
+        }
+    }
+
+    fn make_test_state(token: &str) -> (AppState, crate::db::Db) {
+        let db = crate::db::Db::open(":memory:").expect("in-memory db");
+        let config = make_test_config(token);
+        let rate_limit = crate::rate_limit::RateLimitStore::new(&config);
+        let state = AppState {
+            db: db.clone(),
+            config: Arc::new(config),
+            auth_codes: Arc::new(Mutex::new(HashMap::new())),
+            oauth_clients: Arc::new(Mutex::new(HashMap::new())),
+            refresh_tokens: Arc::new(Mutex::new(HashMap::new())),
+            access_tokens: Arc::new(Mutex::new(HashMap::new())),
+            rate_limit: rate_limit.clone(),
+        };
+        (state, db)
+    }
+
+    fn test_app_with_audit(token: &str) -> Router {
+        let (state, _db) = make_test_state(token);
+        let rate_limit = state.rate_limit.clone();
+        Router::new()
+            .route("/api/v1/documents", post(crate::handlers::post_document).get(crate::handlers::list_documents))
+            .route("/api/v1/documents/:slug", get(crate::handlers::get_agent)
+                .put(crate::handlers::put_document)
+                .delete(crate::handlers::delete_document))
+            .route("/api/v1/audit", get(crate::handlers::list_audit))
+            .layer(axum::Extension(rate_limit))
+            .with_state(state)
+    }
+
+    fn test_app_with_db(token: &str) -> (Router, crate::db::Db) {
+        let (state, db) = make_test_state(token);
+        let rate_limit = state.rate_limit.clone();
+        let router = Router::new()
+            .route("/api/v1/documents", post(crate::handlers::post_document).get(crate::handlers::list_documents))
+            .route("/api/v1/documents/:slug", get(crate::handlers::get_agent)
+                .put(crate::handlers::put_document)
+                .delete(crate::handlers::delete_document))
+            .route("/api/v1/audit", get(crate::handlers::list_audit))
+            .layer(axum::Extension(rate_limit))
+            .with_state(state);
+        (router, db)
+    }
+
+    /// Test Db insert_audit_entry and list_audit_entries directly.
+    #[test]
+    fn test_db_insert_and_list_audit_entries() {
+        let db = crate::db::Db::open(":memory:").expect("in-memory db");
+
+        // Empty initially.
+        let (entries, total) = db.list_audit_entries(20, 0).expect("list ok");
+        assert_eq!(total, 0);
+        assert!(entries.is_empty());
+
+        // Insert one entry.
+        let entry = crate::db::AuditEntry {
+            id: "test001".to_string(),
+            timestamp: "2026-05-12T14:00:00Z".to_string(),
+            action: "create".to_string(),
+            slug: "my-doc".to_string(),
+            token_name: "admin".to_string(),
+            ip_address: "127.0.0.1".to_string(),
+        };
+        db.insert_audit_entry(&entry).expect("insert ok");
+
+        let (entries, total) = db.list_audit_entries(20, 0).expect("list ok");
+        assert_eq!(total, 1);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].action, "create");
+        assert_eq!(entries[0].slug, "my-doc");
+        assert_eq!(entries[0].token_name, "admin");
+        assert_eq!(entries[0].ip_address, "127.0.0.1");
+    }
+
+    /// check_auth returns "admin" for the master token.
+    #[tokio::test]
+    async fn test_check_auth_returns_admin_for_master_token() {
+        let token = "master-secret-token";
+        let app = test_app(token);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/documents")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "text/markdown")
+            .body(Body::from("# Test Doc\nContent."))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        // 201 confirms auth passed (token_name "admin" returned internally)
+        assert_eq!(resp.status(), StatusCode::CREATED, "master token should authenticate");
+    }
+
+    /// check_auth returns token name for managed tokens.
+    #[tokio::test]
+    async fn test_check_auth_returns_token_name_for_managed_token() {
+        let (app, managed_plain) = test_app_with_managed_token();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/documents")
+            .header("Authorization", format!("Bearer {managed_plain}"))
+            .header("Content-Type", "text/markdown")
+            .body(Body::from("# Managed Token Test\nContent."))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED, "managed token should authenticate");
+    }
+
+    /// GET /api/v1/audit returns 200 with correct JSON shape.
+    #[tokio::test]
+    async fn test_list_audit_returns_200_with_correct_shape() {
+        let token = "test-token";
+        let app = test_app_with_audit(token);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/audit")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(json.get("entries").is_some(), "response must have 'entries' field");
+        assert!(json.get("total").is_some(), "response must have 'total' field");
+        assert!(json.get("limit").is_some(), "response must have 'limit' field");
+        assert!(json.get("offset").is_some(), "response must have 'offset' field");
+        assert_eq!(json["total"].as_u64().unwrap(), 0);
+        assert!(json["entries"].as_array().unwrap().is_empty());
+    }
+
+    /// GET /api/v1/audit returns 401 without auth token.
+    #[tokio::test]
+    async fn test_list_audit_requires_auth() {
+        let token = "test-token";
+        let app = test_app_with_audit(token);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/audit")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "audit endpoint must require auth");
+    }
+
+    /// POST /api/v1/documents writes an audit entry.
+    #[tokio::test]
+    async fn test_post_document_writes_audit_entry() {
+        let token = "test-token";
+        let (app, db) = test_app_with_db(token);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/documents")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "text/markdown")
+            .body(Body::from("---\nslug: audit-test-create\n---\n# Audit Test\nContent."))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED, "publish failed");
+
+        let (entries, total) = db.list_audit_entries(20, 0).expect("list ok");
+        assert_eq!(total, 1, "should have 1 audit entry after create");
+        assert_eq!(entries[0].action, "create");
+        assert_eq!(entries[0].slug, "audit-test-create");
+        assert_eq!(entries[0].token_name, "admin");
+    }
+
+    /// DELETE /api/v1/documents/:slug writes an audit entry.
+    #[tokio::test]
+    async fn test_delete_document_writes_audit_entry() {
+        let token = "test-token";
+        let (app, db) = test_app_with_db(token);
+
+        // Create first.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/documents")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "text/markdown")
+            .body(Body::from("---\nslug: to-delete\n---\n# Delete Me"))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // Delete it.
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/documents/to-delete")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let (entries, total) = db.list_audit_entries(20, 0).expect("list ok");
+        assert_eq!(total, 2, "should have 2 audit entries (create + delete)");
+        let delete_entry = entries.iter().find(|e| e.action == "delete").expect("delete entry");
+        assert_eq!(delete_entry.slug, "to-delete");
+        assert_eq!(delete_entry.token_name, "admin");
+    }
+
+    /// extract_client_ip: X-Forwarded-For takes priority.
+    #[test]
+    fn test_extract_client_ip_xff_priority() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "10.0.0.1, 192.168.1.1".parse().unwrap());
+        let ip = extract_client_ip(&headers, Some("127.0.0.1:12345"));
+        assert_eq!(ip, "10.0.0.1", "XFF first value should take priority");
+    }
+
+    /// extract_client_ip falls back to socket addr when no XFF.
+    #[test]
+    fn test_extract_client_ip_fallback_to_socket() {
+        let headers = HeaderMap::new();
+        let ip = extract_client_ip(&headers, Some("1.2.3.4:5678"));
+        assert_eq!(ip, "1.2.3.4:5678", "should use socket addr as fallback");
+    }
+
+    /// extract_client_ip returns "unknown" when nothing is available.
+    #[test]
+    fn test_extract_client_ip_unknown() {
+        let headers = HeaderMap::new();
+        let ip = extract_client_ip(&headers, None);
+        assert_eq!(ip, "unknown");
+    }
+
 }

@@ -31,6 +31,17 @@ pub struct TokenRecord {
     pub prefix: Option<String>,
 }
 
+/// An audit log entry recording a mutation event.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AuditEntry {
+    pub id: String,
+    pub timestamp: String,
+    pub action: String,
+    pub slug: String,
+    pub token_name: String,
+    pub ip_address: String,
+}
+
 /// Thread-safe database handle backed by an r2d2 connection pool.
 ///
 /// Contract: all methods take `&self`. Pool provides thread-safe concurrent
@@ -105,7 +116,18 @@ impl Db {
                 revoked    INTEGER NOT NULL DEFAULT 0,
                 prefix     TEXT
             );
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_tokens_prefix ON tokens(prefix);",
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_tokens_prefix ON tokens(prefix);
+
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id          TEXT PRIMARY KEY,
+                timestamp   TEXT NOT NULL,
+                action      TEXT NOT NULL,
+                slug        TEXT NOT NULL,
+                token_name  TEXT NOT NULL,
+                ip_address  TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_audit_log_slug ON audit_log(slug);",
         )?;
         Ok(())
     }
@@ -161,6 +183,21 @@ impl Db {
         }
         conn.execute_batch(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_tokens_prefix ON tokens(prefix);"
+        )?;
+
+        // v0.5: add audit_log table for mutation tracking.
+        // IF NOT EXISTS makes this safe to run on databases that already have the table.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS audit_log (
+                id          TEXT PRIMARY KEY,
+                timestamp   TEXT NOT NULL,
+                action      TEXT NOT NULL,
+                slug        TEXT NOT NULL,
+                token_name  TEXT NOT NULL,
+                ip_address  TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_audit_log_slug ON audit_log(slug);"
         )?;
 
         Ok(())
@@ -485,6 +522,68 @@ impl Db {
 
         Ok((docs, total))
     }
+
+    // ── Audit log operations ──────────────────────────────────────────────────
+
+    /// Insert an audit log entry.
+    ///
+    /// Fire-and-forget contract: callers log errors but do not fail the request.
+    /// Audit entries are never deleted — they outlive the documents they reference.
+    pub fn insert_audit_entry(&self, entry: &AuditEntry) -> Result<()> {
+        let conn = self.pool.get().map_err(pool_err)?;
+        conn.execute(
+            "INSERT INTO audit_log (id, timestamp, action, slug, token_name, ip_address)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                entry.id,
+                entry.timestamp,
+                entry.action,
+                entry.slug,
+                entry.token_name,
+                entry.ip_address,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// List audit entries with pagination, newest first.
+    ///
+    /// Returns (entries, total_count).
+    /// limit is capped at 100 server-side (same pattern as list_documents).
+    pub fn list_audit_entries(&self, limit: u32, offset: u32) -> Result<(Vec<AuditEntry>, u64)> {
+        let capped_limit = limit.min(100);
+        let conn = self.pool.get().map_err(pool_err)?;
+
+        let total: u64 = {
+            let mut stmt = conn.prepare("SELECT COUNT(*) FROM audit_log")?;
+            stmt.query_row([], |row| row.get::<_, i64>(0))
+                .map(|n| n as u64)?
+        };
+
+        let mut stmt = conn.prepare(
+            "SELECT id, timestamp, action, slug, token_name, ip_address \
+             FROM audit_log \
+             ORDER BY timestamp DESC \
+             LIMIT ?1 OFFSET ?2",
+        )?;
+
+        let entries = stmt
+            .query_map(params![capped_limit, offset], |row| {
+                Ok(AuditEntry {
+                    id: row.get(0)?,
+                    timestamp: row.get(1)?,
+                    action: row.get(2)?,
+                    slug: row.get(3)?,
+                    token_name: row.get(4)?,
+                    ip_address: row.get(5)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok((entries, total))
+    }
+
 }
 
 /// Document summary for the list endpoint (no raw_content — metadata only).

@@ -56,6 +56,9 @@ fn main() {
 
         // Token management — direct database access, no server needed.
         Commands::Token(args) => run_token(args),
+
+        // Audit log — synchronous HTTP call.
+        Commands::Audit(args) => run_audit(args),
     }
 }
 
@@ -160,6 +163,8 @@ async fn run_server() {
         // Documents: POST (create) and GET (list) share the same path.
         // Axum 0.7: combine with method router chaining.
         .route("/api/v1/documents", post(handlers::post_document).get(handlers::list_documents))
+        // Audit log endpoint — auth required.
+        .route("/api/v1/audit", get(handlers::list_audit))
         .route("/api/v1/documents/:slug", get(handlers::get_agent)
             .put(handlers::put_document)
             .delete(handlers::delete_document))
@@ -576,6 +581,75 @@ fn run_delete(args: cli::DeleteArgs) {
             eprintln!("Delete failed: HTTP {status}\n{body}");
             std::process::exit(1);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `twofold audit`
+// ---------------------------------------------------------------------------
+
+fn run_audit(args: cli::AuditArgs) {
+    let token = resolve_token(args.token);
+    let url = format!(
+        "{}/api/v1/audit?limit={}",
+        args.server.trim_end_matches('/'),
+        args.limit
+    );
+
+    let client = make_blocking_client();
+
+    let response = match client
+        .get(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Request failed: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().unwrap_or_default();
+        eprintln!("Audit failed: HTTP {status}\n{body}");
+        std::process::exit(1);
+    }
+
+    let body: serde_json::Value = match response.json() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Failed to parse server response: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let entries = body.get("entries").and_then(|v| v.as_array());
+    let entries = match entries {
+        Some(e) => e,
+        None => {
+            eprintln!("Unexpected response format");
+            std::process::exit(1);
+        }
+    };
+
+    // Column widths: TIMESTAMP 21, ACTION 9, SLUG 25, TOKEN remainder.
+    println!("{:<21} {:<9} {:<25} {}",
+        "TIMESTAMP", "ACTION", "SLUG", "TOKEN");
+    println!("{}", "-".repeat(75));
+
+    for entry in entries {
+        let timestamp  = entry.get("timestamp").and_then(|v| v.as_str()).unwrap_or("-");
+        let action     = entry.get("action").and_then(|v| v.as_str()).unwrap_or("-");
+        let slug       = entry.get("slug").and_then(|v| v.as_str()).unwrap_or("-");
+        let token_name = entry.get("token_name").and_then(|v| v.as_str()).unwrap_or("-");
+
+        // Truncate timestamp to 20 chars (drop sub-second noise if present)
+        let ts_d   = &timestamp[..std::cmp::min(20, timestamp.len())];
+        let slug_d = truncate(slug, 24);
+
+        println!("{:<21} {:<9} {:<25} {}", ts_d, action, slug_d, token_name);
     }
 }
 
