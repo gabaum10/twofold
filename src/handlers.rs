@@ -217,6 +217,7 @@ struct HearthTemplate<'a> {
 #[template(path = "password.html")]
 struct PasswordTemplate<'a> {
     slug: &'a str,
+    base_url: &'a str,
     error: Option<&'a str>,
 }
 
@@ -799,7 +800,7 @@ pub async fn get_slug_md(
     // Password-protected documents still require auth cookie for the .md shortcut.
     if doc.password.is_some() {
         if !is_password_authed(&headers, bare_slug, &state.config.token) {
-            let template = PasswordTemplate { slug: bare_slug, error: None };
+            let template = PasswordTemplate { slug: bare_slug, base_url: state.config.base_url.trim_end_matches('/'), error: None };
             return Ok(Html(template.render().map_err(|e| {
                 AppError::Internal(format!("Template error: {e}"))
             })?).into_response());
@@ -863,7 +864,7 @@ pub async fn get_human(
 
         // Fall back to cookie-based auth (post-form-unlock session).
         if !query_pw_valid && !is_password_authed(&headers, &slug, &state.config.token) {
-            let template = PasswordTemplate { slug: &slug, error: None };
+            let template = PasswordTemplate { slug: &slug, base_url: state.config.base_url.trim_end_matches('/'), error: None };
             return Ok(Html(template.render().map_err(|e| {
                 AppError::Internal(format!("Template error: {e}"))
             })?).into_response());
@@ -995,6 +996,7 @@ pub async fn post_unlock(
         // Wrong password — show form again with error
         let template = PasswordTemplate {
             slug: &slug,
+            base_url: state.config.base_url.trim_end_matches('/'),
             error: Some("Incorrect password"),
         };
         Ok(Html(template.render().map_err(|e| {
@@ -1028,7 +1030,7 @@ pub async fn get_full(
     // Password check
     if doc.password.is_some() {
         if !is_password_authed(&headers, &slug, &state.config.token) {
-            let template = PasswordTemplate { slug: &slug, error: None };
+            let template = PasswordTemplate { slug: &slug, base_url: state.config.base_url.trim_end_matches('/'), error: None };
             return Ok(Html(template.render().map_err(|e| {
                 AppError::Internal(format!("Template error: {e}"))
             })?).into_response());
