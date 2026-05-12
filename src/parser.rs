@@ -1,97 +1,10 @@
-use serde::Deserialize;
-use std::collections::HashMap;
+//! Markdown marker parsing (`@agent`/`@end`/`@instructions`), slug validation, expiry parsing. Re-exports frontmatter types.
 
-// ── Frontmatter ──────────────────────────────────────────────────────────────
-
-/// Parsed frontmatter metadata from YAML block.
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct Frontmatter {
-    pub title: Option<String>,
-    pub slug: Option<String>,
-    pub theme: Option<String>,
-    pub expiry: Option<String>,
-    pub password: Option<String>,
-    pub description: Option<String>,
-    /// Catch-all for unknown fields (forward-compatible).
-    #[serde(flatten)]
-    pub _extra: HashMap<String, serde_yaml::Value>,
-}
-
-/// Result of extracting frontmatter from raw content.
-#[derive(Debug)]
-pub struct FrontmatterResult {
-    /// Parsed frontmatter (None if no frontmatter block present).
-    pub meta: Option<Frontmatter>,
-    /// Document body (everything after the closing `---`, or the full content if no frontmatter).
-    pub body: String,
-}
-
-/// Extract YAML frontmatter from the beginning of a document.
-///
-/// Frontmatter rules:
-/// 1. Must be the very first thing in the document (line 1 starts with `---`).
-/// 2. Closed by a second `---` on its own line.
-/// 3. If no closing `---` found, treat entire document as body (no frontmatter).
-/// 4. Empty frontmatter (`---\n---`) is valid — returns default Frontmatter.
-///
-/// Returns Err with a descriptive message if YAML parsing fails.
-pub fn extract_frontmatter(source: &str) -> Result<FrontmatterResult, String> {
-    let lines: Vec<&str> = source.lines().collect();
-
-    // Must start with `---` on the first line
-    if lines.is_empty() || lines[0].trim() != "---" {
-        return Ok(FrontmatterResult {
-            meta: None,
-            body: source.to_string(),
-        });
-    }
-
-    // Find closing `---`
-    let mut close_idx = None;
-    for (i, line) in lines.iter().enumerate().skip(1) {
-        if line.trim() == "---" {
-            close_idx = Some(i);
-            break;
-        }
-    }
-
-    let close_idx = match close_idx {
-        Some(i) => i,
-        None => {
-            // No closing fence — treat as no frontmatter
-            return Ok(FrontmatterResult {
-                meta: None,
-                body: source.to_string(),
-            });
-        }
-    };
-
-    // Extract YAML content between fences
-    let yaml_content = lines[1..close_idx].join("\n");
-
-    // Parse YAML (empty string parses to None in serde_yaml, handle explicitly)
-    let meta: Frontmatter = if yaml_content.trim().is_empty() {
-        Frontmatter::default()
-    } else {
-        serde_yaml::from_str(&yaml_content)
-            .map_err(|e| format!("Invalid frontmatter: {e}"))?
-    };
-
-    // Body is everything after the closing `---`
-    let body = if close_idx + 1 < lines.len() {
-        // Join remaining lines; preserve the leading newline after `---`
-        let remaining = &lines[close_idx + 1..];
-        // If the first line after closing fence is empty, preserve it
-        remaining.join("\n")
-    } else {
-        String::new()
-    };
-
-    Ok(FrontmatterResult {
-        meta: Some(meta),
-        body,
-    })
-}
+// Re-export frontmatter types and extraction from the canonical module.
+// handlers.rs and service.rs import these from parser — keep the path stable.
+#[allow(unused_imports)]
+pub use crate::frontmatter::Frontmatter;
+pub use crate::frontmatter::{extract_frontmatter, FrontmatterResult}; // re-exported for callers that may reference parser::Frontmatter
 
 // ── Marker Parsing ───────────────────────────────────────────────────────────
 // No-regex approach from the raccoon assembly. Whitespace tolerance via trim.
@@ -207,7 +120,11 @@ pub fn parse_expiry(s: &str) -> Result<u64, String> {
         "h" => num * 3600,
         "d" => num * 86400,
         "w" => num * 604800,
-        _ => return Err(format!("Invalid expiry unit: '{unit}' (expected m, h, d, or w)")),
+        _ => {
+            return Err(format!(
+                "Invalid expiry unit: '{unit}' (expected m, h, d, or w)"
+            ))
+        }
     };
 
     let min_seconds = 5 * 60; // 5 minutes
@@ -249,7 +166,18 @@ pub fn validate_slug(slug: &str) -> Result<(), String> {
         }
     }
 
-    let reserved = ["api", "health", "status", "favicon.ico", "robots.txt"];
+    let reserved = [
+        "api",
+        "health",
+        "status",
+        "favicon.ico",
+        "robots.txt",
+        "authorize",
+        "oauth",
+        "mcp",
+        "icon.png",
+        ".well-known",
+    ];
     if reserved.contains(&slug) {
         return Err(format!("Slug '{slug}' is reserved"));
     }
@@ -273,7 +201,8 @@ mod tests {
 
     #[test]
     fn strips_multiple_sections() {
-        let src = "A.\n<!-- @agent -->\nH1.\n<!-- @end -->\nB.\n<!-- @agent -->\nH2.\n<!-- @end -->\nC.";
+        let src =
+            "A.\n<!-- @agent -->\nH1.\n<!-- @end -->\nB.\n<!-- @agent -->\nH2.\n<!-- @end -->\nC.";
         let r = parse_document(src, "test");
         assert!(r.human.contains("A.") && r.human.contains("B.") && r.human.contains("C."));
         assert!(!r.human.contains("H1.") && !r.human.contains("H2."));
@@ -330,7 +259,10 @@ mod tests {
 
     #[test]
     fn extract_title_basic() {
-        assert_eq!(extract_title("# Hello World\n\nContent.", "fallback"), "Hello World");
+        assert_eq!(
+            extract_title("# Hello World\n\nContent.", "fallback"),
+            "Hello World"
+        );
     }
 
     #[test]
@@ -343,52 +275,6 @@ mod tests {
         let src = "<!-- @agent -->\n# Hidden Title\n<!-- @end -->\nContent.";
         // extract_title works on raw source, finds H1 regardless of markers
         assert_eq!(extract_title(src, "fallback"), "Hidden Title");
-    }
-
-    // Frontmatter tests
-
-    #[test]
-    fn frontmatter_basic() {
-        let src = "---\ntitle: Hello\nslug: hello-world\n---\n\n# Body";
-        let result = extract_frontmatter(src).unwrap();
-        let meta = result.meta.unwrap();
-        assert_eq!(meta.title.as_deref(), Some("Hello"));
-        assert_eq!(meta.slug.as_deref(), Some("hello-world"));
-        assert!(result.body.contains("# Body"));
-        assert!(!result.body.contains("---"));
-    }
-
-    #[test]
-    fn frontmatter_empty_block() {
-        let src = "---\n---\n\n# Just body";
-        let result = extract_frontmatter(src).unwrap();
-        assert!(result.meta.is_some());
-        assert!(result.body.contains("# Just body"));
-    }
-
-    #[test]
-    fn no_frontmatter() {
-        let src = "# No frontmatter\n\nJust content.";
-        let result = extract_frontmatter(src).unwrap();
-        assert!(result.meta.is_none());
-        assert_eq!(result.body, src);
-    }
-
-    #[test]
-    fn frontmatter_unclosed() {
-        let src = "---\ntitle: Broken\nNo closing fence.";
-        let result = extract_frontmatter(src).unwrap();
-        // No closing --- means no frontmatter detected
-        assert!(result.meta.is_none());
-        assert_eq!(result.body, src);
-    }
-
-    #[test]
-    fn frontmatter_invalid_yaml() {
-        let src = "---\n[invalid: yaml: broken\n---\n\nBody.";
-        let result = extract_frontmatter(src);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Invalid frontmatter"));
     }
 
     // Expiry parsing tests
@@ -445,5 +331,14 @@ mod tests {
     #[test]
     fn validate_slug_reserved() {
         assert!(validate_slug("api").is_err());
+    }
+
+    #[test]
+    fn validate_slug_reserved_oauth_routes() {
+        assert!(validate_slug("authorize").is_err());
+        assert!(validate_slug("oauth").is_err());
+        assert!(validate_slug("mcp").is_err());
+        assert!(validate_slug("icon.png").is_err());
+        assert!(validate_slug(".well-known").is_err());
     }
 }

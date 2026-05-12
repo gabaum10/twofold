@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Document not found</title>
+    <style>
+/* twofold — error 404 page ({{ theme }} theme) */
+:root {
+    --bg: #F5F0EB;
+    --fg: #2C2420;
+    --fg-secondary: #6B5D52;
+    --fg-muted: #A89888;
+    --border: #E8E0D8;
+    --border-strong: #D4C8B8;
+    --accent: #C4762B;
+    --accent-hover: #A86220;
+    --font-body: Charter, 'Bitstream Charter', 'Sitka Text', Cambria, serif;
+    --font-heading: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    --max-width: 850px;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html {
+    font-size: 16px;
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--font-body);
+    font-size: 1.0625rem;
+    line-height: 1.75;
+    border-top: 4px solid var(--accent);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+}
+
+main {
+    flex: 1;
+    max-width: var(--max-width);
+    margin: 0 auto;
+    padding: 4rem 1.75rem 2.5rem;
+    width: 100%;
+}
+
+.error-code {
+    font-family: var(--font-heading);
+    font-size: 0.75rem;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 1rem;
+}
+
+h1 {
+    font-family: var(--font-heading);
+    font-size: 2rem;
+    font-weight: 800;
+    line-height: 1.15;
+    color: var(--accent);
+    margin: 0 0 1rem;
+    letter-spacing: -0.02em;
+    padding-bottom: 0.5rem;
+    border-bottom: 3px solid var(--accent);
+}
+
+p {
+    color: var(--fg-secondary);
+    margin: 0;
+    max-width: 36rem;
+}
+
+footer {
+    max-width: var(--max-width);
+    margin: 0 auto;
+    padding: 1.75rem 1.75rem 2.5rem;
+    text-align: center;
+    border-top: 1px solid var(--border-strong);
+    width: 100%;
+}
+
+footer::before {
+    content: "";
+    display: block;
+    width: 2.5rem;
+    height: 3px;
+    background: var(--accent);
+    margin: 0 auto 1rem;
+    border-radius: 2px;
+}
+
+footer small {
+    color: var(--fg-muted);
+    font-size: 0.7rem;
+    font-family: var(--font-heading);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+
+footer small a {
+    color: var(--accent);
+    text-decoration: underline;
+    text-decoration-thickness: 1px;
+    text-underline-offset: 2px;
+    transition: color 0.15s ease;
+}
+
+footer small a:hover {
+    color: var(--accent-hover);
+}
+
+@media (max-width: 600px) {
+    main { padding: 2.5rem 1rem 1.75rem; }
+    h1 { font-size: 1.625rem; }
+}
+    </style>
+</head>
+<body>
+    <main>
+        <p class="error-code">404</p>
+        <h1>Document not found</h1>
+        <p>This document doesn&#x27;t exist, or the link may be incorrect.</p>
+    </main>
+    <footer>
+        <small>SHARED VIA FLINT &middot; TWOFOLD</small>
+    </footer>
+</body>
+</html>

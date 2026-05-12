@@ -1,3 +1,5 @@
+//! MCP stdio transport. Raw JSON-RPC over stdin/stdout for CLI use (Claude Code, etc.).
+
 /// MCP (Model Context Protocol) server — raw JSON-RPC over stdio.
 ///
 /// Design choice: raw JSON-RPC, no rmcp crate dependency. The MCP handshake
@@ -48,11 +50,21 @@ pub(crate) struct JsonRpcError {
 
 impl Response {
     pub(crate) fn ok(id: Value, result: Value) -> Self {
-        Self { jsonrpc: "2.0", id, result: Some(result), error: None }
+        Self {
+            jsonrpc: "2.0",
+            id,
+            result: Some(result),
+            error: None,
+        }
     }
 
     pub(crate) fn err(id: Value, code: i32, message: String) -> Self {
-        Self { jsonrpc: "2.0", id, result: None, error: Some(JsonRpcError { code, message }) }
+        Self {
+            jsonrpc: "2.0",
+            id,
+            result: None,
+            error: Some(JsonRpcError { code, message }),
+        }
     }
 }
 
@@ -74,17 +86,6 @@ fn tool_result_err(message: String) -> Value {
     })
 }
 
-/// Returns true if the string contains a marker directive on its own line.
-/// Matches `<!-- @agent -->` or `<!-- @end -->` appearing as a complete line
-/// (possibly with surrounding whitespace), to prevent breaking out of the
-/// agent layer containment.
-fn contains_marker_directive(s: &str) -> bool {
-    s.lines().any(|line| {
-        let t = line.trim();
-        t == "<!-- @agent -->" || t == "<!-- @end -->"
-    })
-}
-
 // ── HTTP client ───────────────────────────────────────────────────────────────
 
 /// Build the reqwest client with conservative timeouts.
@@ -103,8 +104,8 @@ pub(crate) fn build_client() -> reqwest::blocking::Client {
 /// Run the MCP server on stdio. Reads JSON-RPC messages line-by-line.
 /// Each line is one complete JSON-RPC message.
 pub fn run_mcp_server() {
-    let server_url = std::env::var("TWOFOLD_MCP_SERVER")
-        .unwrap_or_else(|_| "http://localhost:3000".to_string());
+    let server_url =
+        std::env::var("TWOFOLD_MCP_SERVER").unwrap_or_else(|_| "http://localhost:3000".to_string());
     let server_url = server_url.trim_end_matches('/').to_string();
 
     // Token: TWOFOLD_MCP_TOKEN falls back to TWOFOLD_TOKEN
@@ -137,11 +138,7 @@ pub fn run_mcp_server() {
             Err(e) => {
                 // Parse error — send JSON-RPC parse error if we can determine an id.
                 // Since we can't parse, use null id per spec.
-                let resp = Response::err(
-                    Value::Null,
-                    -32700,
-                    format!("Parse error: {e}"),
-                );
+                let resp = Response::err(Value::Null, -32700, format!("Parse error: {e}"));
                 write_response(&stdout, &resp);
                 continue;
             }
@@ -197,141 +194,153 @@ pub(crate) fn handle_request(
 }
 
 fn handle_initialize(id: Value) -> Response {
-    Response::ok(id, serde_json::json!({
-        "protocolVersion": "2024-11-05",
-        "serverInfo": {
-            "name": "twofold",
-            "version": env!("CARGO_PKG_VERSION"),
-            "icons": [
-                {
-                    "url": "https://share.hearth.observer/icon.png",
-                    "mime_type": "image/jpeg"
-                }
-            ]
-        },
-        "capabilities": {
-            "tools": {}
-        }
-    }))
+    Response::ok(
+        id,
+        serde_json::json!({
+            "protocolVersion": "2024-11-05",
+            "serverInfo": {
+                "name": "twofold",
+                "version": env!("CARGO_PKG_VERSION"),
+                "icons": [
+                    {
+                        "url": "https://share.hearth.observer/icon.png",
+                        "mime_type": "image/jpeg"
+                    }
+                ]
+            },
+            "capabilities": {
+                "tools": {}
+            }
+        }),
+    )
+}
+
+/// Public entry point for the tools/list response, shared between the stdio
+/// and HTTP MCP transports so both advertise identical tool schemas.
+pub fn tools_list_response(id: Value) -> Response {
+    handle_tools_list(id)
 }
 
 fn handle_tools_list(id: Value) -> Response {
-    Response::ok(id, serde_json::json!({
-        "tools": [
-            {
-                "name": "twofold_publish",
-                "description": "Publish a dual-layer document. One URL, two audiences. The human layer (content) gives readers the critical context they need to understand and act on the information — concise, scannable, written for someone on their phone. The agent layer (agent_content) carries the full technical depth — specs, data, configuration, implementation details — everything an AI agent needs to pick up the thread and work with it. When someone pastes the link into a conversation with an AI, the agent fetches the API endpoint and gets the complete picture without the human needing to relay it.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "content": {
-                            "type": "string",
-                            "description": "Human-readable layer, visible in the browser. Write the essential context a person needs to understand what this is, why it matters, and what to do next. Keep it concise and scannable. Skip technical specs, API details, and structured data — those belong in agent_content."
+    Response::ok(
+        id,
+        serde_json::json!({
+            "tools": [
+                {
+                    "name": "twofold_publish",
+                    "description": "Publish a dual-layer document. One URL, two audiences. The human layer (content) gives readers the critical context they need to understand and act on the information — concise, scannable, written for someone on their phone. The agent layer (agent_content) carries the full technical depth — specs, data, configuration, implementation details — everything an AI agent needs to pick up the thread and work with it. When someone pastes the link into a conversation with an AI, the agent fetches the API endpoint and gets the complete picture without the human needing to relay it. IMPORTANT: Always provide BOTH content and agent_content. A document with only content is just a web page — the dual-layer split is the entire point of Twofold.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "content": {
+                                "type": "string",
+                                "description": "Human-readable summary layer, visible in the browser. Write a concise overview — what this is, why it matters, what to do next. 3-5 paragraphs max. DO NOT put technical specs, structured data, full details, or raw data here — those go in agent_content. If you're putting everything in content and leaving agent_content empty, you're doing it wrong."
+                            },
+                            "agent_content": {
+                                "type": "string",
+                                "description": "REQUIRED for proper Twofold documents. The agent-readable layer — invisible in the browser, served to AI agents automatically. This is the FULL DEPTH behind the human summary: complete analysis, raw data, source URLs, citations, structured metadata, counterarguments, caveats, related context, and anything an AI agent would need to continue an intelligent conversation about this topic. Think of it as everything you'd want to know if someone asked you a follow-up question. The human layer is the headline. The agent layer is the research folder behind it. Without agent_content, you're just publishing a web page."
+                            },
+                            "title": {
+                                "type": "string",
+                                "description": "The document title. Displayed in browser tabs, search results, OpenGraph previews, and social cards. Always set this explicitly. If omitted, falls back to the first heading in the content, which may not be what you want."
+                            },
+                            "slug": {
+                                "type": "string",
+                                "description": "Optional custom URL slug."
+                            },
+                            "expiry": {
+                                "type": "string",
+                                "description": "Optional expiry duration (e.g. '7d', '24h', '2w'). Document is automatically deleted after expiry."
+                            },
+                            "theme": {
+                                "type": "string",
+                                "description": "Optional theme name."
+                            },
+                            "description": {
+                                "type": "string",
+                                "description": "Optional document description."
+                            }
                         },
-                        "agent_content": {
-                            "type": "string",
-                            "description": "Agent-readable layer, invisible in the browser, accessible via the API endpoint. Full technical context: specs, structured data, API references, configuration, implementation details, and any information an AI agent would need to pick up this thread and act on it without asking follow-up questions. Write for a machine that's about to do work with this information."
+                        "required": ["content"]
+                    }
+                },
+                {
+                    "name": "twofold_get",
+                    "description": "Retrieve raw markdown content for a slug.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "slug": { "type": "string", "description": "Document slug." }
                         },
-                        "title": {
-                            "type": "string",
-                            "description": "The document title. Displayed in browser tabs, search results, OpenGraph previews, and social cards. Always set this explicitly. If omitted, falls back to the first heading in the content, which may not be what you want."
-                        },
-                        "slug": {
-                            "type": "string",
-                            "description": "Optional custom URL slug."
-                        },
-                        "expiry": {
-                            "type": "string",
-                            "description": "Optional expiry duration (e.g. '7d', '24h', '2w'). Document is automatically deleted after expiry."
-                        },
-                        "theme": {
-                            "type": "string",
-                            "description": "Optional theme name."
-                        },
-                        "description": {
-                            "type": "string",
-                            "description": "Optional document description."
-                        }
-                    },
-                    "required": ["content"]
-                }
-            },
-            {
-                "name": "twofold_get",
-                "description": "Retrieve raw markdown content for a slug.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "slug": { "type": "string", "description": "Document slug." }
-                    },
-                    "required": ["slug"]
-                }
-            },
-            {
-                "name": "twofold_list",
-                "description": "List published documents.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "limit": {
-                            "type": "integer",
-                            "description": "Maximum results (default 20, max 100).",
-                            "default": 20
+                        "required": ["slug"]
+                    }
+                },
+                {
+                    "name": "twofold_list",
+                    "description": "List published documents.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "limit": {
+                                "type": "integer",
+                                "description": "Maximum results (default 20, max 100).",
+                                "default": 20
+                            }
                         }
                     }
+                },
+                {
+                    "name": "twofold_delete",
+                    "description": "Delete a document by slug.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "slug": { "type": "string", "description": "Document slug to delete." }
+                        },
+                        "required": ["slug"]
+                    }
+                },
+                {
+                    "name": "twofold_update",
+                    "description": "Update an existing document. Returns 404 if the slug does not exist. Use twofold_publish to create new documents. Publish a dual-layer document. One URL, two audiences. The human layer (content) gives readers the critical context they need to understand and act on the information — concise, scannable, written for someone on their phone. The agent layer (agent_content) carries the full technical depth — specs, data, configuration, implementation details — everything an AI agent needs to pick up the thread and work with it. When someone pastes the link into a conversation with an AI, the agent fetches the API endpoint and gets the complete picture without the human needing to relay it. IMPORTANT: Always provide BOTH content and agent_content. A document with only content is just a web page — the dual-layer split is the entire point of Twofold.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "slug": {
+                                "type": "string",
+                                "description": "Slug of the document to update."
+                            },
+                            "content": {
+                                "type": "string",
+                                "description": "Human-readable summary layer, visible in the browser. Write a concise overview — what this is, why it matters, what to do next. 3-5 paragraphs max. DO NOT put technical specs, structured data, full details, or raw data here — those go in agent_content. If you're putting everything in content and leaving agent_content empty, you're doing it wrong."
+                            },
+                            "agent_content": {
+                                "type": "string",
+                                "description": "REQUIRED for proper Twofold documents. The agent-readable layer — invisible in the browser, served to AI agents automatically. This is the FULL DEPTH behind the human summary: complete analysis, raw data, source URLs, citations, structured metadata, counterarguments, caveats, related context, and anything an AI agent would need to continue an intelligent conversation about this topic. Think of it as everything you'd want to know if someone asked you a follow-up question. The human layer is the headline. The agent layer is the research folder behind it. Without agent_content, you're just publishing a web page."
+                            },
+                            "title": {
+                                "type": "string",
+                                "description": "The document title. Displayed in browser tabs, search results, OpenGraph previews, and social cards. Always set this explicitly. If omitted, falls back to the first heading in the content, which may not be what you want."
+                            },
+                            "description": {
+                                "type": "string",
+                                "description": "Optional document description."
+                            },
+                            "expiry": {
+                                "type": "string",
+                                "description": "Optional expiry duration (e.g. '7d', '24h', '2w'). Document is automatically deleted after expiry."
+                            },
+                            "theme": {
+                                "type": "string",
+                                "description": "Optional theme name."
+                            }
+                        },
+                        "required": ["slug", "content"]
+                    }
                 }
-            },
-            {
-                "name": "twofold_delete",
-                "description": "Delete a document by slug.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "slug": { "type": "string", "description": "Document slug to delete." }
-                    },
-                    "required": ["slug"]
-                }
-            },
-            {
-                "name": "twofold_update",
-                "description": "Update an existing document. Returns 404 if the slug does not exist. Use twofold_publish to create new documents. Publish a dual-layer document. One URL, two audiences. The human layer (content) gives readers the critical context they need to understand and act on the information — concise, scannable, written for someone on their phone. The agent layer (agent_content) carries the full technical depth — specs, data, configuration, implementation details — everything an AI agent needs to pick up the thread and work with it. When someone pastes the link into a conversation with an AI, the agent fetches the API endpoint and gets the complete picture without the human needing to relay it.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "slug": {
-                            "type": "string",
-                            "description": "Slug of the document to update."
-                        },
-                        "content": {
-                            "type": "string",
-                            "description": "Human-readable layer, visible in the browser. Write the essential context a person needs to understand what this is, why it matters, and what to do next. Keep it concise and scannable. Skip technical specs, API details, and structured data — those belong in agent_content."
-                        },
-                        "agent_content": {
-                            "type": "string",
-                            "description": "Agent-readable layer, invisible in the browser, accessible via the API endpoint. Full technical context: specs, structured data, API references, configuration, implementation details, and any information an AI agent would need to pick up this thread and act on it without asking follow-up questions. Write for a machine that's about to do work with this information."
-                        },
-                        "title": {
-                            "type": "string",
-                            "description": "The document title. Displayed in browser tabs, search results, OpenGraph previews, and social cards. Always set this explicitly. If omitted, falls back to the first heading in the content, which may not be what you want."
-                        },
-                        "description": {
-                            "type": "string",
-                            "description": "Optional document description."
-                        },
-                        "expiry": {
-                            "type": "string",
-                            "description": "Optional expiry duration (e.g. '7d', '24h', '2w'). Document is automatically deleted after expiry."
-                        },
-                        "theme": {
-                            "type": "string",
-                            "description": "Optional theme name."
-                        }
-                    },
-                    "required": ["slug", "content"]
-                }
-            }
-        ]
-    }))
+            ]
+        }),
+    )
 }
 
 fn handle_tools_call(
@@ -351,7 +360,10 @@ fn handle_tools_call(
         None => return Response::err(id, -32602, "Missing tool name".to_string()),
     };
 
-    let args = params.get("arguments").cloned().unwrap_or(Value::Object(Default::default()));
+    let args = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or(Value::Object(Default::default()));
 
     let result = match tool_name {
         "twofold_publish" => tool_publish(client, server_url, token, &args),
@@ -391,45 +403,21 @@ fn tool_publish(
     let description = args.get("description").and_then(|v| v.as_str());
     let agent_content = args.get("agent_content").and_then(|v| v.as_str());
 
-    // Determine whether to inject frontmatter.
-    let has_fm_args = title.is_some() || slug.is_some() || password.is_some()
-        || expiry.is_some() || theme.is_some() || description.is_some();
-    let mut body = if !has_fm_args {
-        // No args to inject — send content as-is.
-        content.to_string()
-    } else if content.trim_start().starts_with("---") {
-        // Content already has frontmatter — merge args in (args win on conflict).
-        merge_fm_args(content, title, slug, password, expiry, theme, description)
-    } else {
-        // No existing frontmatter — prepend a new block.
-        let mut fm = String::from("---\n");
-        if let Some(t) = title {
-            fm.push_str(&format!("title: {}\n", yaml_escape_value(t)));
-        }
-        if let Some(s) = slug {
-            fm.push_str(&format!("slug: {}\n", yaml_escape_value(s)));
-        }
-        if let Some(p) = password {
-            fm.push_str(&format!("password: {}\n", yaml_escape_value(p)));
-        }
-        if let Some(ex) = expiry {
-            fm.push_str(&format!("expiry: {}\n", yaml_escape_value(ex)));
-        }
-        if let Some(th) = theme {
-            fm.push_str(&format!("theme: {}\n", yaml_escape_value(th)));
-        }
-        if let Some(d) = description {
-            fm.push_str(&format!("description: {}\n", yaml_escape_value(d)));
-        }
-        fm.push_str("---\n");
-        fm.push_str(content);
-        fm
+    // Inject/merge frontmatter fields.
+    let fields = crate::frontmatter::FrontmatterFields {
+        title: title.map(str::to_string),
+        slug: slug.map(str::to_string),
+        password: password.map(str::to_string),
+        expiry: expiry.map(str::to_string),
+        theme: theme.map(str::to_string),
+        description: description.map(str::to_string),
     };
+    let mut body = crate::frontmatter::apply_frontmatter(content, fields);
 
     // Append agent-only block if provided. Invisible in the browser view;
     // accessible via the raw API endpoint.
     if let Some(ac) = agent_content {
-        if contains_marker_directive(ac) {
+        if crate::frontmatter::contains_marker_directive(ac) {
             return tool_result_err(
                 "agent_content must not contain marker directives (<!-- @agent --> or <!-- @end -->)".to_string()
             );
@@ -613,42 +601,21 @@ fn tool_update(
     let theme = args.get("theme").and_then(|v| v.as_str());
     let agent_content = args.get("agent_content").and_then(|v| v.as_str());
 
-    // Inject frontmatter for provided fields.
-    // When content already has frontmatter, merge args in (args win on conflict).
-    let has_fm_args = title.is_some() || description.is_some() || password.is_some()
-        || expiry.is_some() || theme.is_some();
-    let mut body = if !has_fm_args {
-        content.to_string()
-    } else if content.trim_start().starts_with("---") {
-        // Content already has frontmatter — merge args in (args win on conflict).
-        merge_fm_args(content, title, None, password, expiry, theme, description)
-    } else {
-        // No existing frontmatter — prepend a new block.
-        let mut fm = String::from("---\n");
-        if let Some(t) = title {
-            fm.push_str(&format!("title: {}\n", yaml_escape_value(t)));
-        }
-        if let Some(d) = description {
-            fm.push_str(&format!("description: {}\n", yaml_escape_value(d)));
-        }
-        if let Some(p) = password {
-            fm.push_str(&format!("password: {}\n", yaml_escape_value(p)));
-        }
-        if let Some(ex) = expiry {
-            fm.push_str(&format!("expiry: {}\n", yaml_escape_value(ex)));
-        }
-        if let Some(th) = theme {
-            fm.push_str(&format!("theme: {}\n", yaml_escape_value(th)));
-        }
-        fm.push_str("---\n");
-        fm.push_str(content);
-        fm
+    // Inject/merge frontmatter fields (slug not applicable to update).
+    let fields = crate::frontmatter::FrontmatterFields {
+        title: title.map(str::to_string),
+        slug: None,
+        password: password.map(str::to_string),
+        expiry: expiry.map(str::to_string),
+        theme: theme.map(str::to_string),
+        description: description.map(str::to_string),
     };
+    let mut body = crate::frontmatter::apply_frontmatter(content, fields);
 
     // Append agent-only block if provided. Invisible in the browser view;
     // accessible via the raw API endpoint.
     if let Some(ac) = agent_content {
-        if contains_marker_directive(ac) {
+        if crate::frontmatter::contains_marker_directive(ac) {
             return tool_result_err(
                 "agent_content must not contain marker directives (<!-- @agent --> or <!-- @end -->)".to_string()
             );
@@ -708,143 +675,11 @@ fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 2);
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
-            | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }
     out
-}
-
-// ── YAML value escaping ───────────────────────────────────────────────────────
-
-/// Escape a string value for safe YAML injection.
-///
-/// Wraps the value in double quotes and escapes internal double quotes and
-/// backslashes. Handles values containing colons, hashes, or other YAML
-/// special characters that would break unquoted scalar parsing.
-///
-/// Limitation: multi-line values (containing \n) have their newlines replaced
-/// with spaces. Slugs cannot contain newlines (validation prevents it).
-/// Titles with newlines are unusual and the trade-off is acceptable for v0.3.
-///
-/// `pub` because main.rs uses this for CLI frontmatter injection.
-pub fn yaml_escape_value_pub(s: &str) -> String {
-    // Replace newlines with spaces to prevent multi-line YAML injection.
-    let s = s.replace('\n', " ").replace('\r', "");
-    // Escape backslashes first, then double quotes.
-    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
-    format!("\"{escaped}\"")
-}
-
-fn yaml_escape_value(s: &str) -> String {
-    yaml_escape_value_pub(s)
-}
-
-/// Merge MCP tool args into existing frontmatter.
-///
-/// When content already starts with `---`, we need to inject/overwrite specific
-/// fields rather than silently dropping them. Strategy: parse the existing block
-/// line-by-line, replace matching keys, append any that are absent, then
-/// reassemble. Only operates on the simple single-line scalar values twofold uses.
-fn merge_fm_args(
-    content: &str,
-    title: Option<&str>,
-    slug: Option<&str>,
-    password: Option<&str>,
-    expiry: Option<&str>,
-    theme: Option<&str>,
-    description: Option<&str>,
-) -> String {
-    let lines: Vec<&str> = content.lines().collect();
-
-    // Find closing `---` of the frontmatter block.
-    let mut close_idx = None;
-    for (i, line) in lines.iter().enumerate().skip(1) {
-        if line.trim() == "---" {
-            close_idx = Some(i);
-            break;
-        }
-    }
-
-    let close_idx = match close_idx {
-        Some(i) => i,
-        None => {
-            // No closing fence — treat as no frontmatter, prepend a new block.
-            let mut fm = String::from("---\n");
-            if let Some(t) = title {
-                fm.push_str(&format!("title: {}\n", yaml_escape_value(t)));
-            }
-            if let Some(s) = slug {
-                fm.push_str(&format!("slug: {}\n", yaml_escape_value(s)));
-            }
-            if let Some(p) = password {
-                fm.push_str(&format!("password: {}\n", yaml_escape_value(p)));
-            }
-            if let Some(ex) = expiry {
-                fm.push_str(&format!("expiry: {}\n", yaml_escape_value(ex)));
-            }
-            if let Some(th) = theme {
-                fm.push_str(&format!("theme: {}\n", yaml_escape_value(th)));
-            }
-            if let Some(d) = description {
-                fm.push_str(&format!("description: {}\n", yaml_escape_value(d)));
-            }
-            fm.push_str("---\n");
-            fm.push_str(content);
-            return fm;
-        }
-    };
-
-    // Collect which keys we want to set, track which ones we've written.
-    let mut args: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
-    if let Some(t) = title { args.insert("title", t); }
-    if let Some(s) = slug { args.insert("slug", s); }
-    if let Some(p) = password { args.insert("password", p); }
-    if let Some(ex) = expiry { args.insert("expiry", ex); }
-    if let Some(th) = theme { args.insert("theme", th); }
-    if let Some(d) = description { args.insert("description", d); }
-
-    let mut written_keys: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let mut fm_lines: Vec<String> = Vec::new();
-
-    // First line is always `---`.
-    fm_lines.push(lines[0].to_string());
-
-    // Process existing frontmatter lines (1..close_idx).
-    for line in &lines[1..close_idx] {
-        // Check if this line sets a key we want to override.
-        let mut replaced = false;
-        for &key in args.keys() {
-            let prefix = format!("{}:", key);
-            if line.trim_start().starts_with(&prefix) {
-                fm_lines.push(format!("{}: {}", key, yaml_escape_value(args[key])));
-                written_keys.insert(key);
-                replaced = true;
-                break;
-            }
-        }
-        if !replaced {
-            fm_lines.push(line.to_string());
-        }
-    }
-
-    // Append any args that weren't already in the frontmatter.
-    for &key in args.keys() {
-        if !written_keys.contains(key) {
-            fm_lines.push(format!("{}: {}", key, yaml_escape_value(args[key])));
-        }
-    }
-
-    // Closing `---`.
-    fm_lines.push("---".to_string());
-
-    // Append the body (everything after close_idx).
-    let body_lines = &lines[close_idx + 1..];
-    let mut result = fm_lines.join("\n");
-    if !body_lines.is_empty() {
-        result.push('\n');
-        result.push_str(&body_lines.join("\n"));
-    }
-    result
 }

@@ -1,3 +1,5 @@
+//! CLI definitions via clap. Commands: `serve`, `publish`, `list`, `delete`, `token`, `mcp`, `audit`.
+
 use clap::{Parser, Subcommand};
 
 /// Dual-layer markdown share service.

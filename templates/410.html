@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Document expired</title>
+    <style>
+/* twofold — error 410 page ({{ theme }} theme, muted for impermanence) */
+:root {
+    --bg: #F5F0EB;
+    --fg: #2C2420;
+    --fg-secondary: #6B5D52;
+    --fg-muted: #A89888;
+    --border: #E8E0D8;
+    --border-strong: #D4C8B8;
+    --accent: #C4762B;
+    --accent-hover: #A86220;
+    --font-body: Charter, 'Bitstream Charter', 'Sitka Text', Cambria, serif;
+    --font-heading: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    --max-width: 850px;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html {
+    font-size: 16px;
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--font-body);
+    font-size: 1.0625rem;
+    line-height: 1.75;
+    /* Muted top bar — not gone, just quieter. Ember fading to ash. */
+    border-top: 4px solid var(--fg-muted);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+}
+
+main {
+    flex: 1;
+    max-width: var(--max-width);
+    margin: 0 auto;
+    padding: 4rem 1.75rem 2.5rem;
+    width: 100%;
+    /* Slightly washed out — this was here but isn't anymore */
+    opacity: 0.85;
+}
+
+.error-code {
+    font-family: var(--font-heading);
+    font-size: 0.75rem;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--fg-muted);
+    margin: 0 0 1rem;
+}
+
+h1 {
+    font-family: var(--font-heading);
+    font-size: 2rem;
+    font-weight: 800;
+    line-height: 1.15;
+    /* Secondary color instead of accent — the fire has gone out */
+    color: var(--fg-secondary);
+    margin: 0 0 1rem;
+    letter-spacing: -0.02em;
+    padding-bottom: 0.5rem;
+    /* Muted border — a trace of what was */
+    border-bottom: 3px solid var(--border-strong);
+}
+
+p {
+    color: var(--fg-muted);
+    margin: 0 0 1.5rem;
+    max-width: 36rem;
+}
+
+.expiry-mark {
+    display: inline-block;
+    width: 2rem;
+    height: 2px;
+    background: var(--border-strong);
+    border-radius: 2px;
+    vertical-align: middle;
+    margin-right: 0.5rem;
+    opacity: 0.6;
+}
+
+footer {
+    max-width: var(--max-width);
+    margin: 0 auto;
+    padding: 1.75rem 1.75rem 2.5rem;
+    text-align: center;
+    border-top: 1px solid var(--border-strong);
+    width: 100%;
+}
+
+footer::before {
+    content: "";
+    display: block;
+    width: 2.5rem;
+    height: 3px;
+    /* Footer ember stays warm even when document is gone */
+    background: var(--accent);
+    margin: 0 auto 1rem;
+    border-radius: 2px;
+    opacity: 0.5;
+}
+
+footer small {
+    color: var(--fg-muted);
+    font-size: 0.7rem;
+    font-family: var(--font-heading);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+
+footer small a {
+    color: var(--accent);
+    text-decoration: underline;
+    text-decoration-thickness: 1px;
+    text-underline-offset: 2px;
+    transition: color 0.15s ease;
+}
+
+footer small a:hover {
+    color: var(--accent-hover);
+}
+
+@media (max-width: 600px) {
+    main { padding: 2.5rem 1rem 1.75rem; }
+    h1 { font-size: 1.625rem; }
+}
+    </style>
+</head>
+<body>
+    <main>
+        <p class="error-code">410</p>
+        <h1>This document has expired</h1>
+        <p>This document was set to expire and has been removed.</p>
+        <p>
+            <span class="expiry-mark" aria-hidden="true"></span>
+            The link is no longer valid. Documents are held for up to 30 days after expiry,
+            then permanently removed.
+        </p>
+    </main>
+    <footer>
+        <small>SHARED VIA FLINT &middot; TWOFOLD</small>
+    </footer>
+</body>
+</html>

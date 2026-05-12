@@ -1,6 +1,8 @@
+//! SQLite persistence layer. Document, token, OAuth, and audit log tables. Schema migration via PRAGMA introspection.
+
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::{Result, params};
+use rusqlite::{params, Result};
 
 /// A stored document record (maps 1:1 to the `documents` table row).
 #[derive(Debug, Clone)]
@@ -10,7 +12,7 @@ pub struct DocumentRecord {
     pub title: String,
     pub raw_content: String,
     pub theme: String,
-    pub password: Option<String>,   // argon2 hash, None = public
+    pub password: Option<String>, // argon2 hash, None = public
     pub description: Option<String>,
     pub created_at: String,         // ISO 8601 UTC
     pub expires_at: Option<String>, // ISO 8601 UTC, None = no expiry
@@ -22,7 +24,7 @@ pub struct DocumentRecord {
 pub struct TokenRecord {
     pub id: String,
     pub name: String,
-    pub hash: String,     // argon2 hash of the token
+    pub hash: String, // argon2 hash of the token
     pub created_at: String,
     pub last_used: Option<String>,
     pub revoked: bool,
@@ -54,9 +56,15 @@ pub struct Db {
 
 /// Convert an r2d2 pool error into a rusqlite error so callers keep the same
 /// `rusqlite::Result<T>` return type without an API surface change.
+///
+/// Uses `SqliteFailure` with `SQLITE_CANTOPEN` (error code 14) — the most
+/// accurate SQLite error class for "could not acquire a connection".
+/// Previously used `InvalidPath`, which misled debuggers into thinking a file
+/// path was wrong rather than the pool being exhausted or timed out.
 fn pool_err(e: r2d2::Error) -> rusqlite::Error {
-    rusqlite::Error::InvalidPath(
-        std::path::PathBuf::from(format!("connection pool error: {e}")),
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+        Some(format!("connection pool error: {e}")),
     )
 }
 
@@ -67,12 +75,11 @@ impl Db {
     /// parallel under WAL mode instead of serializing through a single Mutex.
     /// WAL mode and busy_timeout are applied to each connection at open time.
     pub fn open(path: &str) -> Result<Self> {
-        let manager = SqliteConnectionManager::file(path)
-            .with_init(|conn| {
-                conn.execute_batch("PRAGMA journal_mode=WAL;")?;
-                conn.busy_timeout(std::time::Duration::from_secs(5))?;
-                Ok(())
-            });
+        let manager = SqliteConnectionManager::file(path).with_init(|conn| {
+            conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+            conn.busy_timeout(std::time::Duration::from_secs(5))?;
+            Ok(())
+        });
 
         let pool = Pool::builder()
             .max_size(8)
@@ -127,7 +134,45 @@ impl Db {
                 ip_address  TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log(timestamp);
-            CREATE INDEX IF NOT EXISTS idx_audit_log_slug ON audit_log(slug);",
+            CREATE INDEX IF NOT EXISTS idx_audit_log_slug ON audit_log(slug);
+
+            CREATE TABLE IF NOT EXISTS oauth_clients (
+                client_id                   TEXT PRIMARY KEY,
+                client_name                 TEXT NOT NULL,
+                redirect_uris               TEXT NOT NULL,
+                grant_types                 TEXT NOT NULL,
+                response_types              TEXT NOT NULL,
+                token_endpoint_auth_method  TEXT NOT NULL,
+                created_at                  TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS oauth_auth_codes (
+                code            TEXT PRIMARY KEY,
+                client_id       TEXT NOT NULL,
+                redirect_uri    TEXT NOT NULL,
+                expires_at      TEXT NOT NULL,
+                code_challenge  TEXT NOT NULL,
+                resource        TEXT,
+                scope           TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_oauth_auth_codes_expires_at ON oauth_auth_codes(expires_at);
+
+            CREATE TABLE IF NOT EXISTS oauth_access_tokens (
+                token       TEXT PRIMARY KEY,
+                client_id   TEXT NOT NULL,
+                scope       TEXT,
+                expires_at  TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_oauth_access_tokens_expires_at ON oauth_access_tokens(expires_at);
+
+            CREATE TABLE IF NOT EXISTS oauth_refresh_tokens (
+                token        TEXT PRIMARY KEY,
+                client_id    TEXT NOT NULL,
+                access_token TEXT NOT NULL,
+                scope        TEXT,
+                expires_at   TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_oauth_refresh_tokens_expires_at ON oauth_refresh_tokens(expires_at);",
         )?;
         Ok(())
     }
@@ -149,7 +194,7 @@ impl Db {
 
         if !columns.contains(&"theme".to_string()) {
             conn.execute_batch(
-                "ALTER TABLE documents ADD COLUMN theme TEXT NOT NULL DEFAULT 'clean';"
+                "ALTER TABLE documents ADD COLUMN theme TEXT NOT NULL DEFAULT 'clean';",
             )?;
         }
         if !columns.contains(&"password".to_string()) {
@@ -164,7 +209,7 @@ impl Db {
 
         // Create expires_at index (safe now that column is guaranteed to exist)
         conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_documents_expires_at ON documents(expires_at);"
+            "CREATE INDEX IF NOT EXISTS idx_documents_expires_at ON documents(expires_at);",
         )?;
 
         // v0.4: add prefix column to tokens for O(1) auth lookup.
@@ -177,12 +222,10 @@ impl Db {
         drop(token_stmt);
 
         if !token_columns.contains(&"prefix".to_string()) {
-            conn.execute_batch(
-                "ALTER TABLE tokens ADD COLUMN prefix TEXT;"
-            )?;
+            conn.execute_batch("ALTER TABLE tokens ADD COLUMN prefix TEXT;")?;
         }
         conn.execute_batch(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tokens_prefix ON tokens(prefix);"
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tokens_prefix ON tokens(prefix);",
         )?;
 
         // v0.5: add audit_log table for mutation tracking.
@@ -197,7 +240,48 @@ impl Db {
                 ip_address  TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log(timestamp);
-            CREATE INDEX IF NOT EXISTS idx_audit_log_slug ON audit_log(slug);"
+            CREATE INDEX IF NOT EXISTS idx_audit_log_slug ON audit_log(slug);",
+        )?;
+
+        // v0.6: OAuth tables (migrated from in-memory state to SQLite).
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS oauth_clients (
+                client_id                   TEXT PRIMARY KEY,
+                client_name                 TEXT NOT NULL,
+                redirect_uris               TEXT NOT NULL,
+                grant_types                 TEXT NOT NULL,
+                response_types              TEXT NOT NULL,
+                token_endpoint_auth_method  TEXT NOT NULL,
+                created_at                  TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS oauth_auth_codes (
+                code            TEXT PRIMARY KEY,
+                client_id       TEXT NOT NULL,
+                redirect_uri    TEXT NOT NULL,
+                expires_at      TEXT NOT NULL,
+                code_challenge  TEXT NOT NULL,
+                resource        TEXT,
+                scope           TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_oauth_auth_codes_expires_at ON oauth_auth_codes(expires_at);
+
+            CREATE TABLE IF NOT EXISTS oauth_access_tokens (
+                token       TEXT PRIMARY KEY,
+                client_id   TEXT NOT NULL,
+                scope       TEXT,
+                expires_at  TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_oauth_access_tokens_expires_at ON oauth_access_tokens(expires_at);
+
+            CREATE TABLE IF NOT EXISTS oauth_refresh_tokens (
+                token        TEXT PRIMARY KEY,
+                client_id    TEXT NOT NULL,
+                access_token TEXT NOT NULL,
+                scope        TEXT,
+                expires_at   TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_oauth_refresh_tokens_expires_at ON oauth_refresh_tokens(expires_at);",
         )?;
 
         Ok(())
@@ -261,10 +345,7 @@ impl Db {
     /// Delete a document by slug. Returns true if a row was deleted.
     pub fn delete_by_slug(&self, slug: &str) -> Result<bool> {
         let conn = self.pool.get().map_err(pool_err)?;
-        let rows = conn.execute(
-            "DELETE FROM documents WHERE slug = ?1",
-            params![slug],
-        )?;
+        let rows = conn.execute("DELETE FROM documents WHERE slug = ?1", params![slug])?;
         Ok(rows > 0)
     }
 
@@ -382,7 +463,10 @@ impl Db {
                     prefix: row.get(6)?,
                 })
             })?
-            .filter_map(|r| r.map_err(|e| tracing::warn!("Failed to deserialize token row: {}", e)).ok())
+            .filter_map(|r| {
+                r.map_err(|e| tracing::warn!("Failed to deserialize token row: {}", e))
+                    .ok()
+            })
             .collect();
         Ok(tokens)
     }
@@ -406,7 +490,10 @@ impl Db {
                     prefix: row.get(6)?,
                 })
             })?
-            .filter_map(|r| r.map_err(|e| tracing::warn!("Failed to deserialize token row: {}", e)).ok())
+            .filter_map(|r| {
+                r.map_err(|e| tracing::warn!("Failed to deserialize token row: {}", e))
+                    .ok()
+            })
             .collect();
         Ok(tokens)
     }
@@ -434,9 +521,7 @@ impl Db {
     /// Check if a token name already exists.
     pub fn token_name_exists(&self, name: &str) -> Result<bool> {
         let conn = self.pool.get().map_err(pool_err)?;
-        let mut stmt = conn.prepare(
-            "SELECT COUNT(*) FROM tokens WHERE name = ?1",
-        )?;
+        let mut stmt = conn.prepare("SELECT COUNT(*) FROM tokens WHERE name = ?1")?;
         let count: i64 = stmt.query_row(params![name], |row| row.get(0))?;
         Ok(count > 0)
     }
@@ -563,7 +648,292 @@ impl Db {
 
         Ok((entries, total))
     }
+}
 
+// ── OAuth row types ───────────────────────────────────────────────────────────
+
+/// Registered OAuth client (oauth_clients table).
+#[derive(Debug, Clone)]
+pub struct OAuthClientRow {
+    pub client_id: String,
+    pub client_name: String,
+    /// JSON-encoded Vec<String>
+    pub redirect_uris: String,
+    /// JSON-encoded Vec<String>
+    pub grant_types: String,
+    /// JSON-encoded Vec<String>
+    pub response_types: String,
+    pub token_endpoint_auth_method: String,
+    pub created_at: String,
+}
+
+/// Authorization code (oauth_auth_codes table).
+#[derive(Debug, Clone)]
+pub struct AuthCodeRow {
+    pub code: String,
+    pub client_id: String,
+    pub redirect_uri: String,
+    pub expires_at: String,
+    pub code_challenge: String,
+    pub resource: Option<String>,
+    pub scope: Option<String>,
+}
+
+/// Access token (oauth_access_tokens table).
+#[derive(Debug, Clone)]
+pub struct AccessTokenRow {
+    pub token: String,
+    pub client_id: String,
+    pub scope: Option<String>,
+    pub expires_at: String,
+}
+
+/// Refresh token (oauth_refresh_tokens table).
+#[derive(Debug, Clone)]
+pub struct RefreshTokenRow {
+    pub token: String,
+    pub client_id: String,
+    pub access_token: String,
+    pub scope: Option<String>,
+    pub expires_at: String,
+}
+
+// ── OAuth client operations ───────────────────────────────────────────────────
+
+impl Db {
+    /// Insert a dynamically-registered OAuth client.
+    pub fn insert_oauth_client(&self, row: &OAuthClientRow) -> Result<()> {
+        let conn = self.pool.get().map_err(pool_err)?;
+        conn.execute(
+            "INSERT INTO oauth_clients
+             (client_id, client_name, redirect_uris, grant_types, response_types,
+              token_endpoint_auth_method, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                row.client_id,
+                row.client_name,
+                row.redirect_uris,
+                row.grant_types,
+                row.response_types,
+                row.token_endpoint_auth_method,
+                row.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Look up an OAuth client by client_id.
+    pub fn get_oauth_client(&self, client_id: &str) -> Result<Option<OAuthClientRow>> {
+        let conn = self.pool.get().map_err(pool_err)?;
+        let mut stmt = conn.prepare(
+            "SELECT client_id, client_name, redirect_uris, grant_types, response_types,
+                    token_endpoint_auth_method, created_at
+             FROM oauth_clients WHERE client_id = ?1",
+        )?;
+        let mut rows = stmt.query(params![client_id])?;
+        match rows.next()? {
+            None => Ok(None),
+            Some(row) => Ok(Some(OAuthClientRow {
+                client_id: row.get(0)?,
+                client_name: row.get(1)?,
+                redirect_uris: row.get(2)?,
+                grant_types: row.get(3)?,
+                response_types: row.get(4)?,
+                token_endpoint_auth_method: row.get(5)?,
+                created_at: row.get(6)?,
+            })),
+        }
+    }
+
+    /// Count active (non-expired) registered clients.
+    ///
+    /// Used to enforce the 1,000-client hard cap before inserting.
+    pub fn count_active_oauth_clients(&self, cutoff: &str) -> Result<i64> {
+        let conn = self.pool.get().map_err(pool_err)?;
+        let mut stmt = conn.prepare("SELECT COUNT(*) FROM oauth_clients WHERE created_at >= ?1")?;
+        let count: i64 = stmt.query_row(params![cutoff], |row| row.get(0))?;
+        Ok(count)
+    }
+
+    /// Delete OAuth clients registered before `cutoff` (ISO 8601 string).
+    pub fn delete_expired_oauth_clients(&self, cutoff: &str) -> Result<usize> {
+        let conn = self.pool.get().map_err(pool_err)?;
+        let rows = conn.execute(
+            "DELETE FROM oauth_clients WHERE created_at < ?1",
+            params![cutoff],
+        )?;
+        Ok(rows)
+    }
+
+    // ── Auth code operations ──────────────────────────────────────────────────
+
+    /// Insert an authorization code.
+    pub fn insert_auth_code(&self, row: &AuthCodeRow) -> Result<()> {
+        let conn = self.pool.get().map_err(pool_err)?;
+        conn.execute(
+            "INSERT INTO oauth_auth_codes
+             (code, client_id, redirect_uri, expires_at, code_challenge, resource, scope)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                row.code,
+                row.client_id,
+                row.redirect_uri,
+                row.expires_at,
+                row.code_challenge,
+                row.resource,
+                row.scope,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Atomically SELECT + DELETE an authorization code (single-use guarantee).
+    ///
+    /// Returns Ok(None) if the code doesn't exist (already used or never issued).
+    pub fn take_auth_code(&self, code: &str) -> Result<Option<AuthCodeRow>> {
+        let conn = self.pool.get().map_err(pool_err)?;
+        // Use a transaction so concurrent requests can't both succeed on the same code.
+        let tx = conn.unchecked_transaction()?;
+        let row = {
+            let mut stmt = tx.prepare(
+                "SELECT code, client_id, redirect_uri, expires_at, code_challenge, resource, scope
+                 FROM oauth_auth_codes WHERE code = ?1",
+            )?;
+            let mut rows = stmt.query(params![code])?;
+            match rows.next()? {
+                None => None,
+                Some(r) => Some(AuthCodeRow {
+                    code: r.get(0)?,
+                    client_id: r.get(1)?,
+                    redirect_uri: r.get(2)?,
+                    expires_at: r.get(3)?,
+                    code_challenge: r.get(4)?,
+                    resource: r.get(5)?,
+                    scope: r.get(6)?,
+                }),
+            }
+        };
+        if row.is_some() {
+            tx.execute(
+                "DELETE FROM oauth_auth_codes WHERE code = ?1",
+                params![code],
+            )?;
+        }
+        tx.commit()?;
+        Ok(row)
+    }
+
+    /// Delete authorization codes that expired before `now`.
+    pub fn delete_expired_auth_codes(&self, now: &str) -> Result<usize> {
+        let conn = self.pool.get().map_err(pool_err)?;
+        let rows = conn.execute(
+            "DELETE FROM oauth_auth_codes WHERE expires_at < ?1",
+            params![now],
+        )?;
+        Ok(rows)
+    }
+
+    // ── Access token operations ───────────────────────────────────────────────
+
+    /// Insert an OAuth access token.
+    pub fn insert_access_token(&self, row: &AccessTokenRow) -> Result<()> {
+        let conn = self.pool.get().map_err(pool_err)?;
+        conn.execute(
+            "INSERT INTO oauth_access_tokens (token, client_id, scope, expires_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![row.token, row.client_id, row.scope, row.expires_at],
+        )?;
+        Ok(())
+    }
+
+    /// Look up an OAuth access token. Returns None if not found or expired.
+    pub fn get_access_token(&self, token: &str) -> Result<Option<AccessTokenRow>> {
+        let conn = self.pool.get().map_err(pool_err)?;
+        let mut stmt = conn.prepare(
+            "SELECT token, client_id, scope, expires_at
+             FROM oauth_access_tokens WHERE token = ?1",
+        )?;
+        let mut rows = stmt.query(params![token])?;
+        match rows.next()? {
+            None => Ok(None),
+            Some(row) => Ok(Some(AccessTokenRow {
+                token: row.get(0)?,
+                client_id: row.get(1)?,
+                scope: row.get(2)?,
+                expires_at: row.get(3)?,
+            })),
+        }
+    }
+
+    /// Delete OAuth access tokens that expired before `now`.
+    pub fn delete_expired_access_tokens(&self, now: &str) -> Result<usize> {
+        let conn = self.pool.get().map_err(pool_err)?;
+        let rows = conn.execute(
+            "DELETE FROM oauth_access_tokens WHERE expires_at < ?1",
+            params![now],
+        )?;
+        Ok(rows)
+    }
+
+    // ── Refresh token operations ──────────────────────────────────────────────
+
+    /// Insert an OAuth refresh token.
+    pub fn insert_refresh_token(&self, row: &RefreshTokenRow) -> Result<()> {
+        let conn = self.pool.get().map_err(pool_err)?;
+        conn.execute(
+            "INSERT INTO oauth_refresh_tokens (token, client_id, access_token, scope, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                row.token,
+                row.client_id,
+                row.access_token,
+                row.scope,
+                row.expires_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Atomically SELECT + DELETE a refresh token (rotation: single-use).
+    pub fn take_refresh_token(&self, token: &str) -> Result<Option<RefreshTokenRow>> {
+        let conn = self.pool.get().map_err(pool_err)?;
+        let tx = conn.unchecked_transaction()?;
+        let row = {
+            let mut stmt = tx.prepare(
+                "SELECT token, client_id, access_token, scope, expires_at
+                 FROM oauth_refresh_tokens WHERE token = ?1",
+            )?;
+            let mut rows = stmt.query(params![token])?;
+            match rows.next()? {
+                None => None,
+                Some(r) => Some(RefreshTokenRow {
+                    token: r.get(0)?,
+                    client_id: r.get(1)?,
+                    access_token: r.get(2)?,
+                    scope: r.get(3)?,
+                    expires_at: r.get(4)?,
+                }),
+            }
+        };
+        if row.is_some() {
+            tx.execute(
+                "DELETE FROM oauth_refresh_tokens WHERE token = ?1",
+                params![token],
+            )?;
+        }
+        tx.commit()?;
+        Ok(row)
+    }
+
+    /// Delete OAuth refresh tokens that expired before `now`.
+    pub fn delete_expired_refresh_tokens(&self, now: &str) -> Result<usize> {
+        let conn = self.pool.get().map_err(pool_err)?;
+        let rows = conn.execute(
+            "DELETE FROM oauth_refresh_tokens WHERE expires_at < ?1",
+            params![now],
+        )?;
+        Ok(rows)
+    }
 }
 
 /// Document summary for the list endpoint (no raw_content — metadata only).
@@ -574,4 +944,366 @@ pub struct DocumentSummary {
     pub description: Option<String>,
     pub created_at: String,
     pub expires_at: Option<String>,
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: build an in-memory Db with schema initialized.
+    fn open_test_db() -> Db {
+        Db::open(":memory:").expect("in-memory db should open")
+    }
+
+    /// Helper: a minimal DocumentRecord with no expiry or password.
+    fn make_doc(slug: &str, created_at: &str) -> DocumentRecord {
+        DocumentRecord {
+            id: slug.to_string(),
+            slug: slug.to_string(),
+            title: format!("Title for {slug}"),
+            raw_content: format!("# {slug}\n\nContent."),
+            theme: "clean".to_string(),
+            password: None,
+            description: Some(format!("Desc for {slug}")),
+            created_at: created_at.to_string(),
+            expires_at: None,
+            updated_at: created_at.to_string(),
+        }
+    }
+
+    /// Insert a document then fetch it back — all fields round-trip correctly.
+    #[test]
+    fn insert_and_get_document() {
+        let db = open_test_db();
+        let doc = make_doc("test-slug", "2024-01-01T00:00:00Z");
+
+        db.insert_document(&doc).expect("insert should succeed");
+
+        let fetched = db
+            .get_by_slug("test-slug")
+            .expect("query should succeed")
+            .expect("document should exist");
+
+        assert_eq!(fetched.id, doc.id);
+        assert_eq!(fetched.slug, doc.slug);
+        assert_eq!(fetched.title, doc.title);
+        assert_eq!(fetched.raw_content, doc.raw_content);
+        assert_eq!(fetched.theme, doc.theme);
+        assert_eq!(fetched.password, doc.password);
+        assert_eq!(fetched.description, doc.description);
+        assert_eq!(fetched.created_at, doc.created_at);
+        assert_eq!(fetched.expires_at, doc.expires_at);
+        assert_eq!(fetched.updated_at, doc.updated_at);
+    }
+
+    /// list_documents respects limit and offset.
+    #[test]
+    fn list_documents_pagination() {
+        let db = open_test_db();
+
+        // Insert 5 documents with staggered created_at so ordering is stable.
+        for i in 1..=5u32 {
+            let slug = format!("slug-{:02}", i);
+            let ts = format!("2024-01-{:02}T00:00:00Z", i);
+            let doc = make_doc(&slug, &ts);
+            db.insert_document(&doc).expect("insert");
+        }
+
+        // Fetch first 2 — should get the 2 newest (slug-05, slug-04).
+        let (page1, total) = db.list_documents(2, 0).expect("list page 1");
+        assert_eq!(total, 5, "total count should be 5");
+        assert_eq!(page1.len(), 2, "page 1 should have 2 docs");
+        assert_eq!(page1[0].slug, "slug-05", "newest first");
+        assert_eq!(page1[1].slug, "slug-04");
+
+        // Fetch next 2 with offset=2 — should get slug-03, slug-02.
+        let (page2, _) = db.list_documents(2, 2).expect("list page 2");
+        assert_eq!(page2.len(), 2);
+        assert_eq!(page2[0].slug, "slug-03");
+        assert_eq!(page2[1].slug, "slug-02");
+
+        // Fetch last page (offset=4) — should get only slug-01.
+        let (page3, _) = db.list_documents(2, 4).expect("list page 3");
+        assert_eq!(page3.len(), 1);
+        assert_eq!(page3[0].slug, "slug-01");
+    }
+
+    // ── P3-20: reaper tests ───────────────────────────────────────────────────
+    //
+    // For each reaper: insert one expired row + one future row → call reaper
+    // → assert expired row is gone, future row remains.
+
+    /// delete_expired_auth_codes removes past rows and keeps future rows.
+    #[test]
+    fn reaper_auth_codes() {
+        let db = open_test_db();
+        let now = "2025-06-01T00:00:00Z";
+
+        db.insert_auth_code(&AuthCodeRow {
+            code: "expired-code".to_string(),
+            client_id: "c1".to_string(),
+            redirect_uri: "https://example.com/cb".to_string(),
+            expires_at: "2020-01-01T00:00:00Z".to_string(), // past
+            code_challenge: "challenge".to_string(),
+            resource: None,
+            scope: None,
+        })
+        .expect("insert expired auth code");
+        db.insert_auth_code(&AuthCodeRow {
+            code: "future-code".to_string(),
+            client_id: "c1".to_string(),
+            redirect_uri: "https://example.com/cb".to_string(),
+            expires_at: "2099-01-01T00:00:00Z".to_string(), // future
+            code_challenge: "challenge".to_string(),
+            resource: None,
+            scope: None,
+        })
+        .expect("insert future auth code");
+
+        let deleted = db
+            .delete_expired_auth_codes(now)
+            .expect("reaper should succeed");
+        assert_eq!(deleted, 1, "reaper should delete exactly 1 expired code");
+
+        // Verify expired code is gone — take_auth_code returns None if absent.
+        let taken_expired = db
+            .take_auth_code("expired-code")
+            .expect("take should not error");
+        assert!(
+            taken_expired.is_none(),
+            "expired code must be gone after reaper"
+        );
+
+        // Verify future code is still present.
+        let taken_future = db
+            .take_auth_code("future-code")
+            .expect("take should not error");
+        assert!(taken_future.is_some(), "future code must survive reaper");
+    }
+
+    /// delete_expired_access_tokens removes past rows and keeps future rows.
+    #[test]
+    fn reaper_access_tokens() {
+        let db = open_test_db();
+        let now = "2025-06-01T00:00:00Z";
+
+        db.insert_access_token(&AccessTokenRow {
+            token: "expired-at".to_string(),
+            client_id: "c1".to_string(),
+            scope: None,
+            expires_at: "2020-01-01T00:00:00Z".to_string(),
+        })
+        .expect("insert expired access token");
+        db.insert_access_token(&AccessTokenRow {
+            token: "future-at".to_string(),
+            client_id: "c1".to_string(),
+            scope: None,
+            expires_at: "2099-01-01T00:00:00Z".to_string(),
+        })
+        .expect("insert future access token");
+
+        let deleted = db
+            .delete_expired_access_tokens(now)
+            .expect("reaper should succeed");
+        assert_eq!(
+            deleted, 1,
+            "reaper should delete exactly 1 expired access token"
+        );
+
+        let expired = db.get_access_token("expired-at").expect("lookup ok");
+        assert!(
+            expired.is_none(),
+            "expired access token must be gone after reaper"
+        );
+
+        let future = db.get_access_token("future-at").expect("lookup ok");
+        assert!(future.is_some(), "future access token must survive reaper");
+    }
+
+    /// delete_expired_refresh_tokens removes past rows and keeps future rows.
+    #[test]
+    fn reaper_refresh_tokens() {
+        let db = open_test_db();
+        let now = "2025-06-01T00:00:00Z";
+
+        db.insert_refresh_token(&RefreshTokenRow {
+            token: "expired-rt".to_string(),
+            client_id: "c1".to_string(),
+            access_token: "at1".to_string(),
+            scope: None,
+            expires_at: "2020-01-01T00:00:00Z".to_string(),
+        })
+        .expect("insert expired refresh token");
+        db.insert_refresh_token(&RefreshTokenRow {
+            token: "future-rt".to_string(),
+            client_id: "c1".to_string(),
+            access_token: "at2".to_string(),
+            scope: None,
+            expires_at: "2099-01-01T00:00:00Z".to_string(),
+        })
+        .expect("insert future refresh token");
+
+        let deleted = db
+            .delete_expired_refresh_tokens(now)
+            .expect("reaper should succeed");
+        assert_eq!(
+            deleted, 1,
+            "reaper should delete exactly 1 expired refresh token"
+        );
+
+        // take_refresh_token returns None if the row is gone.
+        let expired = db.take_refresh_token("expired-rt").expect("take ok");
+        assert!(
+            expired.is_none(),
+            "expired refresh token must be gone after reaper"
+        );
+
+        let future = db.take_refresh_token("future-rt").expect("take ok");
+        assert!(future.is_some(), "future refresh token must survive reaper");
+    }
+
+    /// delete_expired_oauth_clients removes clients registered before cutoff,
+    /// keeps those registered after.
+    #[test]
+    fn reaper_oauth_clients() {
+        let db = open_test_db();
+        let cutoff = "2025-06-01T00:00:00Z";
+
+        db.insert_oauth_client(&OAuthClientRow {
+            client_id: "old-client".to_string(),
+            client_name: "old".to_string(),
+            redirect_uris: "[]".to_string(),
+            grant_types: "[]".to_string(),
+            response_types: "[]".to_string(),
+            token_endpoint_auth_method: "none".to_string(),
+            created_at: "2020-01-01T00:00:00Z".to_string(), // before cutoff
+        })
+        .expect("insert old client");
+        db.insert_oauth_client(&OAuthClientRow {
+            client_id: "new-client".to_string(),
+            client_name: "new".to_string(),
+            redirect_uris: "[]".to_string(),
+            grant_types: "[]".to_string(),
+            response_types: "[]".to_string(),
+            token_endpoint_auth_method: "none".to_string(),
+            created_at: "2099-01-01T00:00:00Z".to_string(), // after cutoff
+        })
+        .expect("insert new client");
+
+        let deleted = db
+            .delete_expired_oauth_clients(cutoff)
+            .expect("reaper should succeed");
+        assert_eq!(deleted, 1, "reaper should delete exactly 1 expired client");
+
+        let old = db.get_oauth_client("old-client").expect("lookup ok");
+        assert!(old.is_none(), "old client must be gone after reaper");
+
+        let new = db.get_oauth_client("new-client").expect("lookup ok");
+        assert!(new.is_some(), "new client must survive reaper");
+    }
+
+    /// delete_expired_older_than removes documents whose expiry is before the window,
+    /// keeps documents with future expiry or no expiry.
+    #[test]
+    fn reaper_documents() {
+        let db = open_test_db();
+        let now = "2025-06-01T00:00:00Z";
+
+        // Document expired 10 days ago — should be reaped with a 5-day grace window.
+        let expired_doc = DocumentRecord {
+            id: "doc-expired".to_string(),
+            slug: "expired-doc".to_string(),
+            title: "Expired".to_string(),
+            raw_content: "# Expired".to_string(),
+            theme: "clean".to_string(),
+            password: None,
+            description: None,
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            expires_at: Some("2025-05-22T00:00:00Z".to_string()), // 10 days before now
+            updated_at: "2025-01-01T00:00:00Z".to_string(),
+        };
+        // Document expiring far in the future — must survive.
+        let future_doc = DocumentRecord {
+            id: "doc-future".to_string(),
+            slug: "future-doc".to_string(),
+            title: "Future".to_string(),
+            raw_content: "# Future".to_string(),
+            theme: "clean".to_string(),
+            password: None,
+            description: None,
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            expires_at: Some("2099-01-01T00:00:00Z".to_string()),
+            updated_at: "2025-01-01T00:00:00Z".to_string(),
+        };
+        db.insert_document(&expired_doc)
+            .expect("insert expired doc");
+        db.insert_document(&future_doc).expect("insert future doc");
+
+        // Grace window of 5 days: only docs expired more than 5 days before `now` are reaped.
+        let deleted = db
+            .delete_expired_older_than(now, 5)
+            .expect("reaper should succeed");
+        assert_eq!(
+            deleted, 1,
+            "reaper should delete exactly 1 expired document"
+        );
+
+        let expired = db.get_by_slug("expired-doc").expect("lookup ok");
+        assert!(expired.is_none(), "expired doc must be gone after reaper");
+
+        let future = db.get_by_slug("future-doc").expect("lookup ok");
+        assert!(future.is_some(), "future doc must survive reaper");
+    }
+
+    /// Token create → list → revoke cycle works end-to-end.
+    #[test]
+    fn token_crud() {
+        let db = open_test_db();
+
+        // Insert a token. Use a recognizable fake hash — we're testing CRUD,
+        // not argon2 verification.
+        let token = TokenRecord {
+            id: "tok-id-1".to_string(),
+            name: "my-token".to_string(),
+            hash: "fakehash".to_string(),
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            last_used: None,
+            revoked: false,
+            prefix: Some("tok12345".to_string()),
+        };
+        db.insert_token(&token).expect("insert token");
+
+        // List — should contain exactly the one token, not revoked.
+        let tokens = db.list_tokens().expect("list tokens");
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].name, "my-token");
+        assert!(!tokens[0].revoked, "should not be revoked yet");
+
+        // Revoke — should return true (row updated).
+        let revoked = db.revoke_token("my-token").expect("revoke");
+        assert!(revoked, "revoke should return true on first call");
+
+        // Revoking again returns false (already revoked, no rows updated).
+        let revoked_again = db.revoke_token("my-token").expect("revoke again");
+        assert!(
+            !revoked_again,
+            "revoking an already-revoked token returns false"
+        );
+
+        // List — token is still present but marked revoked.
+        let tokens_after = db.list_tokens().expect("list after revoke");
+        assert_eq!(tokens_after.len(), 1);
+        assert!(tokens_after[0].revoked, "should be revoked now");
+
+        // get_token_by_prefix should not return a revoked token.
+        let found = db
+            .get_token_by_prefix("tok12345")
+            .expect("prefix lookup should not error");
+        assert!(
+            found.is_none(),
+            "revoked token should not be returned by prefix lookup"
+        );
+    }
 }
