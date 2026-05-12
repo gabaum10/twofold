@@ -4,8 +4,6 @@ mod db;
 mod handlers;
 mod highlight;
 mod mcp;
-mod mcp_http;
-mod oauth;
 mod parser;
 mod webhook;
 
@@ -135,8 +133,7 @@ async fn run_server() {
         "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'",
     );
 
-    // Document routes — body size is capped at max_size.
-    let doc_router = Router::new()
+    let app = Router::new()
         // Health check — no auth, checked by load balancers and uptime monitors.
         .route("/health", get(handlers::health_check))
         // Documents: POST (create) and GET (list) share the same path.
@@ -155,21 +152,7 @@ async fn run_server() {
             axum::http::header::CONTENT_SECURITY_POLICY,
             csp,
         ))
-        .layer(DefaultBodyLimit::max(max_size));
-
-    // MCP HTTP transport — NOT behind DefaultBodyLimit (JSON-RPC payloads can
-    // be large for publish operations). Auth is handled inside the handler.
-    let mcp_router = Router::new()
-        .route("/mcp", post(mcp_http::handle_mcp_post))
-        .layer(DefaultBodyLimit::disable());
-
-    // OAuth 2.0 Client Credentials grant — auth handled inside the handler.
-    let oauth_router = Router::new()
-        .route("/oauth/token", post(oauth::handle_oauth_token));
-
-    let app = doc_router
-        .merge(mcp_router)
-        .merge(oauth_router)
+        .layer(DefaultBodyLimit::max(max_size))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
@@ -650,6 +633,12 @@ fn token_create(name: &str, db_path: &str) {
     let now = handlers::chrono_now();
     let id = nanoid::nanoid!(10);
 
+    // Store the first 8 chars of the plaintext token as a lookup prefix.
+    // This enables O(1) indexed lookup in check_auth instead of O(n × argon2).
+    // The prefix is NOT a secret — it merely narrows the candidate to 1 record.
+    // Argon2 verification still runs on that 1 candidate.
+    let prefix = token_plain.chars().take(8).collect::<String>();
+
     let record = db::TokenRecord {
         id,
         name: name.to_string(),
@@ -657,6 +646,7 @@ fn token_create(name: &str, db_path: &str) {
         created_at: now,
         last_used: None,
         revoked: false,
+        prefix: Some(prefix),
     };
 
     if let Err(e) = db.insert_token(&record) {
