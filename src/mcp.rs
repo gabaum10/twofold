@@ -227,17 +227,17 @@ fn handle_tools_list(id: Value) -> Response {
             "tools": [
                 {
                     "name": "twofold_publish",
-                    "description": "Publish a dual-layer document. One URL, two audiences. The human layer (content) gives readers the critical context they need to understand and act on the information — concise, scannable, written for someone on their phone. The agent layer (agent_content) carries the full technical depth — specs, data, configuration, implementation details — everything an AI agent needs to pick up the thread and work with it. When someone pastes the link into a conversation with an AI, the agent fetches the API endpoint and gets the complete picture without the human needing to relay it.",
+                    "description": "Publish a dual-layer document. One URL, two audiences. The human layer (content) gives readers the critical context they need to understand and act on the information — concise, scannable, written for someone on their phone. The agent layer (agent_content) carries the full technical depth — specs, data, configuration, implementation details — everything an AI agent needs to pick up the thread and work with it. When someone pastes the link into a conversation with an AI, the agent fetches the API endpoint and gets the complete picture without the human needing to relay it. IMPORTANT: Always provide BOTH content and agent_content. A document with only content is just a web page — the dual-layer split is the entire point of Twofold.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "content": {
                                 "type": "string",
-                                "description": "Human-readable layer, visible in the browser. Write the essential context a person needs to understand what this is, why it matters, and what to do next. Keep it concise and scannable. Skip technical specs, API details, and structured data — those belong in agent_content."
+                                "description": "Human-readable summary layer, visible in the browser. Write a concise overview — what this is, why it matters, what to do next. 3-5 paragraphs max. DO NOT put technical specs, structured data, full details, or raw data here — those go in agent_content. If you're putting everything in content and leaving agent_content empty, you're doing it wrong."
                             },
                             "agent_content": {
                                 "type": "string",
-                                "description": "Agent-readable layer, invisible in the browser, accessible via the API endpoint. Full technical context: specs, structured data, API references, configuration, implementation details, and any information an AI agent would need to pick up this thread and act on it without asking follow-up questions. Write for a machine that's about to do work with this information."
+                                "description": "REQUIRED for proper Twofold documents. The agent-readable layer — invisible in the browser, served to AI agents automatically. This is the FULL DEPTH behind the human summary: complete analysis, raw data, source URLs, citations, structured metadata, counterarguments, caveats, related context, and anything an AI agent would need to continue an intelligent conversation about this topic. Think of it as everything you'd want to know if someone asked you a follow-up question. The human layer is the headline. The agent layer is the research folder behind it. Without agent_content, you're just publishing a web page."
                             },
                             "title": {
                                 "type": "string",
@@ -301,7 +301,7 @@ fn handle_tools_list(id: Value) -> Response {
                 },
                 {
                     "name": "twofold_update",
-                    "description": "Update an existing document. Returns 404 if the slug does not exist. Use twofold_publish to create new documents. Publish a dual-layer document. One URL, two audiences. The human layer (content) gives readers the critical context they need to understand and act on the information — concise, scannable, written for someone on their phone. The agent layer (agent_content) carries the full technical depth — specs, data, configuration, implementation details — everything an AI agent needs to pick up the thread and work with it. When someone pastes the link into a conversation with an AI, the agent fetches the API endpoint and gets the complete picture without the human needing to relay it.",
+                    "description": "Update an existing document. Returns 404 if the slug does not exist. Use twofold_publish to create new documents. Publish a dual-layer document. One URL, two audiences. The human layer (content) gives readers the critical context they need to understand and act on the information — concise, scannable, written for someone on their phone. The agent layer (agent_content) carries the full technical depth — specs, data, configuration, implementation details — everything an AI agent needs to pick up the thread and work with it. When someone pastes the link into a conversation with an AI, the agent fetches the API endpoint and gets the complete picture without the human needing to relay it. IMPORTANT: Always provide BOTH content and agent_content. A document with only content is just a web page — the dual-layer split is the entire point of Twofold.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -311,11 +311,11 @@ fn handle_tools_list(id: Value) -> Response {
                             },
                             "content": {
                                 "type": "string",
-                                "description": "Human-readable layer, visible in the browser. Write the essential context a person needs to understand what this is, why it matters, and what to do next. Keep it concise and scannable. Skip technical specs, API details, and structured data — those belong in agent_content."
+                                "description": "Human-readable summary layer, visible in the browser. Write a concise overview — what this is, why it matters, what to do next. 3-5 paragraphs max. DO NOT put technical specs, structured data, full details, or raw data here — those go in agent_content. If you're putting everything in content and leaving agent_content empty, you're doing it wrong."
                             },
                             "agent_content": {
                                 "type": "string",
-                                "description": "Agent-readable layer, invisible in the browser, accessible via the API endpoint. Full technical context: specs, structured data, API references, configuration, implementation details, and any information an AI agent would need to pick up this thread and act on it without asking follow-up questions. Write for a machine that's about to do work with this information."
+                                "description": "REQUIRED for proper Twofold documents. The agent-readable layer — invisible in the browser, served to AI agents automatically. This is the FULL DEPTH behind the human summary: complete analysis, raw data, source URLs, citations, structured metadata, counterarguments, caveats, related context, and anything an AI agent would need to continue an intelligent conversation about this topic. Think of it as everything you'd want to know if someone asked you a follow-up question. The human layer is the headline. The agent layer is the research folder behind it. Without agent_content, you're just publishing a web page."
                             },
                             "title": {
                                 "type": "string",
