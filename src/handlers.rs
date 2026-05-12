@@ -116,6 +116,8 @@ pub struct OAuthClientRecord {
     pub grant_types: Vec<String>,
     pub response_types: Vec<String>,
     pub token_endpoint_auth_method: String,
+    /// RFC 3339 timestamp of registration — used by the 24-hour expiry sweep.
+    pub created_at: String,
 }
 
 /// Active refresh token record.

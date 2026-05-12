@@ -22,6 +22,7 @@ use crate::handlers::{
     check_auth_token, chrono_now, AccessTokenRecord, AppState, OAuthClientRecord,
     RefreshTokenRecord,
 };
+use crate::rate_limit::{ReadRateLimit, RegistrationRateLimit};
 
 use chrono;
 
@@ -93,6 +94,7 @@ struct RegisterResponse {
 /// POST /oauth/register — RFC 7591 dynamic client registration.
 pub async fn handle_register(
     State(state): State<AppState>,
+    _rl: RegistrationRateLimit,
     Json(req): Json<RegisterRequest>,
 ) -> Response {
     let client_name = req.client_name.unwrap_or_else(|| "unnamed-client".to_string());
@@ -117,6 +119,12 @@ pub async fn handle_register(
         .token_endpoint_auth_method
         .unwrap_or_else(|| "none".to_string());
     let client_id = new_uuid();
+    let now = chrono_now();
+    // Compute the cutoff for the 24-hour expiry sweep (RFC 3339, lexicographic-safe).
+    let cutoff_24h = {
+        let cutoff = chrono::Utc::now() - chrono::Duration::hours(24);
+        cutoff.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+    };
     let record = OAuthClientRecord {
         client_id: client_id.clone(),
         client_name: client_name.clone(),
@@ -124,12 +132,34 @@ pub async fn handle_register(
         grant_types: grant_types.clone(),
         response_types: response_types.clone(),
         token_endpoint_auth_method: token_endpoint_auth_method.clone(),
+        created_at: now,
     };
     {
         let mut clients = state
             .oauth_clients
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+
+        // Sweep registrations older than 24 hours before checking the size cap.
+        // Legitimate clients that need to re-register simply do so; stale entries
+        // from spam or one-off tools are cleaned up automatically.
+        clients.retain(|_, v| v.created_at.as_str() >= cutoff_24h.as_str());
+
+        // Hard cap: refuse new registrations if the map is at or over 1,000 entries.
+        // This prevents memory exhaustion from registration spam that slips past
+        // the rate limiter (e.g., distributed sources).
+        if clients.len() >= 1_000 {
+            tracing::warn!("OAuth client registration limit reached ({} entries)", clients.len());
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "server_error",
+                    "error_description": "Registration limit reached"
+                })),
+            )
+                .into_response();
+        }
+
         clients.insert(client_id.clone(), record);
     }
     tracing::info!(client_id = %client_id, client_name = %client_name, "OAuth dynamic client registered");
@@ -165,6 +195,7 @@ pub struct AuthorizeParams {
 /// open redirect attacks.
 pub async fn handle_authorize(
     State(state): State<AppState>,
+    _rl: ReadRateLimit,
     Query(params): Query<AuthorizeParams>,
 ) -> Response {
     match params.response_type.as_deref() {
@@ -347,6 +378,7 @@ struct TokenResponse {
 /// POST /oauth/token — all grant types.
 pub async fn handle_oauth_token(
     State(state): State<AppState>,
+    _rl: ReadRateLimit,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {

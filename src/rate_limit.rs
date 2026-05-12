@@ -53,16 +53,23 @@ pub struct RateLimitError {
 pub struct RateLimitStore {
     read_store: DashMap<String, Bucket>,
     write_store: DashMap<String, Bucket>,
+    /// Separate tight bucket for OAuth registration — 5 req/min per IP.
+    registration_store: DashMap<String, Bucket>,
     read_limit: u32,
     write_limit: u32,
     window_secs: u64,
 }
+
+/// Registration rate limit: 5 requests per 60-second window per IP.
+const REGISTRATION_LIMIT: u32 = 5;
+const REGISTRATION_WINDOW_SECS: u64 = 60;
 
 impl RateLimitStore {
     pub fn new(config: &ServeConfig) -> Arc<Self> {
         Arc::new(Self {
             read_store: DashMap::new(),
             write_store: DashMap::new(),
+            registration_store: DashMap::new(),
             read_limit: config.rate_limit_read,
             write_limit: config.rate_limit_write,
             window_secs: config.rate_limit_window,
@@ -81,6 +88,14 @@ impl RateLimitStore {
     /// Returns Ok(()) if the request is within limit, Err(RateLimitError) if exhausted.
     pub fn check_write(&self, token: &str) -> Result<(), RateLimitError> {
         check_bucket(&self.write_store, token, self.write_limit, self.window_secs)
+    }
+
+    /// Check and increment the registration bucket for the given IP key.
+    ///
+    /// Hard limit: 5 requests per 60-second window. Legitimate clients register
+    /// once; this budget is generous enough for retries while blocking spam.
+    pub fn check_registration(&self, ip: &str) -> Result<(), RateLimitError> {
+        check_bucket(&self.registration_store, ip, REGISTRATION_LIMIT, REGISTRATION_WINDOW_SECS)
     }
 }
 
@@ -227,6 +242,39 @@ where
 
         store.check_read(&ip).map_err(|e| too_many_requests_response(&e))?;
         Ok(ReadRateLimit)
+    }
+}
+
+// ── RegistrationRateLimit Extractor ──────────────────────────────────────────
+
+/// Axum extractor that enforces per-IP rate limiting on OAuth client registration.
+///
+/// Tighter than `ReadRateLimit`: 5 requests per 60-second window per IP.
+/// Legitimate clients register once; the budget covers retries and re-registration
+/// after 24-hour expiry sweeps. Spam registrations are blocked before hitting
+/// the handler's map-size guard.
+pub struct RegistrationRateLimit;
+
+#[async_trait]
+impl<S> FromRequestParts<S> for RegistrationRateLimit
+where
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let store = parts
+            .extensions
+            .get::<Arc<RateLimitStore>>()
+            .cloned()
+            .ok_or_else(|| {
+                (StatusCode::INTERNAL_SERVER_ERROR, "Rate limit store missing").into_response()
+            })?;
+
+        let ip = extract_client_ip(parts);
+
+        store.check_registration(&ip).map_err(|e| too_many_requests_response(&e))?;
+        Ok(RegistrationRateLimit)
     }
 }
 
