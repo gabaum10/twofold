@@ -728,6 +728,7 @@ const KNOWN_BOT_AGENTS: &[&str] = &[
     "bingbot",
     "perplexitybot",
     "anthropic",
+    "google-agent",
 ];
 
 /// Returns true if the User-Agent header matches a known AI crawler.
