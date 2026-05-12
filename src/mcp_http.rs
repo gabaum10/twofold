@@ -53,7 +53,10 @@ pub async fn handle_mcp_post(
         None => {
             return (
                 StatusCode::UNAUTHORIZED,
-                [(axum::http::header::WWW_AUTHENTICATE, www_auth_header.clone())],
+                [(
+                    axum::http::header::WWW_AUTHENTICATE,
+                    www_auth_header.clone(),
+                )],
                 axum::Json(serde_json::json!({
                     "error": "unauthorized",
                     "error_description": "Bearer token required"
@@ -63,7 +66,7 @@ pub async fn handle_mcp_post(
         }
     };
 
-    if let Err(_) = check_auth_token(&state, &token).await {
+    if check_auth_token(&state, &token).await.is_err() {
         return (
             StatusCode::UNAUTHORIZED,
             [(axum::http::header::WWW_AUTHENTICATE, www_auth_header)],
@@ -79,11 +82,7 @@ pub async fn handle_mcp_post(
     let request: mcp::Request = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
-            let resp = mcp::Response::err(
-                Value::Null,
-                -32700,
-                format!("Parse error: {e}"),
-            );
+            let resp = mcp::Response::err(Value::Null, -32700, format!("Parse error: {e}"));
             return json_response(StatusCode::OK, &resp);
         }
     };
@@ -100,8 +99,8 @@ pub async fn handle_mcp_post(
     // These are the credentials the MCP layer uses for its onward HTTP calls
     // to the document API — independent of the bearer token the caller used
     // to authenticate with this endpoint.
-    let server_url = std::env::var("TWOFOLD_MCP_SERVER")
-        .unwrap_or_else(|_| "http://localhost:3000".to_string());
+    let server_url =
+        std::env::var("TWOFOLD_MCP_SERVER").unwrap_or_else(|_| "http://localhost:3000".to_string());
     let server_url = server_url.trim_end_matches('/').to_string();
 
     let token = std::env::var("TWOFOLD_MCP_TOKEN")
@@ -135,10 +134,7 @@ fn json_response(status: StatusCode, resp: &mcp::Response) -> Response {
     match serde_json::to_vec(resp) {
         Ok(body) => (
             status,
-            [(
-                axum::http::header::CONTENT_TYPE,
-                "application/json",
-            )],
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
             body,
         )
             .into_response(),

@@ -1,5 +1,5 @@
-use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use askama::Template;
 use axum::{
@@ -9,9 +9,9 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     Form, Json,
 };
-use std::net::SocketAddr;
 use comrak::{markdown_to_html, Options};
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 
 use crate::{
     config::ServeConfig,
@@ -24,12 +24,10 @@ use crate::{
 
 /// URL-safe slug alphabet: alphanumeric + hyphen.
 const SLUG_ALPHABET: [char; 63] = [
-    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
-    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm',
-    'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
-    'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M',
-    'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z',
-    '-',
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i',
+    'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', 'A', 'B',
+    'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U',
+    'V', 'W', 'X', 'Y', 'Z', '-',
 ];
 
 // ── Application Error ────────────────────────────────────────────────────────
@@ -262,8 +260,8 @@ pub struct SlugQuery {
 pub struct DocumentResponse {
     pub slug: String,
     pub title: String,
-    pub content: String,          // full raw markdown, password stripped from frontmatter
-    pub human_content: String,    // content outside <!-- @agent --> blocks
+    pub content: String, // full raw markdown, password stripped from frontmatter
+    pub human_content: String, // content outside <!-- @agent --> blocks
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_content: Option<String>, // content inside <!-- @agent --> blocks
     pub theme: String,
@@ -331,7 +329,9 @@ pub async fn post_document(
 
     // Body validation
     if body.is_empty() {
-        return Err(AppError::BadRequest("Request body must not be empty".to_string()));
+        return Err(AppError::BadRequest(
+            "Request body must not be empty".to_string(),
+        ));
     }
 
     let raw_content = std::str::from_utf8(&body)
@@ -339,33 +339,34 @@ pub async fn post_document(
         .to_string();
 
     // Parse frontmatter
-    let fm_result = extract_frontmatter(&raw_content)
-        .map_err(|e| AppError::BadRequest(e))?;
+    let fm_result = extract_frontmatter(&raw_content).map_err(AppError::BadRequest)?;
 
     let meta = fm_result.meta.unwrap_or_default();
     let body_text = &fm_result.body;
 
     // Determine slug
     let slug = if let Some(ref custom_slug) = meta.slug {
-        validate_slug(custom_slug)
-            .map_err(|e| AppError::BadRequest(e))?;
+        validate_slug(custom_slug).map_err(AppError::BadRequest)?;
         custom_slug.clone()
     } else {
         nanoid::nanoid!(10, &SLUG_ALPHABET)
     };
 
     // Determine title: frontmatter > H1 > slug
-    let title = meta.title.unwrap_or_else(|| extract_title(body_text, &slug));
+    let title = meta
+        .title
+        .unwrap_or_else(|| extract_title(body_text, &slug));
 
     // Determine theme
-    let theme = meta.theme.unwrap_or_else(|| state.config.default_theme.clone());
+    let theme = meta
+        .theme
+        .unwrap_or_else(|| state.config.default_theme.clone());
 
     // Parse expiry
     let now = chrono_now();
     let expires_at = match meta.expiry.as_deref() {
         Some(exp) => {
-            let seconds = parse_expiry(exp)
-                .map_err(|e| AppError::BadRequest(e))?;
+            let seconds = parse_expiry(exp).map_err(AppError::BadRequest)?;
             Some(add_seconds_to_now(&now, seconds))
         }
         None => None,
@@ -398,9 +399,10 @@ pub async fn post_document(
         Err(e) if is_unique_violation(&e) => {
             // Custom slug collision -> 409 Conflict
             if meta.slug.is_some() {
-                return Err(AppError::Conflict(
-                    format!("Slug '{}' is already in use", slug),
-                ));
+                return Err(AppError::Conflict(format!(
+                    "Slug '{}' is already in use",
+                    slug
+                )));
             }
             // Random slug collision (extremely rare) -> retry once
             let new_slug = nanoid::nanoid!(10, &SLUG_ALPHABET);
@@ -409,11 +411,10 @@ pub async fn post_document(
                 slug: new_slug.clone(),
                 ..doc
             };
-            state.db.insert_document(&retry_doc)
-                .map_err(|e2| {
-                    tracing::error!(error = %e2, "Slug collision retry failed");
-                    AppError::Internal("Failed to allocate unique slug".to_string())
-                })?;
+            state.db.insert_document(&retry_doc).map_err(|e2| {
+                tracing::error!(error = %e2, "Slug collision retry failed");
+                AppError::Internal("Failed to allocate unique slug".to_string())
+            })?;
             retry_doc
         }
         Err(e) => return Err(AppError::from(e)),
@@ -483,7 +484,9 @@ pub async fn put_document(
 
     // Body validation
     if body.is_empty() {
-        return Err(AppError::BadRequest("Request body must not be empty".to_string()));
+        return Err(AppError::BadRequest(
+            "Request body must not be empty".to_string(),
+        ));
     }
 
     let raw_content = std::str::from_utf8(&body)
@@ -491,43 +494,44 @@ pub async fn put_document(
         .to_string();
 
     // Check document exists and is not expired
-    let existing = state.db.get_by_slug(&slug)?
-        .ok_or(AppError::NotFound)?;
+    let existing = state.db.get_by_slug(&slug)?.ok_or(AppError::NotFound)?;
 
     if is_expired(&existing) {
         return Err(AppError::Gone);
     }
 
     // Parse frontmatter
-    let fm_result = extract_frontmatter(&raw_content)
-        .map_err(|e| AppError::BadRequest(e))?;
+    let fm_result = extract_frontmatter(&raw_content).map_err(AppError::BadRequest)?;
 
     let meta = fm_result.meta.unwrap_or_default();
     let body_text = &fm_result.body;
 
     // Title: frontmatter > H1 > slug (slug from URL, NOT frontmatter)
-    let title = meta.title.unwrap_or_else(|| extract_title(body_text, &slug));
+    let title = meta
+        .title
+        .unwrap_or_else(|| extract_title(body_text, &slug));
 
     // Theme
-    let theme = meta.theme.unwrap_or_else(|| state.config.default_theme.clone());
+    let theme = meta
+        .theme
+        .unwrap_or_else(|| state.config.default_theme.clone());
 
     // Expiry: None = keep existing, Some("") = clear, Some(value) = set new
     let now = chrono_now();
     let expires_at = match meta.expiry.as_deref() {
         Some(exp) if !exp.is_empty() => {
-            let seconds = parse_expiry(exp)
-                .map_err(|e| AppError::BadRequest(e))?;
+            let seconds = parse_expiry(exp).map_err(AppError::BadRequest)?;
             Some(add_seconds_to_now(&now, seconds))
         }
-        Some(_) => None,                      // empty string = clear
-        None => existing.expires_at.clone(),  // absent = preserve
+        Some(_) => None,                     // empty string = clear
+        None => existing.expires_at.clone(), // absent = preserve
     };
 
     // Password: None = keep existing, Some("") = clear, Some(value) = set new
     let password_hash = match meta.password.as_deref() {
         Some(pw) if !pw.is_empty() => Some(hash_password(pw)?),
-        Some(_) => None,                      // empty string = clear
-        None => existing.password.clone(),    // absent = preserve
+        Some(_) => None,                   // empty string = clear
+        None => existing.password.clone(), // absent = preserve
     };
 
     let updated_doc = DocumentRecord {
@@ -604,8 +608,7 @@ pub async fn delete_document(
     let peer_addr = connect_info.map(|c| c.0.ip().to_string());
 
     // Check document exists — capture title/slug for webhook before delete.
-    let existing = state.db.get_by_slug(&slug)?
-        .ok_or(AppError::NotFound)?;
+    let existing = state.db.get_by_slug(&slug)?.ok_or(AppError::NotFound)?;
 
     // Expired documents: still delete them (cleanup), return 204
     // Non-expired: normal delete, return 204.
@@ -669,7 +672,9 @@ pub async fn list_documents(
     let limit = params.limit.unwrap_or(20);
     let offset = params.offset.unwrap_or(0);
 
-    let (documents, total) = state.db.list_documents(limit, offset)
+    let (documents, total) = state
+        .db
+        .list_documents(limit, offset)
         .map_err(AppError::from)?;
 
     // Report the effective (capped) limit in the response.
@@ -680,7 +685,8 @@ pub async fn list_documents(
         total,
         limit: effective_limit,
         offset,
-    }).into_response())
+    })
+    .into_response())
 }
 
 // ── GET /api/v1/audit ────────────────────────────────────────────────────────
@@ -703,7 +709,9 @@ pub async fn list_audit(
     let limit = params.limit.unwrap_or(20);
     let offset = params.offset.unwrap_or(0);
 
-    let (entries, total) = state.db.list_audit_entries(limit, offset)
+    let (entries, total) = state
+        .db
+        .list_audit_entries(limit, offset)
         .map_err(AppError::from)?;
 
     let effective_limit = limit.min(100);
@@ -713,7 +721,8 @@ pub async fn list_audit(
         total,
         limit: effective_limit,
         offset,
-    }).into_response())
+    })
+    .into_response())
 }
 
 // ── GET /health ──────────────────────────────────────────────────────────────
@@ -752,7 +761,10 @@ pub async fn serve_openapi_yaml(_rl: ReadRateLimit) -> impl IntoResponse {
     let yaml = include_str!("../docs/openapi.yaml");
     (
         StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "application/yaml; charset=utf-8")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/yaml; charset=utf-8",
+        )],
         yaml,
     )
 }
@@ -768,16 +780,18 @@ pub async fn serve_openapi_json(_rl: ReadRateLimit) -> impl IntoResponse {
     let json = OPENAPI_JSON.get_or_init(|| {
         let yaml = include_str!("../docs/openapi.yaml");
         match serde_yaml::from_str::<serde_json::Value>(yaml) {
-            Ok(val) => serde_json::to_string(&val).unwrap_or_else(|e| {
-                format!("{{\"error\":\"JSON serialization failed: {e}\"}}")
-            }),
+            Ok(val) => serde_json::to_string(&val)
+                .unwrap_or_else(|e| format!("{{\"error\":\"JSON serialization failed: {e}\"}}")),
             Err(e) => format!("{{\"error\":\"YAML parse failed: {e}\"}}"),
         }
     });
 
     (
         StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "application/json; charset=utf-8")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/json; charset=utf-8",
+        )],
         json.as_str(),
     )
 }
@@ -865,7 +879,12 @@ fn strip_password_from_content(raw: &str) -> String {
     }
 
     // Find closing `---`.
-    let close_idx = match lines.iter().enumerate().skip(1).find(|(_, l)| l.trim() == "---") {
+    let close_idx = match lines
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find(|(_, l)| l.trim() == "---")
+    {
         Some((i, _)) => i,
         None => return raw.to_string(),
     };
@@ -956,7 +975,10 @@ pub async fn get_human(
     if let Some(stored_hash) = &doc.password {
         // First: query-param unlock — ?access_token=X (or legacy ?password=X) works for agents
         // and direct links.  access_token takes precedence; password is a backward-compat fallback.
-        let query_provided = params.access_token.as_deref().or(params.password.as_deref());
+        let query_provided = params
+            .access_token
+            .as_deref()
+            .or(params.password.as_deref());
         let query_pw_valid = if let Some(provided) = query_provided {
             let provided_owned = provided.to_string();
             let hash_owned = stored_hash.clone();
@@ -969,10 +991,17 @@ pub async fn get_human(
 
         // Fall back to cookie-based auth (post-form-unlock session).
         if !query_pw_valid && !is_password_authed(&headers, &slug, &state.config.token) {
-            let template = PasswordTemplate { slug: &slug, base_url: state.config.base_url.trim_end_matches('/'), error: None };
-            return Ok(Html(template.render().map_err(|e| {
-                AppError::Internal(format!("Template error: {e}"))
-            })?).into_response());
+            let template = PasswordTemplate {
+                slug: &slug,
+                base_url: state.config.base_url.trim_end_matches('/'),
+                error: None,
+            };
+            return Ok(Html(
+                template
+                    .render()
+                    .map_err(|e| AppError::Internal(format!("Template error: {e}")))?,
+            )
+            .into_response());
         }
     }
 
@@ -1028,15 +1057,24 @@ pub async fn get_human(
     let base_url_clone = base_url.clone();
 
     let html_result = tokio::task::spawn_blocking(move || {
-        let fm_result = extract_frontmatter(&raw_content)
-            .unwrap_or_else(|_| crate::parser::FrontmatterResult {
+        let fm_result = extract_frontmatter(&raw_content).unwrap_or_else(|_| {
+            crate::parser::FrontmatterResult {
                 meta: None,
                 body: raw_content.clone(),
-            });
+            }
+        });
 
         let parse_result = parse_document(&fm_result.body, &slug_owned);
         let rendered_html = render_markdown(&parse_result.human);
-        render_themed_sync(&title, &rendered_html, &slug_owned, &theme, &base_url_clone, false, expires_at)
+        render_themed_sync(
+            &title,
+            &rendered_html,
+            &slug_owned,
+            &theme,
+            &base_url_clone,
+            false,
+            expires_at,
+        )
     })
     .await
     .map_err(|e| AppError::Internal(format!("Render task failed: {e}")))?;
@@ -1096,7 +1134,8 @@ pub async fn post_unlock(
                 (axum::http::header::SET_COOKIE, cookie_header),
             ],
             "",
-        ).into_response())
+        )
+            .into_response())
     } else {
         // Wrong password — show form again with error
         let template = PasswordTemplate {
@@ -1104,9 +1143,12 @@ pub async fn post_unlock(
             base_url: state.config.base_url.trim_end_matches('/'),
             error: Some("Incorrect password"),
         };
-        Ok(Html(template.render().map_err(|e| {
-            AppError::Internal(format!("Template error: {e}"))
-        })?).into_response())
+        Ok(Html(
+            template
+                .render()
+                .map_err(|e| AppError::Internal(format!("Template error: {e}")))?,
+        )
+        .into_response())
     }
 }
 
@@ -1133,13 +1175,18 @@ pub async fn get_full(
     }
 
     // Password check
-    if doc.password.is_some() {
-        if !is_password_authed(&headers, &slug, &state.config.token) {
-            let template = PasswordTemplate { slug: &slug, base_url: state.config.base_url.trim_end_matches('/'), error: None };
-            return Ok(Html(template.render().map_err(|e| {
-                AppError::Internal(format!("Template error: {e}"))
-            })?).into_response());
-        }
+    if doc.password.is_some() && !is_password_authed(&headers, &slug, &state.config.token) {
+        let template = PasswordTemplate {
+            slug: &slug,
+            base_url: state.config.base_url.trim_end_matches('/'),
+            error: None,
+        };
+        return Ok(Html(
+            template
+                .render()
+                .map_err(|e| AppError::Internal(format!("Template error: {e}")))?,
+        )
+        .into_response());
     }
 
     // Same spawn_blocking pattern as get_human — syntect needs a larger stack.
@@ -1152,15 +1199,24 @@ pub async fn get_full(
     let base_url_clone = base_url.clone();
 
     let html_result = tokio::task::spawn_blocking(move || {
-        let fm_result = extract_frontmatter(&raw_content)
-            .unwrap_or_else(|_| crate::parser::FrontmatterResult {
+        let fm_result = extract_frontmatter(&raw_content).unwrap_or_else(|_| {
+            crate::parser::FrontmatterResult {
                 meta: None,
                 body: raw_content.clone(),
-            });
+            }
+        });
 
         let stripped = strip_marker_comments(&fm_result.body);
         let rendered_html = render_markdown(&stripped);
-        render_themed_sync(&title, &rendered_html, &slug_owned, &theme, &base_url_clone, true, expires_at)
+        render_themed_sync(
+            &title,
+            &rendered_html,
+            &slug_owned,
+            &theme,
+            &base_url_clone,
+            true,
+            expires_at,
+        )
     })
     .await
     .map_err(|e| AppError::Internal(format!("Render task failed: {e}")))?;
@@ -1203,8 +1259,7 @@ pub async fn get_agent(
     Path(slug): Path<String>,
     Query(params): Query<AgentQuery>,
 ) -> Result<Response, AppError> {
-    let doc = state.db.get_by_slug(&slug)?
-        .ok_or(AppError::NotFound)?;
+    let doc = state.db.get_by_slug(&slug)?.ok_or(AppError::NotFound)?;
 
     if is_expired(&doc) {
         return Err(AppError::Gone);
@@ -1213,7 +1268,10 @@ pub async fn get_agent(
     // Password gate — same argon2 check as the human view.
     // access_token takes precedence; password is a backward-compat fallback.
     if let Some(stored_hash) = &doc.password {
-        let provided = params.access_token.as_deref().or(params.password.as_deref());
+        let provided = params
+            .access_token
+            .as_deref()
+            .or(params.password.as_deref());
         match provided {
             Some(provided) if verify_password(provided, stored_hash) => {
                 // Correct password — fall through to serve content.
@@ -1242,8 +1300,7 @@ pub async fn get_agent(
 ///    argon2 per record, also in `spawn_blocking`. Degrades gracefully for
 ///    existing deployments; new tokens never hit this path.
 async fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<String, AppError> {
-    let provided = extract_bearer(headers)
-        .ok_or(AppError::Unauthorized)?;
+    let provided = extract_bearer(headers).ok_or(AppError::Unauthorized)?;
 
     check_auth_token(state, provided).await
 }
@@ -1262,7 +1319,10 @@ pub async fn check_auth_token(state: &AppState, provided: &str) -> Result<String
     // Sweep expired entries on access, then check for a match.
     {
         let now = chrono_now();
-        let mut tokens = state.access_tokens.lock().unwrap_or_else(|e| e.into_inner());
+        let mut tokens = state
+            .access_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         tokens.retain(|_, v| v.expires_at.as_str() >= now.as_str());
         if tokens.contains_key(provided) {
             return Ok("oauth".to_string());
@@ -1273,17 +1333,18 @@ pub async fn check_auth_token(state: &AppState, provided: &str) -> Result<String
     // to look up the one candidate record, then verify with argon2.
     let prefix: String = provided.chars().take(8).collect();
 
-    let candidate = state.db.get_token_by_prefix(&prefix)
+    let candidate = state
+        .db
+        .get_token_by_prefix(&prefix)
         .map_err(|_| AppError::Internal("Failed to check tokens".to_string()))?;
 
     if let Some(token_record) = candidate {
         let provided_owned = provided.to_string();
         let hash_owned = token_record.hash.clone();
-        let verified = tokio::task::spawn_blocking(move || {
-            verify_password(&provided_owned, &hash_owned)
-        })
-        .await
-        .map_err(|e| AppError::Internal(format!("Auth task failed: {e}")))?;
+        let verified =
+            tokio::task::spawn_blocking(move || verify_password(&provided_owned, &hash_owned))
+                .await
+                .map_err(|e| AppError::Internal(format!("Auth task failed: {e}")))?;
 
         if verified {
             let now = chrono_now();
@@ -1296,7 +1357,9 @@ pub async fn check_auth_token(state: &AppState, provided: &str) -> Result<String
 
     // Legacy fallback: tokens created before v0.4 have no prefix stored.
     // On a fresh database this query returns 0 rows immediately.
-    let legacy_tokens = state.db.get_legacy_active_tokens()
+    let legacy_tokens = state
+        .db
+        .get_legacy_active_tokens()
         .map_err(|_| AppError::Internal("Failed to check tokens".to_string()))?;
 
     if !legacy_tokens.is_empty() {
@@ -1454,7 +1517,15 @@ fn render_markdown(source: &str) -> String {
 ///
 /// Named `_sync` because it is called from `spawn_blocking` contexts (not directly from async).
 /// This avoids stack overflow in async worker threads during syntect init/tokenization.
-fn render_themed_sync(title: &str, content: &str, slug: &str, theme: &str, base_url: &str, full_view: bool, expires_at: Option<String>) -> Result<Response, AppError> {
+fn render_themed_sync(
+    title: &str,
+    content: &str,
+    slug: &str,
+    theme: &str,
+    base_url: &str,
+    full_view: bool,
+    expires_at: Option<String>,
+) -> Result<Response, AppError> {
     // Apply syntax highlighting to the pre-rendered HTML.
     // Dark theme gets dark syntax palette; all others get light.
     let is_dark = theme == "dark";
@@ -1468,24 +1539,66 @@ fn render_themed_sync(title: &str, content: &str, slug: &str, theme: &str, base_
 
     let html = match theme {
         "dark" => {
-            let t = DarkTemplate { title, content: &highlighted, slug, base_url, body_empty, expires_at, description };
+            let t = DarkTemplate {
+                title,
+                content: &highlighted,
+                slug,
+                base_url,
+                body_empty,
+                expires_at,
+                description,
+            };
             t.render()
         }
         "paper" => {
-            let t = PaperTemplate { title, content: &highlighted, slug, base_url, body_empty, expires_at, description };
+            let t = PaperTemplate {
+                title,
+                content: &highlighted,
+                slug,
+                base_url,
+                body_empty,
+                expires_at,
+                description,
+            };
             t.render()
         }
         "minimal" => {
-            let t = MinimalTemplate { title, content: &highlighted, slug, base_url, body_empty, expires_at, description };
+            let t = MinimalTemplate {
+                title,
+                content: &highlighted,
+                slug,
+                base_url,
+                body_empty,
+                expires_at,
+                description,
+            };
             t.render()
         }
         "hearth" => {
-            let t = HearthTemplate { title, content: &highlighted, slug, base_url, full_view, body_empty, expires_at, description };
+            let t = HearthTemplate {
+                title,
+                content: &highlighted,
+                slug,
+                base_url,
+                full_view,
+                body_empty,
+                expires_at,
+                description,
+            };
             t.render()
         }
         _ => {
             // "clean" or unknown -> default
-            let t = CleanTemplate { title, content: &highlighted, slug, base_url, full_view, body_empty, expires_at, description };
+            let t = CleanTemplate {
+                title,
+                content: &highlighted,
+                slug,
+                base_url,
+                full_view,
+                body_empty,
+                expires_at,
+                description,
+            };
             t.render()
         }
     };
@@ -1503,7 +1616,9 @@ fn plain_text_excerpt(html: &str, max_chars: usize) -> String {
 
     for ch in html.chars() {
         match ch {
-            '<' => { in_tag = true; }
+            '<' => {
+                in_tag = true;
+            }
             '>' => {
                 in_tag = false;
                 // Treat closing/block tags as whitespace boundaries.
@@ -1901,7 +2016,10 @@ fn is_unique_violation(e: &rusqlite::Error) -> bool {
 
 /// Hash a password with argon2.
 pub fn hash_password(password: &str) -> Result<String, AppError> {
-    use argon2::{Argon2, password_hash::{SaltString, PasswordHasher, rand_core::OsRng}};
+    use argon2::{
+        password_hash::{rand_core::OsRng, PasswordHasher, SaltString},
+        Argon2,
+    };
 
     let salt = SaltString::generate(&mut OsRng);
     let argon2 = Argon2::default();
@@ -1926,9 +2044,9 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
 
 /// Generate an HMAC-based auth cookie value for a slug.
 fn make_auth_cookie(slug: &str, server_secret: &str) -> String {
+    use base64::Engine;
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
-    use base64::Engine;
 
     let expiry = chrono::Utc::now() + chrono::Duration::hours(1);
     let expiry_str = expiry.format("%Y-%m-%dT%H:%M:%SZ").to_string();
@@ -1945,9 +2063,9 @@ fn make_auth_cookie(slug: &str, server_secret: &str) -> String {
 
 /// Check if the request has a valid password auth cookie.
 fn is_password_authed(headers: &HeaderMap, slug: &str, server_secret: &str) -> bool {
+    use base64::Engine;
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
-    use base64::Engine;
 
     let cookie_name = format!("twofold_auth_{}", slug);
 
@@ -1957,15 +2075,14 @@ fn is_password_authed(headers: &HeaderMap, slug: &str, server_secret: &str) -> b
     };
 
     // Find our cookie in the cookie string
-    let cookie_value = cookies
-        .split(';')
-        .map(|s| s.trim())
-        .find_map(|pair| {
-            let mut parts = pair.splitn(2, '=');
-            let name = parts.next()?;
-            let value = parts.next()?;
-            if name == cookie_name { Some(value) } else { None }
-        });
+    let cookie_value = cookies.split(';').map(|s| s.trim()).find_map(|pair| {
+        let (name, value) = pair.split_once('=')?;
+        if name == cookie_name {
+            Some(value)
+        } else {
+            None
+        }
+    });
 
     let cookie_value = match cookie_value {
         Some(v) => v,
@@ -2074,13 +2191,13 @@ mod tests {
     // These tests use axum's oneshot mechanism to exercise the full handler stack
     // with an in-memory SQLite database. No network, no external process.
 
-    use std::sync::Arc;
     use axum::{
         body::Body,
         http::{Request, StatusCode},
-        Router,
         routing::{get, post},
+        Router,
     };
+    use std::sync::Arc;
     use tower::ServiceExt;
 
     /// Build a minimal test router backed by an in-memory database.
@@ -2102,7 +2219,8 @@ mod tests {
         };
         let rate_limit = crate::rate_limit::RateLimitStore::new(&config);
         let state = AppState {
-            db, config: Arc::new(config),
+            db,
+            config: Arc::new(config),
             auth_codes: Arc::new(Mutex::new(HashMap::new())),
             oauth_clients: Arc::new(Mutex::new(HashMap::new())),
             refresh_tokens: Arc::new(Mutex::new(HashMap::new())),
@@ -2145,7 +2263,8 @@ mod tests {
         };
         let rate_limit = crate::rate_limit::RateLimitStore::new(&config);
         let state = AppState {
-            db, config: Arc::new(config),
+            db,
+            config: Arc::new(config),
             auth_codes: Arc::new(Mutex::new(HashMap::new())),
             oauth_clients: Arc::new(Mutex::new(HashMap::new())),
             refresh_tokens: Arc::new(Mutex::new(HashMap::new())),
@@ -2197,7 +2316,9 @@ mod tests {
             "404 response should be HTML, got: {content_type}"
         );
 
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let text = std::str::from_utf8(&body).unwrap();
 
         assert!(
@@ -2252,11 +2373,13 @@ mod tests {
             expires_at: Some("2020-06-01T00:00:00Z".to_string()), // firmly in the past
             updated_at: "2020-01-01T00:00:00Z".to_string(),
         };
-        db.insert_document(&expired_doc).expect("insert expired doc");
+        db.insert_document(&expired_doc)
+            .expect("insert expired doc");
 
         let rate_limit = crate::rate_limit::RateLimitStore::new(&config);
         let state = AppState {
-            db, config: Arc::new(config),
+            db,
+            config: Arc::new(config),
             auth_codes: Arc::new(Mutex::new(HashMap::new())),
             oauth_clients: Arc::new(Mutex::new(HashMap::new())),
             refresh_tokens: Arc::new(Mutex::new(HashMap::new())),
@@ -2299,7 +2422,9 @@ mod tests {
             "410 response should be HTML, got: {content_type}"
         );
 
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let text = std::str::from_utf8(&body).unwrap();
 
         assert!(
@@ -2334,7 +2459,9 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"].as_str().unwrap(), "Not found");
     }
@@ -2356,7 +2483,9 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let text = std::str::from_utf8(&body).unwrap();
 
         // Should NOT contain password form elements
@@ -2383,7 +2512,9 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED, "publish failed");
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         json["slug"].as_str().unwrap().to_string()
     }
@@ -2394,7 +2525,13 @@ mod tests {
         let app = test_app(token);
 
         // Publish a document first.
-        let slug = publish_doc(app.clone(), token, "my-slug", "# Original\nOriginal content.").await;
+        let slug = publish_doc(
+            app.clone(),
+            token,
+            "my-slug",
+            "# Original\nOriginal content.",
+        )
+        .await;
         assert_eq!(slug, "my-slug");
 
         // PUT with new content.
@@ -2408,7 +2545,9 @@ mod tests {
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["slug"].as_str().unwrap(), "my-slug");
 
@@ -2421,10 +2560,18 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let raw = std::str::from_utf8(&body_bytes).unwrap();
-        assert!(raw.contains("Updated content."), "content should reflect PUT body");
-        assert!(!raw.contains("Original content."), "old content should be gone");
+        assert!(
+            raw.contains("Updated content."),
+            "content should reflect PUT body"
+        );
+        assert!(
+            !raw.contains("Original content."),
+            "old content should be gone"
+        );
     }
 
     #[tokio::test]
@@ -2476,7 +2623,9 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["title"].as_str().unwrap(), "New Title");
     }
@@ -2503,10 +2652,15 @@ mod tests {
 
         // The response from PUT is CreateResponse which includes created_at but not updated_at.
         // Verify the response is well-formed and slug is correct.
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["slug"].as_str().unwrap(), slug);
-        assert!(json.get("created_at").is_some(), "response should include created_at");
+        assert!(
+            json.get("created_at").is_some(),
+            "response should include created_at"
+        );
     }
 
     #[tokio::test]
@@ -2529,7 +2683,9 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         // Slug in response must match the URL slug, not the frontmatter slug.
         assert_eq!(json["slug"].as_str().unwrap(), "original-slug");
@@ -2548,8 +2704,14 @@ mod tests {
             .body(Body::from(body))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::CREATED, "publish protected doc failed");
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "publish protected doc failed"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         json["slug"].as_str().unwrap().to_string()
     }
@@ -2569,9 +2731,14 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let text = std::str::from_utf8(&body).unwrap();
-        assert!(text.contains("Secret content."), "body should contain document content");
+        assert!(
+            text.contains("Secret content."),
+            "body should contain document content"
+        );
     }
 
     #[tokio::test]
@@ -2589,7 +2756,9 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"].as_str().unwrap(), "Invalid password");
     }
@@ -2609,7 +2778,9 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"].as_str().unwrap(), "Password required");
     }
@@ -2629,9 +2800,14 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let text = std::str::from_utf8(&body).unwrap();
-        assert!(text.contains("Open content."), "unprotected doc should be served without password");
+        assert!(
+            text.contains("Open content."),
+            "unprotected doc should be served without password"
+        );
     }
 
     // ── Managed token auth tests ──────────────────────────────────────────────
@@ -2641,8 +2817,8 @@ mod tests {
     /// Returns (Router, plaintext_managed_token). The admin TWOFOLD_TOKEN is set
     /// to "admin-token" so both paths can be exercised separately.
     fn test_app_with_managed_token() -> (Router, String) {
-        use crate::db::{Db, TokenRecord};
         use crate::config::ServeConfig;
+        use crate::db::{Db, TokenRecord};
 
         let db = Db::open(":memory:").expect("in-memory db");
 
@@ -2679,7 +2855,8 @@ mod tests {
         };
         let rate_limit = crate::rate_limit::RateLimitStore::new(&config);
         let state = AppState {
-            db, config: Arc::new(config),
+            db,
+            config: Arc::new(config),
             auth_codes: Arc::new(Mutex::new(HashMap::new())),
             oauth_clients: Arc::new(Mutex::new(HashMap::new())),
             refresh_tokens: Arc::new(Mutex::new(HashMap::new())),
@@ -2718,8 +2895,11 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK,
-            "managed token should be accepted by prefix lookup + argon2 verify");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "managed token should be accepted by prefix lookup + argon2 verify"
+        );
     }
 
     /// Wrong token with same prefix: prefix matches DB record but argon2 rejects it.
@@ -2738,8 +2918,11 @@ mod tests {
             .body(Body::from("# Test"))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED,
-            "token with matching prefix but wrong value must be rejected");
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "token with matching prefix but wrong value must be rejected"
+        );
     }
 
     /// Admin token still works independently of managed token path.
@@ -2755,8 +2938,11 @@ mod tests {
             .body(Body::from("# Admin Test"))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::CREATED,
-            "admin TWOFOLD_TOKEN must still work when managed tokens exist");
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "admin TWOFOLD_TOKEN must still work when managed tokens exist"
+        );
     }
 
     /// No token: 401 immediately.
@@ -2771,16 +2957,19 @@ mod tests {
             .body(Body::from("# No Auth"))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED,
-            "missing token must return 401");
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "missing token must return 401"
+        );
     }
 
     /// Revoked managed token: prefix lookup finds the record, but argon2 passes,
     /// yet it should be excluded by `WHERE revoked = 0`.
     #[tokio::test]
     async fn test_revoked_managed_token_rejected() {
-        use crate::db::{Db, TokenRecord};
         use crate::config::ServeConfig;
+        use crate::db::{Db, TokenRecord};
 
         let db = Db::open(":memory:").expect("in-memory db");
         let managed_plain = "tf_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
@@ -2794,7 +2983,7 @@ mod tests {
             hash,
             created_at: "2024-01-01T00:00:00Z".to_string(),
             last_used: None,
-            revoked: true,   // already revoked
+            revoked: true, // already revoked
             prefix: Some(prefix),
         };
         db.insert_token(&record).expect("insert revoked token");
@@ -2815,7 +3004,8 @@ mod tests {
         };
         let rate_limit = crate::rate_limit::RateLimitStore::new(&config);
         let state = AppState {
-            db, config: Arc::new(config),
+            db,
+            config: Arc::new(config),
             auth_codes: Arc::new(Mutex::new(HashMap::new())),
             oauth_clients: Arc::new(Mutex::new(HashMap::new())),
             refresh_tokens: Arc::new(Mutex::new(HashMap::new())),
@@ -2838,8 +3028,11 @@ mod tests {
             .body(Body::from("# Revoked Test"))
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED,
-            "revoked token must not authenticate");
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "revoked token must not authenticate"
+        );
     }
 
     // ── Content negotiation tests ─────────────────────────────────────────────
@@ -2856,7 +3049,9 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED, "publish failed");
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         json["slug"].as_str().unwrap().to_string()
     }
@@ -2876,7 +3071,12 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert!(ct.contains("text/html"), "expected HTML, got {ct}");
     }
 
@@ -2885,7 +3085,8 @@ mod tests {
     async fn test_content_neg_json_accept_returns_json() {
         let token = "test-token";
         let app = test_app_full(token);
-        let slug = publish_doc_full(app.clone(), token, "cn-json", "# Hello\n\nAgent content.").await;
+        let slug =
+            publish_doc_full(app.clone(), token, "cn-json", "# Hello\n\nAgent content.").await;
 
         let req = Request::builder()
             .method("GET")
@@ -2895,9 +3096,16 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert!(ct.contains("application/json"), "expected JSON, got {ct}");
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["slug"].as_str().unwrap(), "cn-json");
         assert!(json["content"].as_str().unwrap().contains("Hello"));
@@ -2918,11 +3126,21 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert!(ct.contains("text/markdown"), "expected markdown, got {ct}");
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let body = std::str::from_utf8(&bytes).unwrap();
-        assert!(body.contains("Markdown test"), "expected raw markdown in body");
+        assert!(
+            body.contains("Markdown test"),
+            "expected raw markdown in body"
+        );
     }
 
     /// Bot User-Agent with no Accept → returns JSON.
@@ -2940,8 +3158,16 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
-        assert!(ct.contains("application/json"), "expected JSON for bot UA, got {ct}");
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            ct.contains("application/json"),
+            "expected JSON for bot UA, got {ct}"
+        );
     }
 
     /// Browser Accept + bot User-Agent → Accept wins, returns HTML.
@@ -2960,8 +3186,16 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
-        assert!(ct.contains("text/html"), "Accept: text/html should beat bot UA, got {ct}");
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            ct.contains("text/html"),
+            "Accept: text/html should beat bot UA, got {ct}"
+        );
     }
 
     /// GET /:slug.md → returns raw markdown.
@@ -2978,9 +3212,19 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
-        assert!(ct.contains("text/markdown"), "expected markdown content-type, got {ct}");
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            ct.contains("text/markdown"),
+            "expected markdown content-type, got {ct}"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let body = std::str::from_utf8(&bytes).unwrap();
         assert!(body.contains("Dotmd test"), "expected raw markdown in body");
     }
@@ -3024,10 +3268,16 @@ mod tests {
         let (state, _db) = make_test_state(token);
         let rate_limit = state.rate_limit.clone();
         Router::new()
-            .route("/api/v1/documents", post(crate::handlers::post_document).get(crate::handlers::list_documents))
-            .route("/api/v1/documents/:slug", get(crate::handlers::get_agent)
-                .put(crate::handlers::put_document)
-                .delete(crate::handlers::delete_document))
+            .route(
+                "/api/v1/documents",
+                post(crate::handlers::post_document).get(crate::handlers::list_documents),
+            )
+            .route(
+                "/api/v1/documents/:slug",
+                get(crate::handlers::get_agent)
+                    .put(crate::handlers::put_document)
+                    .delete(crate::handlers::delete_document),
+            )
             .route("/api/v1/audit", get(crate::handlers::list_audit))
             .layer(axum::Extension(rate_limit))
             .with_state(state)
@@ -3037,10 +3287,16 @@ mod tests {
         let (state, db) = make_test_state(token);
         let rate_limit = state.rate_limit.clone();
         let router = Router::new()
-            .route("/api/v1/documents", post(crate::handlers::post_document).get(crate::handlers::list_documents))
-            .route("/api/v1/documents/:slug", get(crate::handlers::get_agent)
-                .put(crate::handlers::put_document)
-                .delete(crate::handlers::delete_document))
+            .route(
+                "/api/v1/documents",
+                post(crate::handlers::post_document).get(crate::handlers::list_documents),
+            )
+            .route(
+                "/api/v1/documents/:slug",
+                get(crate::handlers::get_agent)
+                    .put(crate::handlers::put_document)
+                    .delete(crate::handlers::delete_document),
+            )
             .route("/api/v1/audit", get(crate::handlers::list_audit))
             .layer(axum::Extension(rate_limit))
             .with_state(state);
@@ -3091,7 +3347,11 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         // 201 confirms auth passed (token_name "admin" returned internally)
-        assert_eq!(resp.status(), StatusCode::CREATED, "master token should authenticate");
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "master token should authenticate"
+        );
     }
 
     /// check_auth returns token name for managed tokens.
@@ -3106,7 +3366,11 @@ mod tests {
             .body(Body::from("# Managed Token Test\nContent."))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::CREATED, "managed token should authenticate");
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "managed token should authenticate"
+        );
     }
 
     /// GET /api/v1/audit returns 200 with correct JSON shape.
@@ -3124,12 +3388,26 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(json.get("entries").is_some(), "response must have 'entries' field");
-        assert!(json.get("total").is_some(), "response must have 'total' field");
-        assert!(json.get("limit").is_some(), "response must have 'limit' field");
-        assert!(json.get("offset").is_some(), "response must have 'offset' field");
+        assert!(
+            json.get("entries").is_some(),
+            "response must have 'entries' field"
+        );
+        assert!(
+            json.get("total").is_some(),
+            "response must have 'total' field"
+        );
+        assert!(
+            json.get("limit").is_some(),
+            "response must have 'limit' field"
+        );
+        assert!(
+            json.get("offset").is_some(),
+            "response must have 'offset' field"
+        );
         assert_eq!(json["total"].as_u64().unwrap(), 0);
         assert!(json["entries"].as_array().unwrap().is_empty());
     }
@@ -3146,7 +3424,11 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "audit endpoint must require auth");
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "audit endpoint must require auth"
+        );
     }
 
     /// POST /api/v1/documents writes an audit entry.
@@ -3160,7 +3442,9 @@ mod tests {
             .uri("/api/v1/documents")
             .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "text/markdown")
-            .body(Body::from("---\nslug: audit-test-create\n---\n# Audit Test\nContent."))
+            .body(Body::from(
+                "---\nslug: audit-test-create\n---\n# Audit Test\nContent.",
+            ))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED, "publish failed");
@@ -3201,7 +3485,10 @@ mod tests {
 
         let (entries, total) = db.list_audit_entries(20, 0).expect("list ok");
         assert_eq!(total, 2, "should have 2 audit entries (create + delete)");
-        let delete_entry = entries.iter().find(|e| e.action == "delete").expect("delete entry");
+        let delete_entry = entries
+            .iter()
+            .find(|e| e.action == "delete")
+            .expect("delete entry");
         assert_eq!(delete_entry.slug, "to-delete");
         assert_eq!(delete_entry.token_name, "admin");
     }
@@ -3231,5 +3518,4 @@ mod tests {
         let ip = extract_client_ip(&headers, None);
         assert_eq!(ip, "unknown");
     }
-
 }

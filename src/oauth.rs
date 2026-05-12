@@ -24,8 +24,6 @@ use crate::handlers::{
 };
 use crate::rate_limit::{ReadRateLimit, RegistrationRateLimit};
 
-use chrono;
-
 // ── Well-known metadata handlers ─────────────────────────────────────────────
 
 /// GET /.well-known/oauth-protected-resource — RFC 8707 resource metadata.
@@ -96,7 +94,9 @@ pub async fn handle_register(
     _rl: RegistrationRateLimit,
     Json(req): Json<RegisterRequest>,
 ) -> Response {
-    let client_name = req.client_name.unwrap_or_else(|| "unnamed-client".to_string());
+    let client_name = req
+        .client_name
+        .unwrap_or_else(|| "unnamed-client".to_string());
     let redirect_uris = req.redirect_uris.unwrap_or_default();
     if redirect_uris.is_empty() {
         return (
@@ -148,7 +148,10 @@ pub async fn handle_register(
         // This prevents memory exhaustion from registration spam that slips past
         // the rate limiter (e.g., distributed sources).
         if clients.len() >= 1_000 {
-            tracing::warn!("OAuth client registration limit reached ({} entries)", clients.len());
+            tracing::warn!(
+                "OAuth client registration limit reached ({} entries)",
+                clients.len()
+            );
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({
@@ -291,7 +294,8 @@ pub async fn handle_authorize(
                     StatusCode::BAD_REQUEST,
                     Json(OAuthError {
                         error: "invalid_request",
-                        error_description: "redirect_uri must use HTTPS (localhost is permitted over HTTP)",
+                        error_description:
+                            "redirect_uri must use HTTPS (localhost is permitted over HTTP)",
                     }),
                 )
                     .into_response();
@@ -311,10 +315,7 @@ pub async fn handle_authorize(
         future.format("%Y-%m-%dT%H:%M:%SZ").to_string()
     };
     {
-        let mut codes = state
-            .auth_codes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut codes = state.auth_codes.lock().unwrap_or_else(|e| e.into_inner());
         // Sweep expired codes on insert to keep the map bounded.
         codes.retain(|_, v| v.expires_at.as_str() >= now.as_str());
         codes.insert(
@@ -455,10 +456,7 @@ async fn handle_authorization_code(state: AppState, req: TokenRequest) -> Respon
         _ => return invalid_request("code_verifier is required (PKCE mandatory)"),
     };
     let record = {
-        let mut codes = state
-            .auth_codes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut codes = state.auth_codes.lock().unwrap_or_else(|e| e.into_inner());
         match codes.remove(&code) {
             Some(r) => r,
             None => {
@@ -773,13 +771,21 @@ fn percent_encode(s: &str) -> String {
 /// Validate that a redirect_uri is safe for use with an unregistered client.
 /// Requires HTTPS unless the host is localhost or 127.0.0.1.
 fn is_safe_redirect_uri(uri: &str) -> bool {
-    if uri.starts_with("https://") {
+    let parsed = match url::Url::parse(uri) {
+        Ok(u) => u,
+        Err(_) => return false,
+    };
+    if parsed.scheme() == "https" {
         return true;
     }
-    if uri.starts_with("http://localhost") || uri.starts_with("http://127.0.0.1") {
-        return true;
+    if parsed.scheme() == "http" {
+        matches!(
+            parsed.host_str(),
+            Some("localhost") | Some("127.0.0.1") | Some("[::1]")
+        )
+    } else {
+        false
     }
-    false
 }
 
 fn url_decode(s: &str) -> String {
@@ -906,4 +912,35 @@ fn invalid_grant(description: &'static str) -> Response {
         }),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_safe_redirect_uri;
+
+    #[test]
+    fn safe_redirect_https() {
+        assert!(is_safe_redirect_uri("https://example.com/callback"));
+    }
+
+    #[test]
+    fn safe_redirect_localhost_with_port() {
+        assert!(is_safe_redirect_uri("http://localhost:8080/callback"));
+    }
+
+    #[test]
+    fn unsafe_redirect_userinfo_bypass() {
+        // http://localhost@evil.com — host is evil.com, not localhost
+        assert!(!is_safe_redirect_uri("http://localhost@evil.com"));
+    }
+
+    #[test]
+    fn unsafe_redirect_plain_http() {
+        assert!(!is_safe_redirect_uri("http://evil.com"));
+    }
+
+    #[test]
+    fn unsafe_redirect_not_a_url() {
+        assert!(!is_safe_redirect_uri("not-a-url"));
+    }
 }

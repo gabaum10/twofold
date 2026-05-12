@@ -12,15 +12,17 @@ mod webhook;
 
 use std::sync::Arc;
 
+use axum::http::HeaderValue;
 use axum::{
     extract::DefaultBodyLimit,
     routing::{get, post},
     Router,
 };
 use clap::Parser;
-use axum::http::HeaderValue;
 use tower::Layer;
-use tower_http::{normalize_path::NormalizePathLayer, set_header::SetResponseHeaderLayer, trace::TraceLayer};
+use tower_http::{
+    normalize_path::NormalizePathLayer, set_header::SetResponseHeaderLayer, trace::TraceLayer,
+};
 use tracing_subscriber::EnvFilter;
 
 use cli::{Cli, Commands, TokenAction};
@@ -70,8 +72,7 @@ async fn run_server() {
     // Initialize tracing subscriber. RUST_LOG controls filtering.
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::from_default_env()
-                .add_directive("twofold=info".parse().unwrap()),
+            EnvFilter::from_default_env().add_directive("twofold=info".parse().unwrap()),
         )
         .init();
 
@@ -105,7 +106,9 @@ async fn run_server() {
         config: Arc::new(config),
         auth_codes: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         oauth_clients: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        refresh_tokens: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        refresh_tokens: std::sync::Arc::new(
+            std::sync::Mutex::new(std::collections::HashMap::new()),
+        ),
         access_tokens: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         rate_limit: rate_limit.clone(),
     };
@@ -118,15 +121,16 @@ async fn run_server() {
     // 410 page a 30-day window before the tombstone is discarded.
     let reaper_db = db.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(
-            std::time::Duration::from_secs(reaper_interval),
-        );
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(reaper_interval));
         loop {
             interval.tick().await;
             let now = handlers::chrono_now();
             match reaper_db.delete_expired_older_than(&now, 30) {
                 Ok(count) if count > 0 => {
-                    tracing::info!(count, "Reaper garbage-collected tombstones older than 30 days");
+                    tracing::info!(
+                        count,
+                        "Reaper garbage-collected tombstones older than 30 days"
+                    );
                 }
                 Ok(_) => {} // nothing old enough to reap
                 Err(e) => {
@@ -152,8 +156,14 @@ async fn run_server() {
         // Health check — no auth, checked by load balancers and uptime monitors.
         .route("/health", get(handlers::health_check))
         // OAuth 2.0 well-known metadata — no auth required (RFC 8707, RFC 8414).
-        .route("/.well-known/oauth-protected-resource", get(oauth::handle_protected_resource_metadata))
-        .route("/.well-known/oauth-authorization-server", get(oauth::handle_authorization_server_metadata))
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(oauth::handle_protected_resource_metadata),
+        )
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(oauth::handle_authorization_server_metadata),
+        )
         // OAuth 2.0 dynamic client registration — public per RFC 7591.
         .route("/oauth/register", post(oauth::handle_register))
         // OAuth 2.0 Authorization Code flow — browser redirect, auto-approve.
@@ -162,12 +172,18 @@ async fn run_server() {
         .route("/oauth/token", post(oauth::handle_oauth_token))
         // Documents: POST (create) and GET (list) share the same path.
         // Axum 0.7: combine with method router chaining.
-        .route("/api/v1/documents", post(handlers::post_document).get(handlers::list_documents))
+        .route(
+            "/api/v1/documents",
+            post(handlers::post_document).get(handlers::list_documents),
+        )
         // Audit log endpoint — auth required.
         .route("/api/v1/audit", get(handlers::list_audit))
-        .route("/api/v1/documents/:slug", get(handlers::get_agent)
-            .put(handlers::put_document)
-            .delete(handlers::delete_document))
+        .route(
+            "/api/v1/documents/:slug",
+            get(handlers::get_agent)
+                .put(handlers::put_document)
+                .delete(handlers::delete_document),
+        )
         // OpenAPI spec endpoints — no auth required.
         .route("/api/v1/openapi.yaml", get(handlers::serve_openapi_yaml))
         .route("/api/v1/openapi.json", get(handlers::serve_openapi_json))
@@ -237,7 +253,14 @@ fn run_publish(args: cli::PublishArgs) {
     // Apply frontmatter from CLI flags if any flags were provided.
     // If content already has frontmatter (starts with ---), merge flags in.
     // If no frontmatter and no flags, send as-is.
-    let body = apply_publish_flags(content, args.title, args.slug, args.theme, args.expiry, args.password);
+    let body = apply_publish_flags(
+        content,
+        args.title,
+        args.slug,
+        args.theme,
+        args.expiry,
+        args.password,
+    );
 
     // POST to the server.
     let url = format!("{}/api/v1/documents", args.server.trim_end_matches('/'));
@@ -304,8 +327,11 @@ fn apply_publish_flags(
     expiry: Option<String>,
     password: Option<String>,
 ) -> String {
-    let has_flags = title.is_some() || slug.is_some() || theme.is_some()
-        || expiry.is_some() || password.is_some();
+    let has_flags = title.is_some()
+        || slug.is_some()
+        || theme.is_some()
+        || expiry.is_some()
+        || password.is_some();
     if !has_flags {
         return content;
     }
@@ -318,19 +344,34 @@ fn apply_publish_flags(
         // No frontmatter — prepend it.
         let mut fm = String::from("---\n");
         if let Some(t) = title {
-            fm.push_str(&format!("title: {}\n", crate::mcp::yaml_escape_value_pub(&t)));
+            fm.push_str(&format!(
+                "title: {}\n",
+                crate::mcp::yaml_escape_value_pub(&t)
+            ));
         }
         if let Some(s) = slug {
-            fm.push_str(&format!("slug: {}\n", crate::mcp::yaml_escape_value_pub(&s)));
+            fm.push_str(&format!(
+                "slug: {}\n",
+                crate::mcp::yaml_escape_value_pub(&s)
+            ));
         }
         if let Some(th) = theme {
-            fm.push_str(&format!("theme: {}\n", crate::mcp::yaml_escape_value_pub(&th)));
+            fm.push_str(&format!(
+                "theme: {}\n",
+                crate::mcp::yaml_escape_value_pub(&th)
+            ));
         }
         if let Some(ex) = expiry {
-            fm.push_str(&format!("expiry: {}\n", crate::mcp::yaml_escape_value_pub(&ex)));
+            fm.push_str(&format!(
+                "expiry: {}\n",
+                crate::mcp::yaml_escape_value_pub(&ex)
+            ));
         }
         if let Some(pw) = password {
-            fm.push_str(&format!("password: {}\n", crate::mcp::yaml_escape_value_pub(&pw)));
+            fm.push_str(&format!(
+                "password: {}\n",
+                crate::mcp::yaml_escape_value_pub(&pw)
+            ));
         }
         fm.push_str("---\n");
         fm.push_str(&content);
@@ -370,19 +411,34 @@ fn merge_frontmatter_flags(
             // Fallback: just prepend the flags as a new block.
             let mut fm = String::from("---\n");
             if let Some(t) = title {
-                fm.push_str(&format!("title: {}\n", crate::mcp::yaml_escape_value_pub(&t)));
+                fm.push_str(&format!(
+                    "title: {}\n",
+                    crate::mcp::yaml_escape_value_pub(&t)
+                ));
             }
             if let Some(s) = slug {
-                fm.push_str(&format!("slug: {}\n", crate::mcp::yaml_escape_value_pub(&s)));
+                fm.push_str(&format!(
+                    "slug: {}\n",
+                    crate::mcp::yaml_escape_value_pub(&s)
+                ));
             }
             if let Some(th) = theme {
-                fm.push_str(&format!("theme: {}\n", crate::mcp::yaml_escape_value_pub(&th)));
+                fm.push_str(&format!(
+                    "theme: {}\n",
+                    crate::mcp::yaml_escape_value_pub(&th)
+                ));
             }
             if let Some(ex) = expiry {
-                fm.push_str(&format!("expiry: {}\n", crate::mcp::yaml_escape_value_pub(&ex)));
+                fm.push_str(&format!(
+                    "expiry: {}\n",
+                    crate::mcp::yaml_escape_value_pub(&ex)
+                ));
             }
             if let Some(pw) = password {
-                fm.push_str(&format!("password: {}\n", crate::mcp::yaml_escape_value_pub(&pw)));
+                fm.push_str(&format!(
+                    "password: {}\n",
+                    crate::mcp::yaml_escape_value_pub(&pw)
+                ));
             }
             fm.push_str("---\n");
             fm.push_str(&content);
@@ -507,15 +563,20 @@ fn run_list(args: cli::ListArgs) {
     };
 
     // Print table with fixed-width columns.
-    println!("{:<24} {:<32} {:<21} {}",
-        "SLUG", "TITLE", "CREATED", "EXPIRES");
+    println!("{:<24} {:<32} {:<21} EXPIRES", "SLUG", "TITLE", "CREATED");
     println!("{}", "-".repeat(90));
 
     for doc in docs {
         let slug = doc.get("slug").and_then(|v| v.as_str()).unwrap_or("-");
         let title = doc.get("title").and_then(|v| v.as_str()).unwrap_or("-");
-        let created = doc.get("created_at").and_then(|v| v.as_str()).unwrap_or("-");
-        let expires = doc.get("expires_at").and_then(|v| v.as_str()).unwrap_or("never");
+        let created = doc
+            .get("created_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-");
+        let expires = doc
+            .get("expires_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("never");
 
         // Truncate for display
         let slug_d = truncate(slug, 23);
@@ -527,7 +588,10 @@ fn run_list(args: cli::ListArgs) {
             expires[..std::cmp::min(16, expires.len())].to_string()
         };
 
-        println!("{:<24} {:<32} {:<21} {}", slug_d, title_d, created_d, expires_d);
+        println!(
+            "{:<24} {:<32} {:<21} {}",
+            slug_d, title_d, created_d, expires_d
+        );
     }
 }
 
@@ -635,18 +699,23 @@ fn run_audit(args: cli::AuditArgs) {
     };
 
     // Column widths: TIMESTAMP 21, ACTION 9, SLUG 25, TOKEN remainder.
-    println!("{:<21} {:<9} {:<25} {}",
-        "TIMESTAMP", "ACTION", "SLUG", "TOKEN");
+    println!("{:<21} {:<9} {:<25} TOKEN", "TIMESTAMP", "ACTION", "SLUG");
     println!("{}", "-".repeat(75));
 
     for entry in entries {
-        let timestamp  = entry.get("timestamp").and_then(|v| v.as_str()).unwrap_or("-");
-        let action     = entry.get("action").and_then(|v| v.as_str()).unwrap_or("-");
-        let slug       = entry.get("slug").and_then(|v| v.as_str()).unwrap_or("-");
-        let token_name = entry.get("token_name").and_then(|v| v.as_str()).unwrap_or("-");
+        let timestamp = entry
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-");
+        let action = entry.get("action").and_then(|v| v.as_str()).unwrap_or("-");
+        let slug = entry.get("slug").and_then(|v| v.as_str()).unwrap_or("-");
+        let token_name = entry
+            .get("token_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-");
 
         // Truncate timestamp to 20 chars (drop sub-second noise if present)
-        let ts_d   = &timestamp[..std::cmp::min(20, timestamp.len())];
+        let ts_d = &timestamp[..std::cmp::min(20, timestamp.len())];
         let slug_d = truncate(slug, 24);
 
         println!("{:<21} {:<9} {:<25} {}", ts_d, action, slug_d, token_name);
@@ -725,8 +794,8 @@ fn token_create(name: &str, db_path: &str) {
     // Generate a 32-byte random token, base64url-encode it.
     // Retry up to 3 times on prefix collision (prefix uniqueness is enforced
     // by a UNIQUE index; collisions are astronomically unlikely but possible).
-    use rand::RngCore;
     use base64::Engine;
+    use rand::RngCore;
 
     let now = handlers::chrono_now();
 
@@ -767,9 +836,15 @@ fn token_create(name: &str, db_path: &str) {
 
             match db.insert_token(&record) {
                 Ok(()) => break 'generate plain,
-                Err(e) if e.to_string().contains("UNIQUE constraint failed: tokens.prefix") => {
+                Err(e)
+                    if e.to_string()
+                        .contains("UNIQUE constraint failed: tokens.prefix") =>
+                {
                     if attempt < 2 {
-                        eprintln!("Warning: prefix collision on attempt {}; regenerating.", attempt + 1);
+                        eprintln!(
+                            "Warning: prefix collision on attempt {}; regenerating.",
+                            attempt + 1
+                        );
                         continue;
                     }
                     eprintln!("Failed to store token after 3 attempts (prefix collision): {e}");
@@ -808,8 +883,10 @@ fn token_list(db_path: &str) {
     };
 
     // Print table header
-    println!("{:<20} {:<22} {:<22} {}",
-        "NAME", "CREATED", "LAST USED", "STATUS");
+    println!(
+        "{:<20} {:<22} {:<22} STATUS",
+        "NAME", "CREATED", "LAST USED"
+    );
 
     for token in tokens {
         let status = if token.revoked { "revoked" } else { "active" };
