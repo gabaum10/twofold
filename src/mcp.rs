@@ -201,7 +201,13 @@ fn handle_initialize(id: Value) -> Response {
         "protocolVersion": "2024-11-05",
         "serverInfo": {
             "name": "twofold",
-            "version": env!("CARGO_PKG_VERSION")
+            "version": env!("CARGO_PKG_VERSION"),
+            "icons": [
+                {
+                    "url": "https://share.hearth.observer/icon.png",
+                    "mime_type": "image/jpeg"
+                }
+            ]
         },
         "capabilities": {
             "tools": {}

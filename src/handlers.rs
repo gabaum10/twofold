@@ -650,6 +650,24 @@ pub async fn serve_openapi_json(_rl: ReadRateLimit) -> impl IntoResponse {
     )
 }
 
+// ── GET /icon.png and GET /favicon.ico ──────────────────────────────────────
+
+/// Serve the Twofold icon. Embedded at compile time; no runtime file I/O.
+/// The file is a JPEG served under the /icon.png path for URL stability.
+pub async fn serve_icon() -> impl IntoResponse {
+    let bytes = include_bytes!("../assets/icon.jpg");
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "image/jpeg")],
+        bytes.as_ref(),
+    )
+}
+
+/// Serve favicon — redirect to /icon.png.
+pub async fn serve_favicon() -> impl IntoResponse {
+    Redirect::permanent("/icon.png")
+}
+
 // ── GET /:slug (human view) ──────────────────────────────────────────────────
 
 /// Handle human view and raw-shortcut view.

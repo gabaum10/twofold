@@ -166,6 +166,9 @@ async fn run_server() {
         // OpenAPI spec endpoints — no auth required.
         .route("/api/v1/openapi.yaml", get(handlers::serve_openapi_yaml))
         .route("/api/v1/openapi.json", get(handlers::serve_openapi_json))
+        // Icon and favicon — embedded at compile time, no auth.
+        .route("/icon.png", get(handlers::serve_icon))
+        .route("/favicon.ico", get(handlers::serve_favicon))
         .route("/:slug/unlock", post(handlers::post_unlock))
         .route("/:slug/full", get(handlers::get_full))
         .route("/:slug", get(handlers::get_human))
