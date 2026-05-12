@@ -3,3 +3,9 @@
 *.swo
 .env
 *.db
+
+# Scrapyard artifacts
+.claude/agents/
+.scrapyard-manifest
+result
+.scrapyard-worktrees/
