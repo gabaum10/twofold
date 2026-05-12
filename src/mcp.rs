@@ -74,6 +74,17 @@ fn tool_result_err(message: String) -> Value {
     })
 }
 
+/// Returns true if the string contains a marker directive on its own line.
+/// Matches `<!-- @agent -->` or `<!-- @end -->` appearing as a complete line
+/// (possibly with surrounding whitespace), to prevent breaking out of the
+/// agent layer containment.
+fn contains_marker_directive(s: &str) -> bool {
+    s.lines().any(|line| {
+        let t = line.trim();
+        t == "<!-- @agent -->" || t == "<!-- @end -->"
+    })
+}
+
 // ── HTTP client ───────────────────────────────────────────────────────────────
 
 /// Build the reqwest client with conservative timeouts.
@@ -421,6 +432,11 @@ fn tool_publish(
     // Append agent-only block if provided. Invisible in the browser view;
     // accessible via the raw API endpoint.
     if let Some(ac) = agent_content {
+        if contains_marker_directive(ac) {
+            return tool_result_err(
+                "agent_content must not contain marker directives (<!-- @agent --> or <!-- @end -->)".to_string()
+            );
+        }
         body.push_str("\n\n<!-- @agent -->\n\n");
         body.push_str(ac);
         body.push_str("\n\n<!-- @end -->\n");
@@ -631,6 +647,11 @@ fn tool_update(
     // Append agent-only block if provided. Invisible in the browser view;
     // accessible via the raw API endpoint.
     if let Some(ac) = agent_content {
+        if contains_marker_directive(ac) {
+            return tool_result_err(
+                "agent_content must not contain marker directives (<!-- @agent --> or <!-- @end -->)".to_string()
+            );
+        }
         body.push_str("\n\n<!-- @agent -->\n\n");
         body.push_str(ac);
         body.push_str("\n\n<!-- @end -->\n");
