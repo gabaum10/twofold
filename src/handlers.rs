@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use axum::{
     body::Bytes,
     extract::{ConnectInfo, Path, Query, State},
@@ -10,12 +8,13 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
-use crate::{
-    config::ServeConfig,
-    db::Db,
-    helpers::extract_client_ip,
-    rate_limit::{RateLimitStore, ReadRateLimit, WriteRateLimit},
-};
+use crate::helpers::extract_client_ip;
+use crate::rate_limit::{ReadRateLimit, WriteRateLimit};
+
+// Re-export AppError and AppState so all existing `crate::handlers::{AppError, AppState}`
+// imports continue to resolve without modification.
+pub use crate::error::AppError;
+pub use crate::state::AppState;
 
 // Re-export for callers that still reference this via crate::handlers.
 pub use crate::views::strip_password_from_content_pub;
@@ -28,64 +27,6 @@ pub const SLUG_ALPHABET: [char; 63] = [
     'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U',
     'V', 'W', 'X', 'Y', 'Z', '-',
 ];
-
-// ── Application Error ────────────────────────────────────────────────────────
-
-/// Unified error type with IntoResponse impl.
-/// Replaces inline error tuples throughout handlers.
-#[derive(Debug)]
-pub enum AppError {
-    Unauthorized,
-    Forbidden,
-    BadRequest(String),
-    NotFound,
-    Conflict(String),
-    Gone,
-    Internal(String),
-    /// Document is password-protected and no password was supplied.
-    DocumentPasswordRequired,
-    /// Document is password-protected and the supplied password was wrong.
-    DocumentPasswordInvalid,
-}
-
-impl IntoResponse for AppError {
-    fn into_response(self) -> Response {
-        let (status, msg) = match self {
-            AppError::Unauthorized => (StatusCode::UNAUTHORIZED, "Unauthorized".to_string()),
-            AppError::Forbidden => (StatusCode::FORBIDDEN, "Forbidden".to_string()),
-            AppError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
-            AppError::NotFound => (StatusCode::NOT_FOUND, "Not found".to_string()),
-            AppError::Conflict(m) => (StatusCode::CONFLICT, m),
-            AppError::Gone => (StatusCode::GONE, "Document has expired".to_string()),
-            AppError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
-            AppError::DocumentPasswordRequired => {
-                (StatusCode::UNAUTHORIZED, "Password required".to_string())
-            }
-            AppError::DocumentPasswordInvalid => {
-                (StatusCode::UNAUTHORIZED, "Invalid password".to_string())
-            }
-        };
-        (status, Json(serde_json::json!({ "error": msg }))).into_response()
-    }
-}
-
-impl From<rusqlite::Error> for AppError {
-    fn from(e: rusqlite::Error) -> Self {
-        tracing::error!(error = %e, "Database error");
-        AppError::Internal("Database error".to_string())
-    }
-}
-
-// ── State ────────────────────────────────────────────────────────────────────
-
-/// Shared application state injected into all handlers via axum State extractor.
-#[derive(Clone)]
-#[allow(dead_code)] // rate_limit accessed via axum Extension layer, not directly on AppState
-pub struct AppState {
-    pub db: Db,
-    pub config: Arc<ServeConfig>,
-    pub rate_limit: Arc<RateLimitStore>,
-}
 
 // ── Response Types ───────────────────────────────────────────────────────────
 

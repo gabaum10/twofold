@@ -50,6 +50,11 @@ pub struct Principal {
 impl Principal {
     /// Returns `true` if this principal holds the given scope OR has full access
     /// (i.e. `scopes` is empty, meaning no restriction was recorded).
+    ///
+    /// Note: this method uses the "empty = full access" convention suitable for
+    /// Admin and Managed tokens. OAuth scope enforcement in `can_write` does NOT
+    /// use this method — OAuth tokens with empty scope are denied, not granted, access.
+    #[allow(dead_code)]
     pub fn has_scope(&self, scope: &str) -> bool {
         self.scopes.is_empty() || self.scopes.iter().any(|s| s == scope)
     }
@@ -61,10 +66,17 @@ impl Principal {
 
     /// Returns `true` if this principal may perform write operations.
     ///
-    /// Admin tokens always may.  OAuth tokens must carry the `"mcp:tools"` scope.
-    /// Managed tokens (empty scopes) have full access by convention.
+    /// - Admin tokens: always allowed.
+    /// - Managed tokens (empty scopes): full access by convention.
+    /// - OAuth tokens: MUST explicitly carry the `"mcp:tools"` scope.
+    ///   An OAuth token with an empty or absent scope is NOT granted write access —
+    ///   empty scopes for OAuth means "no scopes granted", not "full access".
     pub fn can_write(&self) -> bool {
-        self.is_admin() || self.has_scope("mcp:tools")
+        match self.kind {
+            PrincipalKind::Admin => true,
+            PrincipalKind::Managed { .. } => true,
+            PrincipalKind::OAuth { .. } => self.scopes.iter().any(|s| s == "mcp:tools"),
+        }
     }
 }
 

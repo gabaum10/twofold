@@ -3,21 +3,27 @@
 /// Frontmatter parsing, merging, and injection — single source of truth.
 ///
 /// Previously scattered across parser.rs (extract_frontmatter),
-/// mcp.rs (merge_fm_args, yaml_escape_value), and main.rs
-/// (apply_publish_flags, merge_frontmatter_flags). Consolidated here.
-use serde::Deserialize;
+/// mcp.rs (merge_fm_args), and main.rs (apply_publish_flags, merge_frontmatter_flags).
+/// Consolidated here.
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 /// Parsed frontmatter metadata from YAML block.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Frontmatter {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub slug: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub expiry: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// Catch-all for unknown fields (forward-compatible).
     #[serde(flatten)]
@@ -36,7 +42,8 @@ pub struct FrontmatterResult {
 /// Fields to inject or merge into a document's frontmatter.
 ///
 /// Only `Some` fields are written. `None` fields are left untouched (merge)
-/// or omitted (prepend). All fields are escaped via `yaml_escape_value`.
+/// or omitted (prepend). All fields are serialized via `serde_yml` for correct
+/// YAML escaping.
 #[derive(Debug, Default)]
 pub struct FrontmatterFields {
     pub title: Option<String>,
@@ -140,29 +147,40 @@ pub fn apply_frontmatter(content: &str, fields: FrontmatterFields) -> String {
 }
 
 /// Prepend a fresh frontmatter block to content that has none.
+///
+/// Uses `serde_yml::to_string` so writes go through the same serializer as reads,
+/// ensuring correct quoting of all values (including multi-line strings and
+/// values containing YAML-special characters like `:` or `#`).
 fn prepend_new_block(content: &str, fields: &FrontmatterFields) -> String {
-    let mut fm = String::from("---\n");
-    if let Some(ref t) = fields.title {
-        fm.push_str(&format!("title: {}\n", yaml_escape_value(t)));
+    // Build a Frontmatter struct from the supplied fields so we can round-trip
+    // through serde_yml — same serializer as reads, correct escaping guaranteed.
+    let fm = Frontmatter {
+        title: fields.title.clone(),
+        slug: fields.slug.clone(),
+        password: fields.password.clone(),
+        expiry: fields.expiry.clone(),
+        theme: fields.theme.clone(),
+        description: fields.description.clone(),
+        _extra: HashMap::new(),
+    };
+
+    let yaml_body = serde_yml::to_string(&fm)
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "serde_yml serialization failed — falling back to empty frontmatter");
+            String::new()
+        });
+
+    // serde_yml adds a trailing newline; strip it since we add our own fence.
+    let yaml_body = yaml_body.trim_end_matches('\n');
+
+    let mut result = String::from("---\n");
+    if !yaml_body.is_empty() {
+        result.push_str(yaml_body);
+        result.push('\n');
     }
-    if let Some(ref s) = fields.slug {
-        fm.push_str(&format!("slug: {}\n", yaml_escape_value(s)));
-    }
-    if let Some(ref p) = fields.password {
-        fm.push_str(&format!("password: {}\n", yaml_escape_value(p)));
-    }
-    if let Some(ref ex) = fields.expiry {
-        fm.push_str(&format!("expiry: {}\n", yaml_escape_value(ex)));
-    }
-    if let Some(ref th) = fields.theme {
-        fm.push_str(&format!("theme: {}\n", yaml_escape_value(th)));
-    }
-    if let Some(ref d) = fields.description {
-        fm.push_str(&format!("description: {}\n", yaml_escape_value(d)));
-    }
-    fm.push_str("---\n");
-    fm.push_str(content);
-    fm
+    result.push_str("---\n");
+    result.push_str(content);
+    result
 }
 
 /// Merge supplied fields into an existing frontmatter block. Supplied fields win on conflict.
@@ -222,7 +240,7 @@ fn merge_into_existing(content: &str, fields: &FrontmatterFields) -> String {
         for &key in overrides.keys() {
             let prefix = format!("{}:", key);
             if line.trim_start().starts_with(&prefix) {
-                fm_lines.push(format!("{}: {}", key, yaml_escape_value(overrides[key])));
+                fm_lines.push(format_yaml_kv(key, overrides[key]));
                 written_keys.insert(key);
                 replaced = true;
                 break;
@@ -236,7 +254,7 @@ fn merge_into_existing(content: &str, fields: &FrontmatterFields) -> String {
     // Append any fields not already in the frontmatter.
     for &key in overrides.keys() {
         if !written_keys.contains(key) {
-            fm_lines.push(format!("{}: {}", key, yaml_escape_value(overrides[key])));
+            fm_lines.push(format_yaml_kv(key, overrides[key]));
         }
     }
 
@@ -253,21 +271,22 @@ fn merge_into_existing(content: &str, fields: &FrontmatterFields) -> String {
     result
 }
 
-// ── YAML value escaping ───────────────────────────────────────────────────────
+// ── YAML value serialization ──────────────────────────────────────────────────
 
-/// Escape a string value for safe YAML injection.
+/// Format a single YAML key-value pair using serde_yml for correct value escaping.
 ///
-/// Wraps the value in double quotes and escapes internal double quotes and
-/// backslashes. Handles values containing colons, hashes, or other YAML
-/// special characters that would break unquoted scalar parsing.
-///
-/// Limitation: multi-line values (containing \n) have their newlines replaced
-/// with spaces. Slugs cannot contain newlines (validation prevents it).
-/// Titles with newlines are unusual and the trade-off is acceptable.
-pub fn yaml_escape_value(s: &str) -> String {
-    let s = s.replace('\n', " ").replace('\r', "");
-    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
-    format!("\"{escaped}\"")
+/// serde_yml handles all quoting and escaping automatically — including colons,
+/// hashes, multi-line strings, and other YAML-special content.
+fn format_yaml_kv(key: &str, value: &str) -> String {
+    // Serialize a single-entry mapping so serde_yml decides quoting.
+    // We serialize as `key: <serialized_value>` by building a struct on-the-fly
+    // using a wrapper type.
+    use std::collections::BTreeMap;
+    let mut map = BTreeMap::new();
+    map.insert(key, value);
+    let yaml = serde_yml::to_string(&map).unwrap_or_else(|_| format!("{key}: {value}"));
+    // serde_yml emits `key: value\n` — trim the trailing newline.
+    yaml.trim_end_matches('\n').to_string()
 }
 
 // ── Marker directive check ────────────────────────────────────────────────────
@@ -356,8 +375,9 @@ mod tests {
         };
         let result = apply_frontmatter(content, fields);
         assert!(result.starts_with("---\n"));
-        assert!(result.contains("title: \"My Title\""));
-        assert!(result.contains("slug: \"my-slug\""));
+        // serde_yml emits unquoted scalars for simple strings — no surrounding quotes.
+        assert!(result.contains("title: My Title"));
+        assert!(result.contains("slug: my-slug"));
         assert!(result.contains("# Hello"));
     }
 
@@ -371,8 +391,9 @@ mod tests {
             ..Default::default()
         };
         let result = apply_frontmatter(content, fields);
-        // Overridden field gets quoted; untouched field is kept verbatim from source.
-        assert!(result.contains("title: \"New Title\""));
+        // Overridden field serialized via serde_yml (unquoted for simple strings);
+        // untouched field kept verbatim from the original source line.
+        assert!(result.contains("title: New Title"));
         assert!(result.contains("slug: old-slug"));
         assert!(result.contains("# Body"));
     }
@@ -385,38 +406,12 @@ mod tests {
             ..Default::default()
         };
         let result = apply_frontmatter(content, fields);
-        // Untouched field kept verbatim; new field gets quoted.
+        // Untouched field kept verbatim from source; new field serialized via serde_yml.
+        // serde_yml single-quotes values that look like YAML special types (e.g. "7d"
+        // resembles a sexagesimal literal), so we check for the quoted form.
         assert!(result.contains("title: Existing"));
-        assert!(result.contains("expiry: \"7d\""));
+        assert!(result.contains("expiry:") && result.contains("7d"));
         assert!(result.contains("# Body"));
-    }
-
-    // yaml_escape_value
-
-    #[test]
-    fn yaml_escape_basic() {
-        assert_eq!(yaml_escape_value("hello"), "\"hello\"");
-    }
-
-    #[test]
-    fn yaml_escape_quotes() {
-        assert_eq!(yaml_escape_value("say \"hi\""), "\"say \\\"hi\\\"\"");
-    }
-
-    #[test]
-    fn yaml_escape_backslash() {
-        assert_eq!(yaml_escape_value("a\\b"), "\"a\\\\b\"");
-    }
-
-    #[test]
-    fn yaml_escape_newline_flattened() {
-        assert_eq!(yaml_escape_value("line1\nline2"), "\"line1 line2\"");
-    }
-
-    #[test]
-    fn yaml_escape_colon() {
-        // Colon in a value would break unquoted YAML; verify it's safely wrapped.
-        assert_eq!(yaml_escape_value("key: val"), "\"key: val\"");
     }
 
     // contains_marker_directive

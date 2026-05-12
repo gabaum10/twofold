@@ -242,4 +242,99 @@ mod tests {
             "error message should mention TWOFOLD_WEBHOOK_URL, got: {msg}"
         );
     }
+
+    // ── P3-19: per-env-var round-trip tests ──────────────────────────────────
+    //
+    // One test per documented env var. Purpose: if docs change without a code change
+    // (e.g., rename TWOFOLD_RATE_LIMIT_READ → TWOFOLD_READ_RATE_LIMIT), CI fails here.
+
+    /// TWOFOLD_RATE_LIMIT_READ is parsed and stored in rate_limit_read.
+    #[test]
+    fn from_env_rate_limit_read() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_twofold_env();
+        std::env::set_var("TWOFOLD_TOKEN", "tok");
+        std::env::set_var("TWOFOLD_RATE_LIMIT_READ", "42");
+
+        let cfg = ServeConfig::from_env().expect("should parse");
+        assert_eq!(
+            cfg.rate_limit_read, 42,
+            "TWOFOLD_RATE_LIMIT_READ should be 42"
+        );
+    }
+
+    /// TWOFOLD_RATE_LIMIT_WRITE is parsed and stored in rate_limit_write.
+    #[test]
+    fn from_env_rate_limit_write() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_twofold_env();
+        std::env::set_var("TWOFOLD_TOKEN", "tok");
+        std::env::set_var("TWOFOLD_RATE_LIMIT_WRITE", "15");
+
+        let cfg = ServeConfig::from_env().expect("should parse");
+        assert_eq!(
+            cfg.rate_limit_write, 15,
+            "TWOFOLD_RATE_LIMIT_WRITE should be 15"
+        );
+    }
+
+    /// TWOFOLD_RATE_LIMIT_WINDOW is parsed and stored in rate_limit_window.
+    #[test]
+    fn from_env_rate_limit_window() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_twofold_env();
+        std::env::set_var("TWOFOLD_TOKEN", "tok");
+        std::env::set_var("TWOFOLD_RATE_LIMIT_WINDOW", "120");
+
+        let cfg = ServeConfig::from_env().expect("should parse");
+        assert_eq!(
+            cfg.rate_limit_window, 120,
+            "TWOFOLD_RATE_LIMIT_WINDOW should be 120"
+        );
+    }
+
+    /// TWOFOLD_REGISTRATION_LIMIT is parsed and stored in registration_limit.
+    #[test]
+    fn from_env_registration_limit() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_twofold_env();
+        std::env::set_var("TWOFOLD_TOKEN", "tok");
+        std::env::set_var("TWOFOLD_REGISTRATION_LIMIT", "10");
+
+        let cfg = ServeConfig::from_env().expect("should parse");
+        assert_eq!(
+            cfg.registration_limit, 10,
+            "TWOFOLD_REGISTRATION_LIMIT should be 10"
+        );
+    }
+
+    /// TWOFOLD_MAX_SIZE is parsed and stored in max_size.
+    #[test]
+    fn from_env_max_size() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_twofold_env();
+        std::env::set_var("TWOFOLD_TOKEN", "tok");
+        std::env::set_var("TWOFOLD_MAX_SIZE", "2097152");
+
+        let cfg = ServeConfig::from_env().expect("should parse");
+        assert_eq!(
+            cfg.max_size, 2_097_152,
+            "TWOFOLD_MAX_SIZE should be 2097152"
+        );
+    }
+
+    /// TWOFOLD_REAPER_INTERVAL is parsed and stored in reaper_interval.
+    #[test]
+    fn from_env_reaper_interval() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_twofold_env();
+        std::env::set_var("TWOFOLD_TOKEN", "tok");
+        std::env::set_var("TWOFOLD_REAPER_INTERVAL", "300");
+
+        let cfg = ServeConfig::from_env().expect("should parse");
+        assert_eq!(
+            cfg.reaper_interval, 300,
+            "TWOFOLD_REAPER_INTERVAL should be 300"
+        );
+    }
 }

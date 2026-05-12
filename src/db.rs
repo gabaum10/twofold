@@ -56,10 +56,16 @@ pub struct Db {
 
 /// Convert an r2d2 pool error into a rusqlite error so callers keep the same
 /// `rusqlite::Result<T>` return type without an API surface change.
+///
+/// Uses `SqliteFailure` with `SQLITE_CANTOPEN` (error code 14) — the most
+/// accurate SQLite error class for "could not acquire a connection".
+/// Previously used `InvalidPath`, which misled debuggers into thinking a file
+/// path was wrong rather than the pool being exhausted or timed out.
 fn pool_err(e: r2d2::Error) -> rusqlite::Error {
-    rusqlite::Error::InvalidPath(std::path::PathBuf::from(format!(
-        "connection pool error: {e}"
-    )))
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+        Some(format!("connection pool error: {e}")),
+    )
 }
 
 impl Db {
@@ -1022,6 +1028,233 @@ mod tests {
         let (page3, _) = db.list_documents(2, 4).expect("list page 3");
         assert_eq!(page3.len(), 1);
         assert_eq!(page3[0].slug, "slug-01");
+    }
+
+    // ── P3-20: reaper tests ───────────────────────────────────────────────────
+    //
+    // For each reaper: insert one expired row + one future row → call reaper
+    // → assert expired row is gone, future row remains.
+
+    /// delete_expired_auth_codes removes past rows and keeps future rows.
+    #[test]
+    fn reaper_auth_codes() {
+        let db = open_test_db();
+        let now = "2025-06-01T00:00:00Z";
+
+        db.insert_auth_code(&AuthCodeRow {
+            code: "expired-code".to_string(),
+            client_id: "c1".to_string(),
+            redirect_uri: "https://example.com/cb".to_string(),
+            expires_at: "2020-01-01T00:00:00Z".to_string(), // past
+            code_challenge: "challenge".to_string(),
+            resource: None,
+            scope: None,
+        })
+        .expect("insert expired auth code");
+        db.insert_auth_code(&AuthCodeRow {
+            code: "future-code".to_string(),
+            client_id: "c1".to_string(),
+            redirect_uri: "https://example.com/cb".to_string(),
+            expires_at: "2099-01-01T00:00:00Z".to_string(), // future
+            code_challenge: "challenge".to_string(),
+            resource: None,
+            scope: None,
+        })
+        .expect("insert future auth code");
+
+        let deleted = db
+            .delete_expired_auth_codes(now)
+            .expect("reaper should succeed");
+        assert_eq!(deleted, 1, "reaper should delete exactly 1 expired code");
+
+        // Verify expired code is gone — take_auth_code returns None if absent.
+        let taken_expired = db
+            .take_auth_code("expired-code")
+            .expect("take should not error");
+        assert!(
+            taken_expired.is_none(),
+            "expired code must be gone after reaper"
+        );
+
+        // Verify future code is still present.
+        let taken_future = db
+            .take_auth_code("future-code")
+            .expect("take should not error");
+        assert!(taken_future.is_some(), "future code must survive reaper");
+    }
+
+    /// delete_expired_access_tokens removes past rows and keeps future rows.
+    #[test]
+    fn reaper_access_tokens() {
+        let db = open_test_db();
+        let now = "2025-06-01T00:00:00Z";
+
+        db.insert_access_token(&AccessTokenRow {
+            token: "expired-at".to_string(),
+            client_id: "c1".to_string(),
+            scope: None,
+            expires_at: "2020-01-01T00:00:00Z".to_string(),
+        })
+        .expect("insert expired access token");
+        db.insert_access_token(&AccessTokenRow {
+            token: "future-at".to_string(),
+            client_id: "c1".to_string(),
+            scope: None,
+            expires_at: "2099-01-01T00:00:00Z".to_string(),
+        })
+        .expect("insert future access token");
+
+        let deleted = db
+            .delete_expired_access_tokens(now)
+            .expect("reaper should succeed");
+        assert_eq!(
+            deleted, 1,
+            "reaper should delete exactly 1 expired access token"
+        );
+
+        let expired = db.get_access_token("expired-at").expect("lookup ok");
+        assert!(
+            expired.is_none(),
+            "expired access token must be gone after reaper"
+        );
+
+        let future = db.get_access_token("future-at").expect("lookup ok");
+        assert!(future.is_some(), "future access token must survive reaper");
+    }
+
+    /// delete_expired_refresh_tokens removes past rows and keeps future rows.
+    #[test]
+    fn reaper_refresh_tokens() {
+        let db = open_test_db();
+        let now = "2025-06-01T00:00:00Z";
+
+        db.insert_refresh_token(&RefreshTokenRow {
+            token: "expired-rt".to_string(),
+            client_id: "c1".to_string(),
+            access_token: "at1".to_string(),
+            scope: None,
+            expires_at: "2020-01-01T00:00:00Z".to_string(),
+        })
+        .expect("insert expired refresh token");
+        db.insert_refresh_token(&RefreshTokenRow {
+            token: "future-rt".to_string(),
+            client_id: "c1".to_string(),
+            access_token: "at2".to_string(),
+            scope: None,
+            expires_at: "2099-01-01T00:00:00Z".to_string(),
+        })
+        .expect("insert future refresh token");
+
+        let deleted = db
+            .delete_expired_refresh_tokens(now)
+            .expect("reaper should succeed");
+        assert_eq!(
+            deleted, 1,
+            "reaper should delete exactly 1 expired refresh token"
+        );
+
+        // take_refresh_token returns None if the row is gone.
+        let expired = db.take_refresh_token("expired-rt").expect("take ok");
+        assert!(
+            expired.is_none(),
+            "expired refresh token must be gone after reaper"
+        );
+
+        let future = db.take_refresh_token("future-rt").expect("take ok");
+        assert!(future.is_some(), "future refresh token must survive reaper");
+    }
+
+    /// delete_expired_oauth_clients removes clients registered before cutoff,
+    /// keeps those registered after.
+    #[test]
+    fn reaper_oauth_clients() {
+        let db = open_test_db();
+        let cutoff = "2025-06-01T00:00:00Z";
+
+        db.insert_oauth_client(&OAuthClientRow {
+            client_id: "old-client".to_string(),
+            client_name: "old".to_string(),
+            redirect_uris: "[]".to_string(),
+            grant_types: "[]".to_string(),
+            response_types: "[]".to_string(),
+            token_endpoint_auth_method: "none".to_string(),
+            created_at: "2020-01-01T00:00:00Z".to_string(), // before cutoff
+        })
+        .expect("insert old client");
+        db.insert_oauth_client(&OAuthClientRow {
+            client_id: "new-client".to_string(),
+            client_name: "new".to_string(),
+            redirect_uris: "[]".to_string(),
+            grant_types: "[]".to_string(),
+            response_types: "[]".to_string(),
+            token_endpoint_auth_method: "none".to_string(),
+            created_at: "2099-01-01T00:00:00Z".to_string(), // after cutoff
+        })
+        .expect("insert new client");
+
+        let deleted = db
+            .delete_expired_oauth_clients(cutoff)
+            .expect("reaper should succeed");
+        assert_eq!(deleted, 1, "reaper should delete exactly 1 expired client");
+
+        let old = db.get_oauth_client("old-client").expect("lookup ok");
+        assert!(old.is_none(), "old client must be gone after reaper");
+
+        let new = db.get_oauth_client("new-client").expect("lookup ok");
+        assert!(new.is_some(), "new client must survive reaper");
+    }
+
+    /// delete_expired_older_than removes documents whose expiry is before the window,
+    /// keeps documents with future expiry or no expiry.
+    #[test]
+    fn reaper_documents() {
+        let db = open_test_db();
+        let now = "2025-06-01T00:00:00Z";
+
+        // Document expired 10 days ago — should be reaped with a 5-day grace window.
+        let expired_doc = DocumentRecord {
+            id: "doc-expired".to_string(),
+            slug: "expired-doc".to_string(),
+            title: "Expired".to_string(),
+            raw_content: "# Expired".to_string(),
+            theme: "clean".to_string(),
+            password: None,
+            description: None,
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            expires_at: Some("2025-05-22T00:00:00Z".to_string()), // 10 days before now
+            updated_at: "2025-01-01T00:00:00Z".to_string(),
+        };
+        // Document expiring far in the future — must survive.
+        let future_doc = DocumentRecord {
+            id: "doc-future".to_string(),
+            slug: "future-doc".to_string(),
+            title: "Future".to_string(),
+            raw_content: "# Future".to_string(),
+            theme: "clean".to_string(),
+            password: None,
+            description: None,
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            expires_at: Some("2099-01-01T00:00:00Z".to_string()),
+            updated_at: "2025-01-01T00:00:00Z".to_string(),
+        };
+        db.insert_document(&expired_doc)
+            .expect("insert expired doc");
+        db.insert_document(&future_doc).expect("insert future doc");
+
+        // Grace window of 5 days: only docs expired more than 5 days before `now` are reaped.
+        let deleted = db
+            .delete_expired_older_than(now, 5)
+            .expect("reaper should succeed");
+        assert_eq!(
+            deleted, 1,
+            "reaper should delete exactly 1 expired document"
+        );
+
+        let expired = db.get_by_slug("expired-doc").expect("lookup ok");
+        assert!(expired.is_none(), "expired doc must be gone after reaper");
+
+        let future = db.get_by_slug("future-doc").expect("lookup ok");
+        assert!(future.is_some(), "future doc must survive reaper");
     }
 
     /// Token create → list → revoke cycle works end-to-end.

@@ -904,7 +904,7 @@ async fn handle_refresh_token(state: AppState, req: TokenRequest) -> Response {
 
 // ── PKCE ──────────────────────────────────────────────────────────────────────
 
-fn verify_pkce_s256(code_verifier: &str, stored_challenge: &str) -> bool {
+pub(crate) fn verify_pkce_s256(code_verifier: &str, stored_challenge: &str) -> bool {
     use base64::Engine;
     use sha2::{Digest, Sha256};
     let hash = Sha256::digest(code_verifier.as_bytes());
@@ -1121,7 +1121,44 @@ fn invalid_grant(description: &'static str) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::is_safe_redirect_uri;
+    use super::{is_safe_redirect_uri, verify_pkce_s256};
+
+    // ── P3-17: PKCE RFC 7636 Appendix B known-vector tests ───────────────────
+
+    /// RFC 7636 Appendix B known vector: correct verifier passes.
+    ///
+    /// verifier: dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk
+    /// challenge: E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM
+    #[test]
+    fn pkce_s256_rfc7636_appendix_b_correct_verifier() {
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+        assert!(
+            verify_pkce_s256(verifier, challenge),
+            "RFC 7636 Appendix B vector must verify"
+        );
+    }
+
+    /// Wrong verifier is rejected.
+    #[test]
+    fn pkce_s256_wrong_verifier_rejected() {
+        let challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+        assert!(
+            !verify_pkce_s256("wrong-verifier-value", challenge),
+            "incorrect verifier must not verify"
+        );
+    }
+
+    /// Verifier with different length is rejected (constant_time_str_eq early-exits on length).
+    #[test]
+    fn pkce_s256_different_length_rejected() {
+        let challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+        // Empty verifier produces a different-length base64 hash — must not match.
+        assert!(
+            !verify_pkce_s256("", challenge),
+            "empty verifier must not match"
+        );
+    }
 
     #[test]
     fn safe_redirect_https() {
@@ -1897,6 +1934,237 @@ mod tests {
         assert!(
             scope.contains("mcp:tools"),
             "scope must round-trip: got {scope}"
+        );
+    }
+
+    // ── P3-16: OAuth scope enforcement regression tests ───────────────────────
+    //
+    // These tests lock in the can_write() gate wired at post_document, put_document,
+    // delete_document, and the MCP tool handlers. An OAuth client with no scope
+    // (empty scope string) must not be able to perform write operations.
+    //
+    // Strategy: seed an access token directly into the DB (same pattern as the
+    // token_auth_code_expired test), build a router that exposes both document
+    // endpoints and OAuth routes, then assert HTTP status codes.
+
+    /// Build a combined app with document write endpoints and OAuth routes,
+    /// backed by the provided in-memory Db. Mirrors main.rs route registration.
+    fn combined_app(admin_token: &str, db: crate::db::Db) -> Router {
+        let config = crate::config::ServeConfig {
+            token: admin_token.to_string(),
+            db_path: ":memory:".to_string(),
+            bind: "127.0.0.1:0".to_string(),
+            base_url: "http://localhost".to_string(),
+            default_theme: "clean".to_string(),
+            max_size: 1_048_576,
+            webhook_url: None,
+            webhook_secret: None,
+            reaper_interval: 3600,
+            rate_limit_read: 10_000,
+            rate_limit_write: 10_000,
+            rate_limit_window: 60,
+            registration_limit: 5,
+        };
+        let rate_limit = crate::rate_limit::RateLimitStore::new(&config);
+        let state = crate::handlers::AppState {
+            db,
+            config: Arc::new(config),
+            rate_limit: rate_limit.clone(),
+        };
+        Router::new()
+            .route("/oauth/register", post(crate::oauth::handle_register))
+            .route("/authorize", get(crate::oauth::handle_authorize))
+            .route("/oauth/token", post(crate::oauth::handle_oauth_token))
+            .route(
+                "/api/v1/documents",
+                post(crate::handlers::post_document).get(crate::handlers::list_documents),
+            )
+            .route(
+                "/api/v1/documents/:slug",
+                axum::routing::put(crate::handlers::put_document)
+                    .delete(crate::handlers::delete_document),
+            )
+            .layer(axum::Extension(rate_limit))
+            .with_state(state)
+    }
+
+    /// Future timestamp for token expiry — well beyond any test run.
+    fn far_future() -> String {
+        "2099-01-01T00:00:00Z".to_string()
+    }
+
+    /// Admin/managed token always passes can_write() — positive control.
+    ///
+    /// If this fails, the test harness itself is broken.
+    #[tokio::test]
+    async fn admin_token_can_write_post_document() {
+        let admin = "admin-token";
+        let db = crate::db::Db::open(":memory:").expect("in-memory db");
+        let app = combined_app(admin, db);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/documents")
+            .header("Authorization", format!("Bearer {admin}"))
+            .header("Content-Type", "text/markdown")
+            .body(Body::from("# Admin write test"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "admin token must be able to write"
+        );
+    }
+
+    /// OAuth client with mcp:tools scope passes can_write() at POST /api/v1/documents.
+    #[tokio::test]
+    async fn oauth_with_mcp_tools_scope_can_write() {
+        let admin = "admin-token";
+        let db = crate::db::Db::open(":memory:").expect("in-memory db");
+
+        // Seed an access token with mcp:tools scope directly.
+        let token_value = "oauth-access-token-with-write-scope";
+        db.insert_access_token(&crate::db::AccessTokenRow {
+            token: token_value.to_string(),
+            client_id: "test-client".to_string(),
+            scope: Some("mcp:tools".to_string()),
+            expires_at: far_future(),
+        })
+        .expect("seed access token");
+
+        let app = combined_app(admin, db);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/documents")
+            .header("Authorization", format!("Bearer {token_value}"))
+            .header("Content-Type", "text/markdown")
+            .body(Body::from("# OAuth write test"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "OAuth token with mcp:tools scope must be able to write"
+        );
+    }
+
+    /// OAuth client with empty scope is blocked at POST /api/v1/documents — 403 Forbidden.
+    ///
+    /// This is the primary regression guard: an OAuth client that omits scope
+    /// must not bypass the can_write() gate even though it authenticates.
+    #[tokio::test]
+    async fn oauth_with_empty_scope_cannot_write_post_document() {
+        let admin = "admin-token";
+        let db = crate::db::Db::open(":memory:").expect("in-memory db");
+
+        // Seed an access token with NULL scope (empty scope string).
+        let token_value = "oauth-access-token-no-scope";
+        db.insert_access_token(&crate::db::AccessTokenRow {
+            token: token_value.to_string(),
+            client_id: "test-client-no-scope".to_string(),
+            scope: None,
+            expires_at: far_future(),
+        })
+        .expect("seed no-scope access token");
+
+        let app = combined_app(admin, db);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/documents")
+            .header("Authorization", format!("Bearer {token_value}"))
+            .header("Content-Type", "text/markdown")
+            .body(Body::from("# Should be blocked"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "OAuth token with no scope must be denied write access (403)"
+        );
+    }
+
+    /// ── P3-16 MCP gate: OAuth token with empty scope is blocked at twofold_publish ──
+    ///
+    /// Covers the can_write() guard in mcp_http::tool_publish. The MCP handler
+    /// returns a JSON-RPC result (not an HTTP error) when the principal lacks
+    /// write access, so we check the JSON-RPC body for the expected error text.
+    #[tokio::test]
+    async fn oauth_with_empty_scope_cannot_write_mcp_publish() {
+        let admin = "admin-token";
+        let db = crate::db::Db::open(":memory:").expect("in-memory db");
+
+        let token_value = "oauth-mcp-no-scope";
+        db.insert_access_token(&crate::db::AccessTokenRow {
+            token: token_value.to_string(),
+            client_id: "mcp-client-no-scope".to_string(),
+            scope: None,
+            expires_at: far_future(),
+        })
+        .expect("seed no-scope access token for MCP");
+
+        let config = crate::config::ServeConfig {
+            token: admin.to_string(),
+            db_path: ":memory:".to_string(),
+            bind: "127.0.0.1:0".to_string(),
+            base_url: "http://localhost".to_string(),
+            default_theme: "clean".to_string(),
+            max_size: 1_048_576,
+            webhook_url: None,
+            webhook_secret: None,
+            reaper_interval: 3600,
+            rate_limit_read: 10_000,
+            rate_limit_write: 10_000,
+            rate_limit_window: 60,
+            registration_limit: 5,
+        };
+        let rate_limit = crate::rate_limit::RateLimitStore::new(&config);
+        let state = crate::handlers::AppState {
+            db,
+            config: Arc::new(config),
+            rate_limit: rate_limit.clone(),
+        };
+        let app = Router::new()
+            .route("/mcp", post(crate::mcp_http::handle_mcp_post))
+            .layer(axum::Extension(rate_limit))
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "twofold_publish",
+                "arguments": {
+                    "content": "# Test",
+                    "slug": "test-mcp"
+                }
+            }
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("Authorization", format!("Bearer {token_value}"))
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "MCP always returns 200");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // tool_publish returns a JSON-RPC result containing an isError=true content block.
+        let result = &json["result"];
+        assert!(
+            result["isError"].as_bool() == Some(true)
+                || result["content"][0]["text"]
+                    .as_str()
+                    .map(|t| t.contains("Forbidden"))
+                    .unwrap_or(false),
+            "MCP twofold_publish with no-scope OAuth must be forbidden: {json}"
         );
     }
 

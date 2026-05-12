@@ -102,6 +102,25 @@ struct PasswordTemplate<'a> {
     error: Option<&'a str>,
 }
 
+/// 404 Not Found error template.
+/// `theme` is passed through to the template for CSS comment identification;
+/// the hearth palette CSS variables are always used for error pages so the
+/// look is consistent regardless of the document's own theme.
+#[derive(Template)]
+#[template(path = "404.html")]
+struct NotFoundTemplate<'a> {
+    theme: &'a str,
+}
+
+/// 410 Gone error template.
+/// `theme` is passed through to the template for CSS comment identification.
+/// The 30-day tombstone window explanation is rendered in the template body.
+#[derive(Template)]
+#[template(path = "410.html")]
+struct GoneTemplate<'a> {
+    theme: &'a str,
+}
+
 // ── Query / form types used only by view handlers ────────────────────────────
 
 /// Query parameters for GET /:slug
@@ -344,6 +363,12 @@ fn strip_marker_comments(source: &str) -> String {
 /// NOT passed through to the output. ammonia then sanitizes the rendered HTML
 /// as a second layer, stripping any script tags, event handlers, iframes, or
 /// other XSS vectors that comrak's own sanitization might miss.
+///
+/// Note: comrak 0.28's `Options<'c>` type contains `ParseOptions<'c>` which
+/// holds `Option<Arc<Mutex<BrokenLinkCallback<'c>>>>`. The `dyn FnMut` inside
+/// the callback is not `Sync`, so `Options` cannot be stored in a `static OnceLock`.
+/// Construction is O(1) bool-field assignment with no heap allocation, so the
+/// per-call cost is negligible.
 fn render_markdown(source: &str) -> String {
     use comrak::{markdown_to_html, Options};
 
@@ -520,325 +545,46 @@ pub fn markdown_response(content: &str) -> Response {
         .into_response()
 }
 
-/// Return a themed 404 HTML response (hearth palette).
+/// Return a themed 404 HTML response via Askama template.
 ///
-/// Inlined so no Askama template dependency is needed for two-page error surfaces.
-/// All CSS is inline — zero external requests — matching the hearth.html contract.
+/// Uses the hearth palette (the default error theme). The `theme` field in
+/// the template is passed through for CSS comment identification but does not
+/// change the palette — error pages use hearth regardless of document theme.
 pub fn not_found_response() -> Response {
-    let html = r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Document not found</title>
-    <style>
-/* twofold — error 404 page (hearth palette) */
-:root {
-    --bg: #F5F0EB;
-    --fg: #2C2420;
-    --fg-secondary: #6B5D52;
-    --fg-muted: #A89888;
-    --border: #E8E0D8;
-    --border-strong: #D4C8B8;
-    --accent: #C4762B;
-    --accent-hover: #A86220;
-    --font-body: Charter, 'Bitstream Charter', 'Sitka Text', Cambria, serif;
-    --font-heading: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-    --max-width: 850px;
+    let t = NotFoundTemplate { theme: "hearth" };
+    match t.render() {
+        Ok(html) => (
+            StatusCode::NOT_FOUND,
+            [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            html,
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to render 404 template");
+            StatusCode::NOT_FOUND.into_response()
+        }
+    }
 }
 
-*, *::before, *::after { box-sizing: border-box; }
-
-html {
-    font-size: 16px;
-    -webkit-text-size-adjust: 100%;
-    text-size-adjust: 100%;
-    -webkit-font-smoothing: antialiased;
-    -moz-osx-font-smoothing: grayscale;
-}
-
-body {
-    margin: 0;
-    padding: 0;
-    background: var(--bg);
-    color: var(--fg);
-    font-family: var(--font-body);
-    font-size: 1.0625rem;
-    line-height: 1.75;
-    border-top: 4px solid var(--accent);
-    min-height: 100vh;
-    display: flex;
-    flex-direction: column;
-}
-
-main {
-    flex: 1;
-    max-width: var(--max-width);
-    margin: 0 auto;
-    padding: 4rem 1.75rem 2.5rem;
-    width: 100%;
-}
-
-.error-code {
-    font-family: var(--font-heading);
-    font-size: 0.75rem;
-    font-weight: 600;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
-    color: var(--accent);
-    margin: 0 0 1rem;
-}
-
-h1 {
-    font-family: var(--font-heading);
-    font-size: 2rem;
-    font-weight: 800;
-    line-height: 1.15;
-    color: var(--accent);
-    margin: 0 0 1rem;
-    letter-spacing: -0.02em;
-    padding-bottom: 0.5rem;
-    border-bottom: 3px solid var(--accent);
-}
-
-p {
-    color: var(--fg-secondary);
-    margin: 0;
-    max-width: 36rem;
-}
-
-footer {
-    max-width: var(--max-width);
-    margin: 0 auto;
-    padding: 1.75rem 1.75rem 2.5rem;
-    text-align: center;
-    border-top: 1px solid var(--border-strong);
-    width: 100%;
-}
-
-footer::before {
-    content: "";
-    display: block;
-    width: 2.5rem;
-    height: 3px;
-    background: var(--accent);
-    margin: 0 auto 1rem;
-    border-radius: 2px;
-}
-
-footer small {
-    color: var(--fg-muted);
-    font-size: 0.7rem;
-    font-family: var(--font-heading);
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-}
-
-footer small a {
-    color: var(--accent);
-    text-decoration: underline;
-    text-decoration-thickness: 1px;
-    text-underline-offset: 2px;
-    transition: color 0.15s ease;
-}
-
-footer small a:hover {
-    color: var(--accent-hover);
-}
-
-@media (max-width: 600px) {
-    main { padding: 2.5rem 1rem 1.75rem; }
-    h1 { font-size: 1.625rem; }
-}
-    </style>
-</head>
-<body>
-    <main>
-        <p class="error-code">404</p>
-        <h1>Document not found</h1>
-        <p>This document doesn't exist, or the link may be incorrect.</p>
-    </main>
-    <footer>
-        <small>SHARED VIA FLINT &middot; TWOFOLD</small>
-    </footer>
-</body>
-</html>"#;
-    (
-        StatusCode::NOT_FOUND,
-        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        html,
-    )
-        .into_response()
-}
-
-/// Return a themed 410 HTML response (hearth palette, muted/faded to signal impermanence).
+/// Return a themed 410 HTML response via Askama template.
 ///
 /// Visually distinct from 404: muted heading color, reduced accent bar opacity,
 /// and language that explains the document was intentionally time-limited.
+/// The 30-day tombstone window is explained in the template body.
 pub fn gone_response() -> Response {
-    let html = r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Document expired</title>
-    <style>
-/* twofold — error 410 page (hearth palette, muted for impermanence) */
-:root {
-    --bg: #F5F0EB;
-    --fg: #2C2420;
-    --fg-secondary: #6B5D52;
-    --fg-muted: #A89888;
-    --border: #E8E0D8;
-    --border-strong: #D4C8B8;
-    --accent: #C4762B;
-    --accent-hover: #A86220;
-    --font-body: Charter, 'Bitstream Charter', 'Sitka Text', Cambria, serif;
-    --font-heading: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-    --max-width: 850px;
-}
-
-*, *::before, *::after { box-sizing: border-box; }
-
-html {
-    font-size: 16px;
-    -webkit-text-size-adjust: 100%;
-    text-size-adjust: 100%;
-    -webkit-font-smoothing: antialiased;
-    -moz-osx-font-smoothing: grayscale;
-}
-
-body {
-    margin: 0;
-    padding: 0;
-    background: var(--bg);
-    color: var(--fg);
-    font-family: var(--font-body);
-    font-size: 1.0625rem;
-    line-height: 1.75;
-    /* Muted top bar — not gone, just quieter. Ember fading to ash. */
-    border-top: 4px solid var(--fg-muted);
-    min-height: 100vh;
-    display: flex;
-    flex-direction: column;
-}
-
-main {
-    flex: 1;
-    max-width: var(--max-width);
-    margin: 0 auto;
-    padding: 4rem 1.75rem 2.5rem;
-    width: 100%;
-    /* Slightly washed out — this was here but isn't anymore */
-    opacity: 0.85;
-}
-
-.error-code {
-    font-family: var(--font-heading);
-    font-size: 0.75rem;
-    font-weight: 600;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
-    color: var(--fg-muted);
-    margin: 0 0 1rem;
-}
-
-h1 {
-    font-family: var(--font-heading);
-    font-size: 2rem;
-    font-weight: 800;
-    line-height: 1.15;
-    /* Secondary color instead of accent — the fire has gone out */
-    color: var(--fg-secondary);
-    margin: 0 0 1rem;
-    letter-spacing: -0.02em;
-    padding-bottom: 0.5rem;
-    /* Muted border — a trace of what was */
-    border-bottom: 3px solid var(--border-strong);
-}
-
-p {
-    color: var(--fg-muted);
-    margin: 0 0 1.5rem;
-    max-width: 36rem;
-}
-
-.expiry-mark {
-    display: inline-block;
-    width: 2rem;
-    height: 2px;
-    background: var(--border-strong);
-    border-radius: 2px;
-    vertical-align: middle;
-    margin-right: 0.5rem;
-    opacity: 0.6;
-}
-
-footer {
-    max-width: var(--max-width);
-    margin: 0 auto;
-    padding: 1.75rem 1.75rem 2.5rem;
-    text-align: center;
-    border-top: 1px solid var(--border-strong);
-    width: 100%;
-}
-
-footer::before {
-    content: "";
-    display: block;
-    width: 2.5rem;
-    height: 3px;
-    /* Footer ember stays warm even when document is gone */
-    background: var(--accent);
-    margin: 0 auto 1rem;
-    border-radius: 2px;
-    opacity: 0.5;
-}
-
-footer small {
-    color: var(--fg-muted);
-    font-size: 0.7rem;
-    font-family: var(--font-heading);
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-}
-
-footer small a {
-    color: var(--accent);
-    text-decoration: underline;
-    text-decoration-thickness: 1px;
-    text-underline-offset: 2px;
-    transition: color 0.15s ease;
-}
-
-footer small a:hover {
-    color: var(--accent-hover);
-}
-
-@media (max-width: 600px) {
-    main { padding: 2.5rem 1rem 1.75rem; }
-    h1 { font-size: 1.625rem; }
-}
-    </style>
-</head>
-<body>
-    <main>
-        <p class="error-code">410</p>
-        <h1>This document has expired</h1>
-        <p>This document was set to expire and has been removed.</p>
-        <p><span class="expiry-mark" aria-hidden="true"></span>The link is no longer valid.</p>
-    </main>
-    <footer>
-        <small>SHARED VIA FLINT &middot; TWOFOLD</small>
-    </footer>
-</body>
-</html>"#;
-    (
-        StatusCode::GONE,
-        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        html,
-    )
-        .into_response()
+    let t = GoneTemplate { theme: "hearth" };
+    match t.render() {
+        Ok(html) => (
+            StatusCode::GONE,
+            [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            html,
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to render 410 template");
+            StatusCode::GONE.into_response()
+        }
+    }
 }
 
 // ── GET /:slug (human view) ───────────────────────────────────────────────────
