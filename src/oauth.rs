@@ -184,6 +184,7 @@ pub struct AuthorizeParams {
     pub code_challenge: Option<String>,
     pub code_challenge_method: Option<String>,
     pub resource: Option<String>,
+    #[allow(dead_code)] // parsed from registration request, reserved for future scope enforcement
     pub scope: Option<String>,
 }
 
