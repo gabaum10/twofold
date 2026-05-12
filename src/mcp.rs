@@ -84,21 +84,6 @@ fn tool_result_err(message: String) -> Value {
     })
 }
 
-/// Returns true if the string contains a marker directive on its own line.
-/// Matches `<!-- @agent -->` or `<!-- @end -->` appearing as a complete line
-/// (possibly with surrounding whitespace), to prevent breaking out of the
-/// agent layer containment.
-fn contains_marker_directive(s: &str) -> bool {
-    contains_marker_directive_pub(s)
-}
-
-/// Public re-export of the marker directive check for use by mcp_http.rs.
-pub fn contains_marker_directive_pub(s: &str) -> bool {
-    s.lines().any(|line| {
-        let t = line.trim();
-        t == "<!-- @agent -->" || t == "<!-- @end -->"
-    })
-}
 
 // ── HTTP client ───────────────────────────────────────────────────────────────
 
@@ -417,49 +402,21 @@ fn tool_publish(
     let description = args.get("description").and_then(|v| v.as_str());
     let agent_content = args.get("agent_content").and_then(|v| v.as_str());
 
-    // Determine whether to inject frontmatter.
-    let has_fm_args = title.is_some()
-        || slug.is_some()
-        || password.is_some()
-        || expiry.is_some()
-        || theme.is_some()
-        || description.is_some();
-    let mut body = if !has_fm_args {
-        // No args to inject — send content as-is.
-        content.to_string()
-    } else if content.trim_start().starts_with("---") {
-        // Content already has frontmatter — merge args in (args win on conflict).
-        merge_fm_args(content, title, slug, password, expiry, theme, description)
-    } else {
-        // No existing frontmatter — prepend a new block.
-        let mut fm = String::from("---\n");
-        if let Some(t) = title {
-            fm.push_str(&format!("title: {}\n", yaml_escape_value(t)));
-        }
-        if let Some(s) = slug {
-            fm.push_str(&format!("slug: {}\n", yaml_escape_value(s)));
-        }
-        if let Some(p) = password {
-            fm.push_str(&format!("password: {}\n", yaml_escape_value(p)));
-        }
-        if let Some(ex) = expiry {
-            fm.push_str(&format!("expiry: {}\n", yaml_escape_value(ex)));
-        }
-        if let Some(th) = theme {
-            fm.push_str(&format!("theme: {}\n", yaml_escape_value(th)));
-        }
-        if let Some(d) = description {
-            fm.push_str(&format!("description: {}\n", yaml_escape_value(d)));
-        }
-        fm.push_str("---\n");
-        fm.push_str(content);
-        fm
+    // Inject/merge frontmatter fields.
+    let fields = crate::frontmatter::FrontmatterFields {
+        title: title.map(str::to_string),
+        slug: slug.map(str::to_string),
+        password: password.map(str::to_string),
+        expiry: expiry.map(str::to_string),
+        theme: theme.map(str::to_string),
+        description: description.map(str::to_string),
     };
+    let mut body = crate::frontmatter::apply_frontmatter(content, fields);
 
     // Append agent-only block if provided. Invisible in the browser view;
     // accessible via the raw API endpoint.
     if let Some(ac) = agent_content {
-        if contains_marker_directive(ac) {
+        if crate::frontmatter::contains_marker_directive(ac) {
             return tool_result_err(
                 "agent_content must not contain marker directives (<!-- @agent --> or <!-- @end -->)".to_string()
             );
@@ -643,45 +600,21 @@ fn tool_update(
     let theme = args.get("theme").and_then(|v| v.as_str());
     let agent_content = args.get("agent_content").and_then(|v| v.as_str());
 
-    // Inject frontmatter for provided fields.
-    // When content already has frontmatter, merge args in (args win on conflict).
-    let has_fm_args = title.is_some()
-        || description.is_some()
-        || password.is_some()
-        || expiry.is_some()
-        || theme.is_some();
-    let mut body = if !has_fm_args {
-        content.to_string()
-    } else if content.trim_start().starts_with("---") {
-        // Content already has frontmatter — merge args in (args win on conflict).
-        merge_fm_args(content, title, None, password, expiry, theme, description)
-    } else {
-        // No existing frontmatter — prepend a new block.
-        let mut fm = String::from("---\n");
-        if let Some(t) = title {
-            fm.push_str(&format!("title: {}\n", yaml_escape_value(t)));
-        }
-        if let Some(d) = description {
-            fm.push_str(&format!("description: {}\n", yaml_escape_value(d)));
-        }
-        if let Some(p) = password {
-            fm.push_str(&format!("password: {}\n", yaml_escape_value(p)));
-        }
-        if let Some(ex) = expiry {
-            fm.push_str(&format!("expiry: {}\n", yaml_escape_value(ex)));
-        }
-        if let Some(th) = theme {
-            fm.push_str(&format!("theme: {}\n", yaml_escape_value(th)));
-        }
-        fm.push_str("---\n");
-        fm.push_str(content);
-        fm
+    // Inject/merge frontmatter fields (slug not applicable to update).
+    let fields = crate::frontmatter::FrontmatterFields {
+        title: title.map(str::to_string),
+        slug: None,
+        password: password.map(str::to_string),
+        expiry: expiry.map(str::to_string),
+        theme: theme.map(str::to_string),
+        description: description.map(str::to_string),
     };
+    let mut body = crate::frontmatter::apply_frontmatter(content, fields);
 
     // Append agent-only block if provided. Invisible in the browser view;
     // accessible via the raw API endpoint.
     if let Some(ac) = agent_content {
-        if contains_marker_directive(ac) {
+        if crate::frontmatter::contains_marker_directive(ac) {
             return tool_result_err(
                 "agent_content must not contain marker directives (<!-- @agent --> or <!-- @end -->)".to_string()
             );
@@ -748,163 +681,4 @@ fn percent_encode(s: &str) -> String {
         }
     }
     out
-}
-
-// ── YAML value escaping ───────────────────────────────────────────────────────
-
-/// Escape a string value for safe YAML injection.
-///
-/// Wraps the value in double quotes and escapes internal double quotes and
-/// backslashes. Handles values containing colons, hashes, or other YAML
-/// special characters that would break unquoted scalar parsing.
-///
-/// Limitation: multi-line values (containing \n) have their newlines replaced
-/// with spaces. Slugs cannot contain newlines (validation prevents it).
-/// Titles with newlines are unusual and the trade-off is acceptable for v0.3.
-///
-/// `pub` because main.rs uses this for CLI frontmatter injection.
-pub fn yaml_escape_value_pub(s: &str) -> String {
-    // Replace newlines with spaces to prevent multi-line YAML injection.
-    let s = s.replace('\n', " ").replace('\r', "");
-    // Escape backslashes first, then double quotes.
-    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
-    format!("\"{escaped}\"")
-}
-
-fn yaml_escape_value(s: &str) -> String {
-    yaml_escape_value_pub(s)
-}
-
-/// Public alias for `merge_fm_args` so `mcp_http` can call it directly.
-#[allow(clippy::too_many_arguments)]
-pub fn merge_fm_args_pub(
-    content: &str,
-    title: Option<&str>,
-    slug: Option<&str>,
-    password: Option<&str>,
-    expiry: Option<&str>,
-    theme: Option<&str>,
-    description: Option<&str>,
-) -> String {
-    merge_fm_args(content, title, slug, password, expiry, theme, description)
-}
-
-/// Merge MCP tool args into existing frontmatter.
-///
-/// When content already starts with `---`, we need to inject/overwrite specific
-/// fields rather than silently dropping them. Strategy: parse the existing block
-/// line-by-line, replace matching keys, append any that are absent, then
-/// reassemble. Only operates on the simple single-line scalar values twofold uses.
-fn merge_fm_args(
-    content: &str,
-    title: Option<&str>,
-    slug: Option<&str>,
-    password: Option<&str>,
-    expiry: Option<&str>,
-    theme: Option<&str>,
-    description: Option<&str>,
-) -> String {
-    let lines: Vec<&str> = content.lines().collect();
-
-    // Find closing `---` of the frontmatter block.
-    let mut close_idx = None;
-    for (i, line) in lines.iter().enumerate().skip(1) {
-        if line.trim() == "---" {
-            close_idx = Some(i);
-            break;
-        }
-    }
-
-    let close_idx = match close_idx {
-        Some(i) => i,
-        None => {
-            // No closing fence — treat as no frontmatter, prepend a new block.
-            let mut fm = String::from("---\n");
-            if let Some(t) = title {
-                fm.push_str(&format!("title: {}\n", yaml_escape_value(t)));
-            }
-            if let Some(s) = slug {
-                fm.push_str(&format!("slug: {}\n", yaml_escape_value(s)));
-            }
-            if let Some(p) = password {
-                fm.push_str(&format!("password: {}\n", yaml_escape_value(p)));
-            }
-            if let Some(ex) = expiry {
-                fm.push_str(&format!("expiry: {}\n", yaml_escape_value(ex)));
-            }
-            if let Some(th) = theme {
-                fm.push_str(&format!("theme: {}\n", yaml_escape_value(th)));
-            }
-            if let Some(d) = description {
-                fm.push_str(&format!("description: {}\n", yaml_escape_value(d)));
-            }
-            fm.push_str("---\n");
-            fm.push_str(content);
-            return fm;
-        }
-    };
-
-    // Collect which keys we want to set, track which ones we've written.
-    let mut args: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
-    if let Some(t) = title {
-        args.insert("title", t);
-    }
-    if let Some(s) = slug {
-        args.insert("slug", s);
-    }
-    if let Some(p) = password {
-        args.insert("password", p);
-    }
-    if let Some(ex) = expiry {
-        args.insert("expiry", ex);
-    }
-    if let Some(th) = theme {
-        args.insert("theme", th);
-    }
-    if let Some(d) = description {
-        args.insert("description", d);
-    }
-
-    let mut written_keys: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let mut fm_lines: Vec<String> = Vec::new();
-
-    // First line is always `---`.
-    fm_lines.push(lines[0].to_string());
-
-    // Process existing frontmatter lines (1..close_idx).
-    for line in &lines[1..close_idx] {
-        // Check if this line sets a key we want to override.
-        let mut replaced = false;
-        for &key in args.keys() {
-            let prefix = format!("{}:", key);
-            if line.trim_start().starts_with(&prefix) {
-                fm_lines.push(format!("{}: {}", key, yaml_escape_value(args[key])));
-                written_keys.insert(key);
-                replaced = true;
-                break;
-            }
-        }
-        if !replaced {
-            fm_lines.push(line.to_string());
-        }
-    }
-
-    // Append any args that weren't already in the frontmatter.
-    for &key in args.keys() {
-        if !written_keys.contains(key) {
-            fm_lines.push(format!("{}: {}", key, yaml_escape_value(args[key])));
-        }
-    }
-
-    // Closing `---`.
-    fm_lines.push("---".to_string());
-
-    // Append the body (everything after close_idx).
-    let body_lines = &lines[close_idx + 1..];
-    let mut result = fm_lines.join("\n");
-    if !body_lines.is_empty() {
-        result.push('\n');
-        result.push_str(&body_lines.join("\n"));
-    }
-    result
 }

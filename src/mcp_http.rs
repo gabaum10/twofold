@@ -390,46 +390,18 @@ fn build_publish_body(
     description: Option<&str>,
     agent_content: Option<&str>,
 ) -> Result<String, String> {
-    use crate::mcp::yaml_escape_value_pub;
-
-    let has_fm_args = title.is_some()
-        || slug.is_some()
-        || password.is_some()
-        || expiry.is_some()
-        || theme.is_some()
-        || description.is_some();
-
-    let mut body = if !has_fm_args {
-        content.to_string()
-    } else if content.trim_start().starts_with("---") {
-        crate::mcp::merge_fm_args_pub(content, title, slug, password, expiry, theme, description)
-    } else {
-        let mut fm = String::from("---\n");
-        if let Some(t) = title {
-            fm.push_str(&format!("title: {}\n", yaml_escape_value_pub(t)));
-        }
-        if let Some(s) = slug {
-            fm.push_str(&format!("slug: {}\n", yaml_escape_value_pub(s)));
-        }
-        if let Some(p) = password {
-            fm.push_str(&format!("password: {}\n", yaml_escape_value_pub(p)));
-        }
-        if let Some(ex) = expiry {
-            fm.push_str(&format!("expiry: {}\n", yaml_escape_value_pub(ex)));
-        }
-        if let Some(th) = theme {
-            fm.push_str(&format!("theme: {}\n", yaml_escape_value_pub(th)));
-        }
-        if let Some(d) = description {
-            fm.push_str(&format!("description: {}\n", yaml_escape_value_pub(d)));
-        }
-        fm.push_str("---\n");
-        fm.push_str(content);
-        fm
+    let fields = crate::frontmatter::FrontmatterFields {
+        title: title.map(str::to_string),
+        slug: slug.map(str::to_string),
+        password: password.map(str::to_string),
+        expiry: expiry.map(str::to_string),
+        theme: theme.map(str::to_string),
+        description: description.map(str::to_string),
     };
+    let mut body = crate::frontmatter::apply_frontmatter(content, fields);
 
     if let Some(ac) = agent_content {
-        if crate::mcp::contains_marker_directive_pub(ac) {
+        if crate::frontmatter::contains_marker_directive(ac) {
             return Err(
                 "agent_content must not contain marker directives (<!-- @agent --> or <!-- @end -->)"
                     .to_string(),
