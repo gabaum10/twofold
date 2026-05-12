@@ -1,5 +1,6 @@
-use rusqlite::{Connection, Result, params};
-use std::sync::{Arc, Mutex};
+use r2d2::Pool;
+use r2d2_sqlite::SqliteConnectionManager;
+use rusqlite::{Result, params};
 
 /// A stored document record (maps 1:1 to the `documents` table row).
 #[derive(Debug, Clone)]
@@ -27,29 +28,44 @@ pub struct TokenRecord {
     pub revoked: bool,
 }
 
-/// Thread-safe database handle.
+/// Thread-safe database handle backed by an r2d2 connection pool.
 ///
-/// Contract: all methods take `&self`; internal synchronization via Mutex.
+/// Contract: all methods take `&self`. Pool provides thread-safe concurrent
+/// access — multiple readers can run in parallel under WAL mode.
 /// Errors are rusqlite::Error — callers map to HTTP status codes.
 #[derive(Clone)]
 pub struct Db {
-    conn: Arc<Mutex<Connection>>,
+    pool: Pool<SqliteConnectionManager>,
+}
+
+/// Convert an r2d2 pool error into a rusqlite error so callers keep the same
+/// `rusqlite::Result<T>` return type without an API surface change.
+fn pool_err(e: r2d2::Error) -> rusqlite::Error {
+    rusqlite::Error::InvalidPath(
+        std::path::PathBuf::from(format!("connection pool error: {e}")),
+    )
 }
 
 impl Db {
     /// Open or create the SQLite database at `path`, running schema initialization.
     ///
-    /// Enables WAL mode and sets busy_timeout for production concurrency.
+    /// Builds an r2d2 pool (max 8 connections) so concurrent reads can run in
+    /// parallel under WAL mode instead of serializing through a single Mutex.
+    /// WAL mode and busy_timeout are applied to each connection at open time.
     pub fn open(path: &str) -> Result<Self> {
-        let conn = Connection::open(path)?;
+        let manager = SqliteConnectionManager::file(path)
+            .with_init(|conn| {
+                conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+                conn.busy_timeout(std::time::Duration::from_secs(5))?;
+                Ok(())
+            });
 
-        // Production hardening: WAL mode for concurrent readers + busy_timeout
-        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let pool = Pool::builder()
+            .max_size(8)
+            .build(manager)
+            .map_err(pool_err)?;
 
-        let db = Db {
-            conn: Arc::new(Mutex::new(conn)),
-        };
+        let db = Db { pool };
         db.initialize_schema()?;
         db.migrate()?;
         Ok(db)
@@ -61,7 +77,7 @@ impl Db {
     /// For existing databases: creates only missing tables (documents table
     /// already exists from v0.1 — migration handles adding columns).
     fn initialize_schema(&self) -> Result<()> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.pool.get().map_err(pool_err)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS documents (
                 id          TEXT PRIMARY KEY,
@@ -94,7 +110,7 @@ impl Db {
     /// Uses PRAGMA table_info to check if columns exist before altering.
     /// Safe to run on fresh databases (no-ops if columns already exist).
     fn migrate(&self) -> Result<()> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.pool.get().map_err(pool_err)?;
 
         // Check which columns exist on documents table
         let mut stmt = conn.prepare("PRAGMA table_info(documents)")?;
@@ -127,12 +143,12 @@ impl Db {
         Ok(())
     }
 
-    /// Verify the database connection is alive with a trivial query.
+    /// Verify the database connection pool is alive with a trivial query.
     ///
-    /// Used by the health endpoint. Returns Ok(()) if the connection responds,
-    /// Err if the connection is broken or the mutex is poisoned.
+    /// Used by the health endpoint. Returns Ok(()) if the pool responds,
+    /// Err if pool acquisition or query fails.
     pub fn ping(&self) -> Result<()> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.pool.get().map_err(pool_err)?;
         conn.execute_batch("SELECT 1;")?;
         Ok(())
     }
@@ -141,7 +157,7 @@ impl Db {
     ///
     /// Returns Err if slug already exists (UNIQUE constraint violation).
     pub fn insert_document(&self, doc: &DocumentRecord) -> Result<()> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.pool.get().map_err(pool_err)?;
         conn.execute(
             "INSERT INTO documents (id, slug, title, raw_content, theme, password, description, created_at, expires_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -163,7 +179,7 @@ impl Db {
 
     /// Update an existing document by slug.
     pub fn update_document(&self, slug: &str, doc: &DocumentRecord) -> Result<bool> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.pool.get().map_err(pool_err)?;
         let rows = conn.execute(
             "UPDATE documents SET title = ?1, raw_content = ?2, theme = ?3, password = ?4,
              description = ?5, expires_at = ?6, updated_at = ?7
@@ -184,7 +200,7 @@ impl Db {
 
     /// Delete a document by slug. Returns true if a row was deleted.
     pub fn delete_by_slug(&self, slug: &str) -> Result<bool> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.pool.get().map_err(pool_err)?;
         let rows = conn.execute(
             "DELETE FROM documents WHERE slug = ?1",
             params![slug],
@@ -196,7 +212,7 @@ impl Db {
     ///
     /// Returns Ok(None) if no row matches the slug (caller maps to 404).
     pub fn get_by_slug(&self, slug: &str) -> Result<Option<DocumentRecord>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.pool.get().map_err(pool_err)?;
         let mut stmt = conn.prepare(
             "SELECT id, slug, title, raw_content, theme, password, description, created_at, expires_at, updated_at
              FROM documents WHERE slug = ?1",
@@ -226,7 +242,7 @@ impl Db {
     /// in the database (returning 410) until they're old enough to discard.
     /// The cutoff is computed from `now` using SQLite's datetime arithmetic.
     pub fn delete_expired_older_than(&self, now: &str, days: u32) -> Result<usize> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.pool.get().map_err(pool_err)?;
         let rows = conn.execute(
             "DELETE FROM documents \
              WHERE expires_at IS NOT NULL \
@@ -240,7 +256,7 @@ impl Db {
 
     /// Insert a new token record.
     pub fn insert_token(&self, token: &TokenRecord) -> Result<()> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.pool.get().map_err(pool_err)?;
         conn.execute(
             "INSERT INTO tokens (id, name, hash, created_at, last_used, revoked)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -258,7 +274,7 @@ impl Db {
 
     /// Get all non-revoked token hashes for auth verification.
     pub fn get_active_tokens(&self) -> Result<Vec<TokenRecord>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.pool.get().map_err(pool_err)?;
         let mut stmt = conn.prepare(
             "SELECT id, name, hash, created_at, last_used, revoked
              FROM tokens WHERE revoked = 0",
@@ -281,7 +297,7 @@ impl Db {
 
     /// List all tokens (for CLI display).
     pub fn list_tokens(&self) -> Result<Vec<TokenRecord>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.pool.get().map_err(pool_err)?;
         let mut stmt = conn.prepare(
             "SELECT id, name, hash, created_at, last_used, revoked
              FROM tokens ORDER BY created_at DESC",
@@ -304,7 +320,7 @@ impl Db {
 
     /// Revoke a token by name. Returns true if a row was updated.
     pub fn revoke_token(&self, name: &str) -> Result<bool> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.pool.get().map_err(pool_err)?;
         let rows = conn.execute(
             "UPDATE tokens SET revoked = 1 WHERE name = ?1 AND revoked = 0",
             params![name],
@@ -314,7 +330,7 @@ impl Db {
 
     /// Update last_used timestamp for a token.
     pub fn touch_token(&self, id: &str, now: &str) -> Result<()> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.pool.get().map_err(pool_err)?;
         conn.execute(
             "UPDATE tokens SET last_used = ?1 WHERE id = ?2",
             params![now, id],
@@ -324,7 +340,7 @@ impl Db {
 
     /// Check if a token name already exists.
     pub fn token_name_exists(&self, name: &str) -> Result<bool> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.pool.get().map_err(pool_err)?;
         let mut stmt = conn.prepare(
             "SELECT COUNT(*) FROM tokens WHERE name = ?1",
         )?;
@@ -342,14 +358,14 @@ impl Db {
     /// Limit is enforced server-side: callers requesting limit > 100 are silently
     /// capped at 100. Offset is u32 (cannot be negative by type).
     ///
-    /// Two queries: count first, then paginated data. The mutex is released between
-    /// them — in theory the count could race with concurrent writes. At v0.3 usage
-    /// patterns this is acceptable; a window-function approach would eliminate it.
+    /// Two queries: count first, then paginated data. Each acquires its own pool
+    /// connection — in theory the count could race with concurrent writes. At v0.3
+    /// usage patterns this is acceptable; a window-function approach would eliminate it.
     pub fn list_documents(&self, limit: u32, offset: u32) -> Result<(Vec<DocumentSummary>, u64)> {
         // Server-side cap: callers asking for >100 get 100, no error.
         let capped_limit = limit.min(100);
 
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.pool.get().map_err(pool_err)?;
 
         // Count all non-expired documents (for pagination total).
         // Filter: expires_at IS NULL (no expiry) OR expires_at > now (not yet expired).
