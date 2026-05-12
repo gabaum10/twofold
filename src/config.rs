@@ -133,3 +133,100 @@ impl ServeConfig {
         })
     }
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Serialize env-var tests with a process-wide mutex.
+    ///
+    /// Rust test threads share a process, so concurrent tests that mutate
+    /// environment variables race each other. This mutex ensures the three
+    /// `from_env_*` tests run one at a time, each with a clean slate.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Clear all TWOFOLD_* vars so each test starts from a known state.
+    fn clear_twofold_env() {
+        for key in &[
+            "TWOFOLD_TOKEN",
+            "TWOFOLD_BIND",
+            "TWOFOLD_DB_PATH",
+            "TWOFOLD_BASE_URL",
+            "TWOFOLD_MAX_SIZE",
+            "TWOFOLD_REAPER_INTERVAL",
+            "TWOFOLD_DEFAULT_THEME",
+            "TWOFOLD_WEBHOOK_URL",
+            "TWOFOLD_WEBHOOK_SECRET",
+            "TWOFOLD_RATE_LIMIT_READ",
+            "TWOFOLD_RATE_LIMIT_WRITE",
+            "TWOFOLD_RATE_LIMIT_WINDOW",
+        ] {
+            std::env::remove_var(key);
+        }
+    }
+
+    /// TWOFOLD_TOKEN absent → from_env returns an error.
+    #[test]
+    fn from_env_missing_token_errors() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_twofold_env();
+
+        let result = ServeConfig::from_env();
+        assert!(
+            result.is_err(),
+            "expected error when TWOFOLD_TOKEN is absent"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("TWOFOLD_TOKEN"),
+            "error message should mention TWOFOLD_TOKEN, got: {msg}"
+        );
+    }
+
+    /// Unset optional vars get their documented defaults.
+    #[test]
+    fn from_env_defaults() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_twofold_env();
+        std::env::set_var("TWOFOLD_TOKEN", "test-secret");
+
+        let cfg = ServeConfig::from_env().expect("from_env should succeed with token set");
+
+        assert_eq!(cfg.token, "test-secret");
+        assert_eq!(cfg.bind, "127.0.0.1:3000");
+        assert_eq!(cfg.db_path, "./twofold.db");
+        assert_eq!(cfg.base_url, "http://localhost:3000");
+        assert_eq!(cfg.max_size, 1_048_576);
+        assert_eq!(cfg.reaper_interval, 60);
+        assert_eq!(cfg.default_theme, "clean");
+        assert!(cfg.webhook_url.is_none());
+        assert!(cfg.webhook_secret.is_none());
+        assert_eq!(cfg.rate_limit_read, 60);
+        assert_eq!(cfg.rate_limit_write, 30);
+        assert_eq!(cfg.rate_limit_window, 60);
+    }
+
+    /// An invalid TWOFOLD_WEBHOOK_URL fails at startup with a descriptive error.
+    #[test]
+    fn from_env_bad_url_errors() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_twofold_env();
+        std::env::set_var("TWOFOLD_TOKEN", "test-secret");
+        std::env::set_var("TWOFOLD_WEBHOOK_URL", "not-a-valid-url");
+
+        let result = ServeConfig::from_env();
+
+        assert!(
+            result.is_err(),
+            "expected error for invalid TWOFOLD_WEBHOOK_URL"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("TWOFOLD_WEBHOOK_URL"),
+            "error message should mention TWOFOLD_WEBHOOK_URL, got: {msg}"
+        );
+    }
+}
