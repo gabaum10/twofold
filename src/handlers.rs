@@ -155,6 +155,8 @@ struct CleanTemplate<'a> {
     full_view: bool,
     body_empty: bool,
     expires_at: Option<String>,
+    /// First ~150 chars of plain text content for meta description / OpenGraph.
+    description: String,
 }
 
 /// Dark theme template.
@@ -167,6 +169,7 @@ struct DarkTemplate<'a> {
     base_url: &'a str,
     body_empty: bool,
     expires_at: Option<String>,
+    description: String,
 }
 
 /// Paper theme template.
@@ -179,6 +182,7 @@ struct PaperTemplate<'a> {
     base_url: &'a str,
     body_empty: bool,
     expires_at: Option<String>,
+    description: String,
 }
 
 /// Minimal theme template.
@@ -191,6 +195,7 @@ struct MinimalTemplate<'a> {
     base_url: &'a str,
     body_empty: bool,
     expires_at: Option<String>,
+    description: String,
 }
 
 /// Hearth theme template.
@@ -204,6 +209,7 @@ struct HearthTemplate<'a> {
     full_view: bool,
     body_empty: bool,
     expires_at: Option<String>,
+    description: String,
 }
 
 /// Password prompt template.
@@ -1115,32 +1121,79 @@ fn render_themed_sync(title: &str, content: &str, slug: &str, theme: &str, base_
 
     let body_empty = highlighted.trim().is_empty();
 
+    // Compute plain-text excerpt for meta description / OpenGraph.
+    // Strip HTML tags from the rendered content, collapse whitespace, truncate at 150 chars.
+    let description = plain_text_excerpt(&highlighted, 150);
+
     let html = match theme {
         "dark" => {
-            let t = DarkTemplate { title, content: &highlighted, slug, base_url, body_empty, expires_at };
+            let t = DarkTemplate { title, content: &highlighted, slug, base_url, body_empty, expires_at, description };
             t.render()
         }
         "paper" => {
-            let t = PaperTemplate { title, content: &highlighted, slug, base_url, body_empty, expires_at };
+            let t = PaperTemplate { title, content: &highlighted, slug, base_url, body_empty, expires_at, description };
             t.render()
         }
         "minimal" => {
-            let t = MinimalTemplate { title, content: &highlighted, slug, base_url, body_empty, expires_at };
+            let t = MinimalTemplate { title, content: &highlighted, slug, base_url, body_empty, expires_at, description };
             t.render()
         }
         "hearth" => {
-            let t = HearthTemplate { title, content: &highlighted, slug, base_url, full_view, body_empty, expires_at };
+            let t = HearthTemplate { title, content: &highlighted, slug, base_url, full_view, body_empty, expires_at, description };
             t.render()
         }
         _ => {
             // "clean" or unknown -> default
-            let t = CleanTemplate { title, content: &highlighted, slug, base_url, full_view, body_empty, expires_at };
+            let t = CleanTemplate { title, content: &highlighted, slug, base_url, full_view, body_empty, expires_at, description };
             t.render()
         }
     };
 
     html.map(|h| Html(h).into_response())
         .map_err(|e| AppError::Internal(format!("Template render error: {e}")))
+}
+
+/// Strip HTML tags and extract plain text, collapsing whitespace.
+/// Returns up to `max_chars` characters, suitable for meta description tags.
+fn plain_text_excerpt(html: &str, max_chars: usize) -> String {
+    let mut result = String::with_capacity(html.len().min(512));
+    let mut in_tag = false;
+    let mut last_was_space = true; // start true so we don't lead with a space
+
+    for ch in html.chars() {
+        match ch {
+            '<' => { in_tag = true; }
+            '>' => {
+                in_tag = false;
+                // Treat closing/block tags as whitespace boundaries.
+                if !last_was_space {
+                    result.push(' ');
+                    last_was_space = true;
+                }
+            }
+            _ if in_tag => {}
+            '\n' | '\r' | '\t' | ' ' => {
+                if !last_was_space {
+                    result.push(' ');
+                    last_was_space = true;
+                }
+            }
+            _ => {
+                result.push(ch);
+                last_was_space = false;
+            }
+        }
+    }
+
+    let trimmed = result.trim().to_string();
+
+    // Truncate at max_chars on a char boundary, appending ellipsis if cut.
+    if trimmed.chars().count() <= max_chars {
+        trimmed
+    } else {
+        let cut: String = trimmed.chars().take(max_chars).collect();
+        format!("{cut}...")
+    }
 }
 
 // ── Themed error page HTML ───────────────────────────────────────────────────

@@ -234,7 +234,7 @@ fn handle_tools_list(id: Value) -> Response {
                         },
                         "title": {
                             "type": "string",
-                            "description": "Optional document title (prepended as frontmatter if content has none)."
+                            "description": "The document title. Displayed in browser tabs, search results, OpenGraph previews, and social cards. Always set this explicitly. If omitted, falls back to the first heading in the content, which may not be what you want."
                         },
                         "slug": {
                             "type": "string",
@@ -320,7 +320,7 @@ fn handle_tools_list(id: Value) -> Response {
                         },
                         "title": {
                             "type": "string",
-                            "description": "Optional new title (prepended as frontmatter if content has none)."
+                            "description": "The document title. Displayed in browser tabs, search results, OpenGraph previews, and social cards. Always set this explicitly. If omitted, falls back to the first heading in the content, which may not be what you want."
                         },
                         "description": {
                             "type": "string",
@@ -404,11 +404,16 @@ fn tool_publish(
     let agent_content = args.get("agent_content").and_then(|v| v.as_str());
 
     // Determine whether to inject frontmatter.
-    // If content already starts with `---`, the caller controls frontmatter.
     let has_fm_args = title.is_some() || slug.is_some() || password.is_some()
         || expiry.is_some() || theme.is_some() || description.is_some();
-    let mut body = if !content.trim_start().starts_with("---") && has_fm_args {
-        // Build frontmatter block. YAML-escape values to handle special chars.
+    let mut body = if !has_fm_args {
+        // No args to inject — send content as-is.
+        content.to_string()
+    } else if content.trim_start().starts_with("---") {
+        // Content already has frontmatter — merge args in (args win on conflict).
+        merge_fm_args(content, title, slug, password, expiry, theme, description)
+    } else {
+        // No existing frontmatter — prepend a new block.
         let mut fm = String::from("---\n");
         if let Some(t) = title {
             fm.push_str(&format!("title: {}\n", yaml_escape_value(t)));
@@ -431,8 +436,6 @@ fn tool_publish(
         fm.push_str("---\n");
         fm.push_str(content);
         fm
-    } else {
-        content.to_string()
     };
 
     // Append agent-only block if provided. Invisible in the browser view;
@@ -622,11 +625,17 @@ fn tool_update(
     let theme = args.get("theme").and_then(|v| v.as_str());
     let agent_content = args.get("agent_content").and_then(|v| v.as_str());
 
-    // Inject frontmatter for provided fields if content has none.
-    // If content already starts with `---`, caller controls frontmatter.
+    // Inject frontmatter for provided fields.
+    // When content already has frontmatter, merge args in (args win on conflict).
     let has_fm_args = title.is_some() || description.is_some() || password.is_some()
         || expiry.is_some() || theme.is_some();
-    let mut body = if !content.trim_start().starts_with("---") && has_fm_args {
+    let mut body = if !has_fm_args {
+        content.to_string()
+    } else if content.trim_start().starts_with("---") {
+        // Content already has frontmatter — merge args in (args win on conflict).
+        merge_fm_args(content, title, None, password, expiry, theme, description)
+    } else {
+        // No existing frontmatter — prepend a new block.
         let mut fm = String::from("---\n");
         if let Some(t) = title {
             fm.push_str(&format!("title: {}\n", yaml_escape_value(t)));
@@ -646,8 +655,6 @@ fn tool_update(
         fm.push_str("---\n");
         fm.push_str(content);
         fm
-    } else {
-        content.to_string()
     };
 
     // Append agent-only block if provided. Invisible in the browser view;
@@ -744,4 +751,112 @@ pub fn yaml_escape_value_pub(s: &str) -> String {
 
 fn yaml_escape_value(s: &str) -> String {
     yaml_escape_value_pub(s)
+}
+
+/// Merge MCP tool args into existing frontmatter.
+///
+/// When content already starts with `---`, we need to inject/overwrite specific
+/// fields rather than silently dropping them. Strategy: parse the existing block
+/// line-by-line, replace matching keys, append any that are absent, then
+/// reassemble. Only operates on the simple single-line scalar values twofold uses.
+fn merge_fm_args(
+    content: &str,
+    title: Option<&str>,
+    slug: Option<&str>,
+    password: Option<&str>,
+    expiry: Option<&str>,
+    theme: Option<&str>,
+    description: Option<&str>,
+) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+
+    // Find closing `---` of the frontmatter block.
+    let mut close_idx = None;
+    for (i, line) in lines.iter().enumerate().skip(1) {
+        if line.trim() == "---" {
+            close_idx = Some(i);
+            break;
+        }
+    }
+
+    let close_idx = match close_idx {
+        Some(i) => i,
+        None => {
+            // No closing fence — treat as no frontmatter, prepend a new block.
+            let mut fm = String::from("---\n");
+            if let Some(t) = title {
+                fm.push_str(&format!("title: {}\n", yaml_escape_value(t)));
+            }
+            if let Some(s) = slug {
+                fm.push_str(&format!("slug: {}\n", yaml_escape_value(s)));
+            }
+            if let Some(p) = password {
+                fm.push_str(&format!("password: {}\n", yaml_escape_value(p)));
+            }
+            if let Some(ex) = expiry {
+                fm.push_str(&format!("expiry: {}\n", yaml_escape_value(ex)));
+            }
+            if let Some(th) = theme {
+                fm.push_str(&format!("theme: {}\n", yaml_escape_value(th)));
+            }
+            if let Some(d) = description {
+                fm.push_str(&format!("description: {}\n", yaml_escape_value(d)));
+            }
+            fm.push_str("---\n");
+            fm.push_str(content);
+            return fm;
+        }
+    };
+
+    // Collect which keys we want to set, track which ones we've written.
+    let mut args: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    if let Some(t) = title { args.insert("title", t); }
+    if let Some(s) = slug { args.insert("slug", s); }
+    if let Some(p) = password { args.insert("password", p); }
+    if let Some(ex) = expiry { args.insert("expiry", ex); }
+    if let Some(th) = theme { args.insert("theme", th); }
+    if let Some(d) = description { args.insert("description", d); }
+
+    let mut written_keys: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut fm_lines: Vec<String> = Vec::new();
+
+    // First line is always `---`.
+    fm_lines.push(lines[0].to_string());
+
+    // Process existing frontmatter lines (1..close_idx).
+    for line in &lines[1..close_idx] {
+        // Check if this line sets a key we want to override.
+        let mut replaced = false;
+        for &key in args.keys() {
+            let prefix = format!("{}:", key);
+            if line.trim_start().starts_with(&prefix) {
+                fm_lines.push(format!("{}: {}", key, yaml_escape_value(args[key])));
+                written_keys.insert(key);
+                replaced = true;
+                break;
+            }
+        }
+        if !replaced {
+            fm_lines.push(line.to_string());
+        }
+    }
+
+    // Append any args that weren't already in the frontmatter.
+    for &key in args.keys() {
+        if !written_keys.contains(key) {
+            fm_lines.push(format!("{}: {}", key, yaml_escape_value(args[key])));
+        }
+    }
+
+    // Closing `---`.
+    fm_lines.push("---".to_string());
+
+    // Append the body (everything after close_idx).
+    let body_lines = &lines[close_idx + 1..];
+    let mut result = fm_lines.join("\n");
+    if !body_lines.is_empty() {
+        result.push('\n');
+        result.push_str(&body_lines.join("\n"));
+    }
+    result
 }
