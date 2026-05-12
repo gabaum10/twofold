@@ -820,30 +820,69 @@ pub async fn get_agent(
 // ── Internal helpers ─────────────────────────────────────────────────────────
 
 /// Auth check: admin token (constant-time) OR managed token (argon2 verify).
-pub(crate) async fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
+///
+/// Performance contract:
+/// 1. Admin token: O(1) constant-time compare, no argon2.
+/// 2. Managed tokens (v0.4+): prefix lookup → O(1) indexed DB query → at most
+///    1 argon2 verification per request, run in `spawn_blocking`.
+/// 3. Legacy tokens (prefix IS NULL, created before v0.4): O(n) fallback with
+///    argon2 per record, also in `spawn_blocking`. Degrades gracefully for
+///    existing deployments; new tokens never hit this path.
+async fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
     let provided = extract_bearer(headers)
         .ok_or(AppError::Unauthorized)?;
-    check_auth_token(state, provided).await
-}
 
-/// Validate a raw token string (no header parsing).
-///
-/// Used by OAuth and any other path that extracts the credential itself.
-pub(crate) async fn check_auth_token(state: &AppState, provided: &str) -> Result<(), AppError> {
-    // Check admin token first (constant-time)
+    // Fast path: admin TWOFOLD_TOKEN — constant-time, no argon2.
     if constant_time_eq(provided.as_bytes(), state.config.token.as_bytes()) {
         return Ok(());
     }
 
-    // Check managed tokens
-    let tokens = state.db.get_active_tokens()
+    // Prefix-based O(1) lookup: use first 8 chars of the provided token
+    // to look up the one candidate record, then verify with argon2.
+    let prefix: String = provided.chars().take(8).collect();
+
+    let candidate = state.db.get_token_by_prefix(&prefix)
         .map_err(|_| AppError::Internal("Failed to check tokens".to_string()))?;
 
-    for token_record in &tokens {
-        if verify_password(provided, &token_record.hash) {
-            // Update last_used
+    if let Some(token_record) = candidate {
+        let provided_owned = provided.to_string();
+        let hash_owned = token_record.hash.clone();
+        let verified = tokio::task::spawn_blocking(move || {
+            verify_password(&provided_owned, &hash_owned)
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("Auth task failed: {e}")))?;
+
+        if verified {
             let now = chrono_now();
             let _ = state.db.touch_token(&token_record.id, &now);
+            return Ok(());
+        }
+        // Prefix matched but hash didn't — fall through to legacy check and
+        // ultimately return Unauthorized (prefix collision is astronomically rare).
+    }
+
+    // Legacy fallback: tokens created before v0.4 have no prefix stored.
+    // On a fresh database this query returns 0 rows immediately.
+    let legacy_tokens = state.db.get_legacy_active_tokens()
+        .map_err(|_| AppError::Internal("Failed to check tokens".to_string()))?;
+
+    if !legacy_tokens.is_empty() {
+        let provided_owned = provided.to_string();
+        let result = tokio::task::spawn_blocking(move || {
+            for token_record in &legacy_tokens {
+                if verify_password(&provided_owned, &token_record.hash) {
+                    return Some(token_record.id.clone());
+                }
+            }
+            None
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("Auth task failed: {e}")))?;
+
+        if let Some(id) = result {
+            let now = chrono_now();
+            let _ = state.db.touch_token(&id, &now);
             return Ok(());
         }
     }
@@ -2041,5 +2080,189 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let text = std::str::from_utf8(&body).unwrap();
         assert!(text.contains("Open content."), "unprotected doc should be served without password");
+    }
+
+    // ── Managed token auth tests ──────────────────────────────────────────────
+
+    /// Build a test router that has a pre-inserted managed token in the DB.
+    ///
+    /// Returns (Router, plaintext_managed_token). The admin TWOFOLD_TOKEN is set
+    /// to "admin-token" so both paths can be exercised separately.
+    fn test_app_with_managed_token() -> (Router, String) {
+        use crate::db::{Db, TokenRecord};
+        use crate::config::ServeConfig;
+
+        let db = Db::open(":memory:").expect("in-memory db");
+
+        // Insert a managed token using the same format as `token_create` in main.rs:
+        // tf_<base64url(32 bytes)>. We use a fixed value for test determinism.
+        let managed_plain = "tf_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let prefix: String = managed_plain.chars().take(8).collect();
+        let hash = hash_password(managed_plain).expect("hash");
+
+        let record = TokenRecord {
+            id: "test-managed-id".to_string(),
+            name: "test-managed".to_string(),
+            hash,
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            last_used: None,
+            revoked: false,
+            prefix: Some(prefix),
+        };
+        db.insert_token(&record).expect("insert managed token");
+
+        let config = Arc::new(ServeConfig {
+            token: "admin-token".to_string(),
+            db_path: ":memory:".to_string(),
+            bind: "127.0.0.1:0".to_string(),
+            base_url: "http://localhost".to_string(),
+            default_theme: "clean".to_string(),
+            max_size: 1_048_576,
+            webhook_url: None,
+            webhook_secret: None,
+            reaper_interval: 3600,
+        });
+        let state = AppState { db, config };
+        let router = Router::new()
+            .route(
+                "/api/v1/documents",
+                post(crate::handlers::post_document).get(crate::handlers::list_documents),
+            )
+            .route(
+                "/api/v1/documents/:slug",
+                get(crate::handlers::get_agent)
+                    .put(crate::handlers::put_document)
+                    .delete(crate::handlers::delete_document),
+            )
+            .with_state(state);
+        (router, managed_plain.to_string())
+    }
+
+    /// Managed token: correct plaintext is accepted by check_auth via prefix lookup.
+    #[tokio::test]
+    async fn test_managed_token_auth_accepted() {
+        let (app, managed_token) = test_app_with_managed_token();
+
+        // First publish with admin token so there's a document to fetch.
+        let slug = publish_doc(app.clone(), "admin-token", "managed-test", "# Hello").await;
+
+        // Now GET with managed token.
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/documents/{slug}"))
+            .header("Authorization", format!("Bearer {managed_token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK,
+            "managed token should be accepted by prefix lookup + argon2 verify");
+    }
+
+    /// Wrong token with same prefix: prefix matches DB record but argon2 rejects it.
+    #[tokio::test]
+    async fn test_managed_token_wrong_value_rejected() {
+        let (app, managed_token) = test_app_with_managed_token();
+
+        // Construct a token with the same 8-char prefix but different suffix.
+        let wrong_token = format!("{}X_WRONG", &managed_token[..8]);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/documents")
+            .header("Authorization", format!("Bearer {wrong_token}"))
+            .header("content-type", "text/markdown")
+            .body(Body::from("# Test"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED,
+            "token with matching prefix but wrong value must be rejected");
+    }
+
+    /// Admin token still works independently of managed token path.
+    #[tokio::test]
+    async fn test_admin_token_still_works_with_managed_tokens_present() {
+        let (app, _) = test_app_with_managed_token();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/documents")
+            .header("Authorization", "Bearer admin-token")
+            .header("content-type", "text/markdown")
+            .body(Body::from("# Admin Test"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED,
+            "admin TWOFOLD_TOKEN must still work when managed tokens exist");
+    }
+
+    /// No token: 401 immediately.
+    #[tokio::test]
+    async fn test_no_token_returns_401() {
+        let (app, _) = test_app_with_managed_token();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/documents")
+            .header("content-type", "text/markdown")
+            .body(Body::from("# No Auth"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED,
+            "missing token must return 401");
+    }
+
+    /// Revoked managed token: prefix lookup finds the record, but argon2 passes,
+    /// yet it should be excluded by `WHERE revoked = 0`.
+    #[tokio::test]
+    async fn test_revoked_managed_token_rejected() {
+        use crate::db::{Db, TokenRecord};
+        use crate::config::ServeConfig;
+
+        let db = Db::open(":memory:").expect("in-memory db");
+        let managed_plain = "tf_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let prefix: String = managed_plain.chars().take(8).collect();
+        let hash = hash_password(managed_plain).expect("hash");
+
+        // Insert as revoked.
+        let record = TokenRecord {
+            id: "revoked-id".to_string(),
+            name: "revoked-token".to_string(),
+            hash,
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            last_used: None,
+            revoked: true,   // already revoked
+            prefix: Some(prefix),
+        };
+        db.insert_token(&record).expect("insert revoked token");
+
+        let config = Arc::new(ServeConfig {
+            token: "admin-token".to_string(),
+            db_path: ":memory:".to_string(),
+            bind: "127.0.0.1:0".to_string(),
+            base_url: "http://localhost".to_string(),
+            default_theme: "clean".to_string(),
+            max_size: 1_048_576,
+            webhook_url: None,
+            webhook_secret: None,
+            reaper_interval: 3600,
+        });
+        let state = AppState { db, config };
+        let router = Router::new()
+            .route(
+                "/api/v1/documents",
+                post(crate::handlers::post_document).get(crate::handlers::list_documents),
+            )
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/documents")
+            .header("Authorization", format!("Bearer {managed_plain}"))
+            .header("content-type", "text/markdown")
+            .body(Body::from("# Revoked Test"))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED,
+            "revoked token must not authenticate");
     }
 }
