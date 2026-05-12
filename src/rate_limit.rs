@@ -60,10 +60,9 @@ pub struct RateLimitStore {
     read_limit: u32,
     write_limit: u32,
     window_secs: u64,
+    registration_limit: u32,
 }
 
-/// Registration rate limit: 5 requests per 60-second window per IP.
-const REGISTRATION_LIMIT: u32 = 5;
 const REGISTRATION_WINDOW_SECS: u64 = 60;
 
 impl RateLimitStore {
@@ -75,6 +74,7 @@ impl RateLimitStore {
             read_limit: config.rate_limit_read,
             write_limit: config.rate_limit_write,
             window_secs: config.rate_limit_window,
+            registration_limit: config.registration_limit,
         })
     }
 
@@ -94,13 +94,14 @@ impl RateLimitStore {
 
     /// Check and increment the registration bucket for the given IP key.
     ///
-    /// Hard limit: 5 requests per 60-second window. Legitimate clients register
-    /// once; this budget is generous enough for retries while blocking spam.
+    /// Default limit: 5 requests per 60-second window. Configurable via
+    /// `TWOFOLD_REGISTRATION_LIMIT`. Legitimate clients register once; this
+    /// budget is generous enough for retries while blocking spam.
     pub fn check_registration(&self, ip: &str) -> Result<(), RateLimitError> {
         check_bucket(
             &self.registration_store,
             ip,
-            REGISTRATION_LIMIT,
+            self.registration_limit,
             REGISTRATION_WINDOW_SECS,
         )
     }
@@ -175,36 +176,17 @@ fn unix_now() -> u64 {
 
 // ── IP Extraction ─────────────────────────────────────────────────────────────
 
-/// Extract client IP from headers or socket address.
+/// Extract client IP from request parts.
 ///
-/// Priority:
-/// 1. X-Forwarded-For (leftmost / original client)
-/// 2. ConnectInfo socket peer address
-///
-/// Trust X-Forwarded-For unconditionally (self-hosted; proxy trust is operator responsibility).
+/// Delegates to `helpers::extract_client_ip` for consistent XFF validation
+/// (rejects values that do not parse as a valid IP address).
 fn extract_client_ip(parts: &Parts) -> String {
-    // Try X-Forwarded-For first.
-    if let Some(xff) = parts.headers.get("x-forwarded-for") {
-        if let Ok(s) = xff.to_str() {
-            if let Some(first) = s.split(',').next() {
-                let ip = first.trim().to_string();
-                if !ip.is_empty() {
-                    return ip;
-                }
-            }
-        }
-    }
-
-    // Fall back to socket peer address via ConnectInfo extension.
-    if let Some(addr) = parts
+    // Extract socket peer address string from ConnectInfo extension.
+    let peer_addr = parts
         .extensions
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-    {
-        return addr.0.ip().to_string();
-    }
-
-    // Absolute fallback — should not happen in normal operation.
-    "unknown".to_string()
+        .map(|c| c.0.to_string());
+    crate::helpers::extract_client_ip(&parts.headers, peer_addr.as_deref())
 }
 
 // ── Bearer Token Extraction ───────────────────────────────────────────────────
@@ -372,6 +354,7 @@ mod tests {
             read_limit: limit,
             write_limit: limit,
             window_secs,
+            registration_limit: 5,
         })
     }
 

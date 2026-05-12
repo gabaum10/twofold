@@ -17,21 +17,27 @@ use crate::handlers::{AppError, AppState};
 // ── Principal ────────────────────────────────────────────────────────────────
 
 /// Which credential class authenticated this request.
-#[allow(dead_code)] // variants and fields used as audit foundation; callers will expand
 pub enum PrincipalKind {
     /// Master TWOFOLD_TOKEN (environment variable).
     Admin,
-    /// In-memory OAuth access token issued to a public client.
-    OAuth { client_id: String },
+    /// SQLite-persisted OAuth access token issued to a public client.
+    OAuth {
+        /// OAuth client identifier — available for future per-client audit logging.
+        #[allow(dead_code)]
+        client_id: String,
+    },
     /// Managed token stored in the database (created via `twofold token create`).
-    Managed { name: String },
+    Managed {
+        /// Token name — available for future per-token audit logging.
+        #[allow(dead_code)]
+        name: String,
+    },
 }
 
 /// The authenticated identity of a caller.
 ///
 /// `scopes` is empty for admin and managed tokens (full access).
 /// OAuth tokens carry whatever scope was recorded in [`AccessTokenRecord`].
-#[allow(dead_code)] // fields used as audit foundation; callers will expand
 pub struct Principal {
     pub kind: PrincipalKind,
     /// Scopes granted by this credential.  Empty = full access (admin / managed).
@@ -44,7 +50,6 @@ pub struct Principal {
 impl Principal {
     /// Returns `true` if this principal holds the given scope OR has full access
     /// (i.e. `scopes` is empty, meaning no restriction was recorded).
-    #[allow(dead_code)]
     pub fn has_scope(&self, scope: &str) -> bool {
         self.scopes.is_empty() || self.scopes.iter().any(|s| s == scope)
     }
@@ -58,7 +63,6 @@ impl Principal {
     ///
     /// Admin tokens always may.  OAuth tokens must carry the `"mcp:tools"` scope.
     /// Managed tokens (empty scopes) have full access by convention.
-    #[allow(dead_code)]
     pub fn can_write(&self) -> bool {
         self.is_admin() || self.has_scope("mcp:tools")
     }
@@ -79,8 +83,8 @@ pub async fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<Princip
 /// Verification order (mirrors the previous `check_auth_token` in handlers.rs):
 ///
 /// 1. **Admin token** — constant-time compare against `TWOFOLD_TOKEN`.  O(1).
-/// 2. **In-memory OAuth access tokens** — sweep expired entries, then look up
-///    the token value and build a [`PrincipalKind::OAuth`] with the stored
+/// 2. **SQLite-persisted OAuth access tokens** — look up the token value by
+///    primary key and build a [`PrincipalKind::OAuth`] with the stored
 ///    `client_id` and `scope`.
 /// 3. **Prefix-indexed managed token** — O(1) DB lookup on first 8 chars, then
 ///    one argon2 verify in `spawn_blocking`.
@@ -99,9 +103,14 @@ pub async fn check_auth_token(state: &AppState, provided: &str) -> Result<Princi
     }
 
     // ── 2. SQLite OAuth access tokens ───────────────────────────────────────
-    // Look up the token; check expiry in-process (avoids a WHERE clause that
-    // requires WAL read, at negligible overhead for one row).
-    match state.db.get_access_token(provided) {
+    // Look up the token off the async executor; check expiry in-process.
+    let provided_for_oauth = provided.to_string();
+    let db_oauth = state.db.clone();
+    let oauth_result =
+        tokio::task::spawn_blocking(move || db_oauth.get_access_token(&provided_for_oauth))
+            .await
+            .map_err(|e| AppError::Internal(format!("Auth task failed: {e}")))?;
+    match oauth_result {
         Ok(Some(record)) => {
             let now = crate::helpers::chrono_now();
             if record.expires_at.as_str() >= now.as_str() {
@@ -130,10 +139,13 @@ pub async fn check_auth_token(state: &AppState, provided: &str) -> Result<Princi
     // ── 3. Prefix-indexed managed token ─────────────────────────────────────
     let prefix: String = provided.chars().take(8).collect();
 
-    let candidate = state
-        .db
-        .get_token_by_prefix(&prefix)
-        .map_err(|_| AppError::Internal("Failed to check tokens".to_string()))?;
+    let prefix_for_lookup = prefix.clone();
+    let db_prefix = state.db.clone();
+    let candidate =
+        tokio::task::spawn_blocking(move || db_prefix.get_token_by_prefix(&prefix_for_lookup))
+            .await
+            .map_err(|e| AppError::Internal(format!("Auth task failed: {e}")))?
+            .map_err(|_| AppError::Internal("Failed to check tokens".to_string()))?;
 
     if let Some(token_record) = candidate {
         let provided_owned = provided.to_string();
@@ -146,7 +158,12 @@ pub async fn check_auth_token(state: &AppState, provided: &str) -> Result<Princi
 
         if verified {
             let now = crate::helpers::chrono_now();
-            let _ = state.db.touch_token(&token_record.id, &now);
+            let id_owned = token_record.id.clone();
+            let now_owned = now.clone();
+            let db_touch = state.db.clone();
+            let _ =
+                tokio::task::spawn_blocking(move || db_touch.touch_token(&id_owned, &now_owned))
+                    .await;
             let name = token_record.name.clone();
             return Ok(Principal {
                 display_name: format!("managed:{name}"),
@@ -158,9 +175,10 @@ pub async fn check_auth_token(state: &AppState, provided: &str) -> Result<Princi
     }
 
     // ── 4. Legacy managed tokens (no prefix, pre-v0.4) ──────────────────────
-    let legacy_tokens = state
-        .db
-        .get_legacy_active_tokens()
+    let db_legacy = state.db.clone();
+    let legacy_tokens = tokio::task::spawn_blocking(move || db_legacy.get_legacy_active_tokens())
+        .await
+        .map_err(|e| AppError::Internal(format!("Auth task failed: {e}")))?
         .map_err(|_| AppError::Internal("Failed to check tokens".to_string()))?;
 
     if !legacy_tokens.is_empty() {
@@ -178,7 +196,8 @@ pub async fn check_auth_token(state: &AppState, provided: &str) -> Result<Princi
 
         if let Some((id, name)) = result {
             let now = crate::helpers::chrono_now();
-            let _ = state.db.touch_token(&id, &now);
+            let db_touch2 = state.db.clone();
+            let _ = tokio::task::spawn_blocking(move || db_touch2.touch_token(&id, &now)).await;
             return Ok(Principal {
                 display_name: format!("managed:{name}"),
                 kind: PrincipalKind::Managed { name },

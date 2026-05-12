@@ -1,13 +1,13 @@
-//! Document CRUD business logic. Pure functions over `&Db` + `&ServeConfig`. Shared by HTTP handlers and MCP HTTP transport.
+//! Document CRUD business logic. Async functions over `Db` + `ServeConfig`. Shared by HTTP handlers and MCP HTTP transport.
 
-// In-progress scaffolding: not yet wired into handlers or mcp_http.
-#![allow(dead_code)]
-
-/// Service layer — pure document CRUD over `&Db` and `&ServeConfig`.
+/// Service layer — async document CRUD over `Db` and `ServeConfig`.
 ///
 /// No axum extractors. No HTTP. No Principal in the function signatures where
 /// it is not needed for logic — callers supply the principal fields they need
 /// (display_name, ip_address) for audit entries.
+///
+/// All blocking SQLite work is offloaded to `tokio::task::spawn_blocking` so
+/// callers in async handler contexts do not block a Tokio worker thread.
 ///
 /// This is the single place where document business logic lives. Both the HTTP
 /// handlers and the MCP HTTP transport call into this layer. The confused-deputy
@@ -63,7 +63,7 @@ pub struct PublishResult {
 ///
 /// Returns `AppError::Conflict` if a custom slug is already in use.
 /// Returns `AppError::BadRequest` for malformed frontmatter or invalid slug.
-pub fn publish(
+pub async fn publish(
     db: &Db,
     config: &ServeConfig,
     req: PublishRequest,
@@ -120,30 +120,36 @@ pub fn publish(
         updated_at: now.clone(),
     };
 
-    // Insert with slug-collision retry.
-    let final_doc = match db.insert_document(&doc) {
-        Ok(()) => doc,
-        Err(e) if is_unique_violation(&e) => {
-            if meta.slug.is_some() {
-                return Err(AppError::Conflict(format!(
-                    "Slug '{}' is already in use",
-                    slug
-                )));
+    // Insert with slug-collision retry. Blocking SQLite work runs off the async executor.
+    let db_clone = db.clone();
+    let custom_slug = meta.slug.clone();
+    let final_doc = tokio::task::spawn_blocking(move || -> Result<DocumentRecord, AppError> {
+        match db_clone.insert_document(&doc) {
+            Ok(()) => Ok(doc),
+            Err(e) if crate::helpers::is_unique_violation(&e) => {
+                if custom_slug.is_some() {
+                    return Err(AppError::Conflict(format!(
+                        "Slug '{}' is already in use",
+                        doc.slug
+                    )));
+                }
+                let new_slug = nanoid::nanoid!(10, &SLUG_ALPHABET);
+                let retry_doc = DocumentRecord {
+                    id: new_slug.clone(),
+                    slug: new_slug.clone(),
+                    ..doc
+                };
+                db_clone.insert_document(&retry_doc).map_err(|e2| {
+                    tracing::error!(error = %e2, "Slug collision retry failed");
+                    AppError::Internal("Failed to allocate unique slug".to_string())
+                })?;
+                Ok(retry_doc)
             }
-            let new_slug = nanoid::nanoid!(10, &SLUG_ALPHABET);
-            let retry_doc = DocumentRecord {
-                id: new_slug.clone(),
-                slug: new_slug.clone(),
-                ..doc
-            };
-            db.insert_document(&retry_doc).map_err(|e2| {
-                tracing::error!(error = %e2, "Slug collision retry failed");
-                AppError::Internal("Failed to allocate unique slug".to_string())
-            })?;
-            retry_doc
+            Err(e) => Err(AppError::from(e)),
         }
-        Err(e) => return Err(AppError::from(e)),
-    };
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("Task failed: {e}")))??;
 
     let base = config.base_url.trim_end_matches('/');
     let url = format!("{base}/{}", final_doc.slug);
@@ -174,9 +180,13 @@ pub fn publish(
         token_name: req.principal.display_name,
         ip_address: req.client_ip,
     };
-    if let Err(e) = db.insert_audit_entry(&audit_entry) {
-        tracing::error!(error = %e, "Failed to write audit entry");
-    }
+    let db_clone2 = db.clone();
+    // Fire-and-forget: errors are logged in the map_err closures; the Result is intentionally discarded.
+    tokio::task::spawn_blocking(move || db_clone2.insert_audit_entry(&audit_entry))
+        .await
+        .map_err(|e| tracing::error!(error = %e, "Audit task panicked"))
+        .and_then(|r| r.map_err(|e| tracing::error!(error = %e, "Failed to write audit entry")))
+        .ok();
 
     Ok(PublishResult {
         slug: final_doc.slug,
@@ -195,7 +205,7 @@ pub fn publish(
 ///
 /// Returns `AppError::NotFound` if the slug does not exist.
 /// Returns `AppError::Gone` if the document has expired.
-pub fn update(
+pub async fn update(
     db: &Db,
     config: &ServeConfig,
     slug: &str,
@@ -207,9 +217,16 @@ pub fn update(
         ));
     }
 
-    let existing = db.get_by_slug(slug)?.ok_or(AppError::NotFound)?;
+    // Fetch the existing document off the executor.
+    let slug_owned = slug.to_string();
+    let db_clone = db.clone();
+    let existing = tokio::task::spawn_blocking(move || db_clone.get_by_slug(&slug_owned))
+        .await
+        .map_err(|e| AppError::Internal(format!("Task failed: {e}")))?
+        .map_err(AppError::from)?
+        .ok_or(AppError::NotFound)?;
 
-    if is_expired_doc(&existing) {
+    if crate::helpers::is_expired(&existing) {
         return Err(AppError::Gone);
     }
 
@@ -239,7 +256,7 @@ pub fn update(
     };
 
     let updated_doc = DocumentRecord {
-        id: existing.id,
+        id: existing.id.clone(),
         slug: slug.to_string(),
         title: title.clone(),
         raw_content: req.raw_content,
@@ -251,7 +268,16 @@ pub fn update(
         updated_at: now.clone(),
     };
 
-    db.update_document(slug, &updated_doc)?;
+    // Write the update off the executor.
+    let db_clone2 = db.clone();
+    let slug_owned2 = slug.to_string();
+    let updated_doc_clone = updated_doc.clone();
+    tokio::task::spawn_blocking(move || {
+        db_clone2.update_document(&slug_owned2, &updated_doc_clone)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("Task failed: {e}")))?
+    .map_err(AppError::from)?;
 
     let base = config.base_url.trim_end_matches('/');
     let url = format!("{base}/{slug}");
@@ -282,9 +308,13 @@ pub fn update(
         token_name: req.principal.display_name,
         ip_address: req.client_ip,
     };
-    if let Err(e) = db.insert_audit_entry(&audit_entry) {
-        tracing::error!(error = %e, "Failed to write audit entry");
-    }
+    let db_clone3 = db.clone();
+    // Fire-and-forget: errors are logged in the map_err closures; the Result is intentionally discarded.
+    tokio::task::spawn_blocking(move || db_clone3.insert_audit_entry(&audit_entry))
+        .await
+        .map_err(|e| tracing::error!(error = %e, "Audit task panicked"))
+        .and_then(|r| r.map_err(|e| tracing::error!(error = %e, "Failed to write audit entry")))
+        .ok();
 
     Ok(PublishResult {
         slug: slug.to_string(),
@@ -303,16 +333,27 @@ pub fn update(
 ///
 /// Returns `AppError::NotFound` if the slug does not exist.
 /// Expired documents are deleted regardless of expiry status.
-pub fn delete(
+pub async fn delete(
     db: &Db,
     config: &ServeConfig,
     slug: &str,
     principal: &Principal,
     client_ip: &str,
 ) -> Result<(), AppError> {
-    let existing = db.get_by_slug(slug)?.ok_or(AppError::NotFound)?;
-
-    db.delete_by_slug(slug)?;
+    // Fetch + delete off the executor in one spawn_blocking.
+    let slug_owned = slug.to_string();
+    let db_clone = db.clone();
+    let existing = tokio::task::spawn_blocking(move || {
+        let existing = db_clone
+            .get_by_slug(&slug_owned)?
+            .ok_or(AppError::NotFound)?;
+        db_clone
+            .delete_by_slug(&slug_owned)
+            .map_err(AppError::from)?;
+        Ok::<_, AppError>(existing)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("Task failed: {e}")))??;
 
     let now = crate::helpers::chrono_now();
 
@@ -342,9 +383,13 @@ pub fn delete(
         token_name: principal.display_name.clone(),
         ip_address: client_ip.to_string(),
     };
-    if let Err(e) = db.insert_audit_entry(&audit_entry) {
-        tracing::error!(error = %e, "Failed to write audit entry");
-    }
+    let db_clone2 = db.clone();
+    // Fire-and-forget: errors are logged in the map_err closures; the Result is intentionally discarded.
+    tokio::task::spawn_blocking(move || db_clone2.insert_audit_entry(&audit_entry))
+        .await
+        .map_err(|e| tracing::error!(error = %e, "Audit task panicked"))
+        .and_then(|r| r.map_err(|e| tracing::error!(error = %e, "Failed to write audit entry")))
+        .ok();
 
     Ok(())
 }
@@ -355,9 +400,15 @@ pub fn delete(
 ///
 /// Returns `AppError::NotFound` if the slug does not exist.
 /// Returns `AppError::Gone` if the document has expired.
-pub fn get(db: &Db, slug: &str) -> Result<DocumentRecord, AppError> {
-    let doc = db.get_by_slug(slug)?.ok_or(AppError::NotFound)?;
-    if is_expired_doc(&doc) {
+pub async fn get(db: &Db, slug: &str) -> Result<DocumentRecord, AppError> {
+    let slug_owned = slug.to_string();
+    let db_clone = db.clone();
+    let doc = tokio::task::spawn_blocking(move || db_clone.get_by_slug(&slug_owned))
+        .await
+        .map_err(|e| AppError::Internal(format!("Task failed: {e}")))?
+        .map_err(AppError::from)?
+        .ok_or(AppError::NotFound)?;
+    if crate::helpers::is_expired(&doc) {
         return Err(AppError::Gone);
     }
     Ok(doc)
@@ -368,27 +419,21 @@ pub fn get(db: &Db, slug: &str) -> Result<DocumentRecord, AppError> {
 /// List documents with pagination.
 ///
 /// Limit is capped at 100 server-side by the db layer.
-pub fn list(db: &Db, limit: u32, offset: u32) -> Result<(Vec<DocumentSummary>, u64), AppError> {
-    db.list_documents(limit, offset).map_err(AppError::from)
+pub async fn list(
+    db: &Db,
+    limit: u32,
+    offset: u32,
+) -> Result<(Vec<DocumentSummary>, u64), AppError> {
+    let db_clone = db.clone();
+    tokio::task::spawn_blocking(move || db_clone.list_documents(limit, offset))
+        .await
+        .map_err(|e| AppError::Internal(format!("Task failed: {e}")))?
+        .map_err(AppError::from)
 }
 
 // ── internal helpers ──────────────────────────────────────────────────────────
 
-fn is_expired_doc(doc: &DocumentRecord) -> bool {
-    match &doc.expires_at {
-        Some(exp) => exp.as_str() < crate::helpers::chrono_now().as_str(),
-        None => false,
-    }
-}
-
 fn add_seconds_to_now(seconds: u64) -> String {
     let future = chrono::Utc::now() + chrono::Duration::seconds(seconds as i64);
     future.format("%Y-%m-%dT%H:%M:%SZ").to_string()
-}
-
-fn is_unique_violation(e: &rusqlite::Error) -> bool {
-    matches!(
-        e,
-        rusqlite::Error::SqliteFailure(err, _) if err.code == rusqlite::ErrorCode::ConstraintViolation
-    )
 }

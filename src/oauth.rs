@@ -121,24 +121,24 @@ pub async fn handle_register(
         .unwrap_or_else(|| "none".to_string());
     let client_id = new_uuid();
     let now = chrono_now();
-    // Compute the cutoff for the 24-hour expiry sweep (RFC 3339, lexicographic-safe).
+    // Compute the cutoff for the 24-hour active-client window (RFC 3339, lexicographic-safe).
+    // The reaper handles periodic sweeps of expired clients; we only count here.
     let cutoff_24h = {
         let cutoff = chrono::Utc::now() - chrono::Duration::hours(24);
         cutoff.format("%Y-%m-%dT%H:%M:%SZ").to_string()
     };
 
-    // Sweep registrations older than 24 hours before checking the size cap.
-    // Legitimate clients that need to re-register simply do so; stale entries
-    // from spam or one-off tools are cleaned up automatically.
-    if let Err(e) = state.db.delete_expired_oauth_clients(&cutoff_24h) {
-        tracing::warn!(error = %e, "Failed to sweep expired OAuth clients");
-    }
-
     // Hard cap: refuse new registrations if there are already 1,000 active entries.
     // This prevents storage exhaustion from registration spam that slips past
     // the rate limiter (e.g., distributed sources).
-    match state.db.count_active_oauth_clients(&cutoff_24h) {
-        Ok(count) if count >= 1_000 => {
+    let db_cap = state.db.clone();
+    let cutoff_for_cap = cutoff_24h.clone();
+    let cap_result =
+        tokio::task::spawn_blocking(move || db_cap.count_active_oauth_clients(&cutoff_for_cap))
+            .await;
+
+    match cap_result {
+        Ok(Ok(count)) if count >= 1_000 => {
             tracing::warn!(
                 "OAuth client registration limit reached ({} entries)",
                 count
@@ -152,8 +152,19 @@ pub async fn handle_register(
             )
                 .into_response();
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::error!(error = %e, "Failed to count OAuth clients");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "server_error",
+                    "error_description": "Database error"
+                })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "OAuth registration count task panicked");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
@@ -175,7 +186,15 @@ pub async fn handle_register(
         token_endpoint_auth_method: token_endpoint_auth_method.clone(),
         created_at: now,
     };
-    if let Err(e) = state.db.insert_oauth_client(&row) {
+    let db_clone = state.db.clone();
+    if let Err(e) = tokio::task::spawn_blocking(move || db_clone.insert_oauth_client(&row))
+        .await
+        .unwrap_or_else(|e| {
+            Err(rusqlite::Error::InvalidPath(std::path::PathBuf::from(
+                format!("task panicked: {e}"),
+            )))
+        })
+    {
         tracing::error!(error = %e, "Failed to insert OAuth client");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -292,8 +311,14 @@ pub async fn handle_authorize(
 
     // Validate client_id and redirect_uri against registered clients.
     // For unregistered clients (admin-token-backed), still validate redirect_uri format.
-    match state.db.get_oauth_client(&client_id) {
-        Ok(Some(client)) => {
+    // Runs off the async executor.
+    let db_lookup = state.db.clone();
+    let client_id_for_lookup = client_id.clone();
+    let client_lookup =
+        tokio::task::spawn_blocking(move || db_lookup.get_oauth_client(&client_id_for_lookup))
+            .await;
+    match client_lookup {
+        Ok(Ok(Some(client))) => {
             // Registered client: redirect_uri must be in the allowed list.
             let uris: Vec<String> = serde_json::from_str(&client.redirect_uris).unwrap_or_default();
             if !uris.contains(&redirect_uri) {
@@ -307,7 +332,7 @@ pub async fn handle_authorize(
                     .into_response();
             }
         }
-        Ok(None) => {
+        Ok(Ok(None)) => {
             // Pre-registered / admin-token client: require HTTPS unless localhost.
             if !is_safe_redirect_uri(&redirect_uri) {
                 return (
@@ -321,8 +346,19 @@ pub async fn handle_authorize(
                     .into_response();
             }
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::error!(error = %e, "Failed to look up OAuth client");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(OAuthError {
+                    error: "server_error",
+                    error_description: "Database error",
+                }),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "OAuth client lookup task panicked");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(OAuthError {
@@ -344,7 +380,7 @@ pub async fn handle_authorize(
         let future = chrono::Utc::now() + chrono::Duration::minutes(5);
         future.format("%Y-%m-%dT%H:%M:%SZ").to_string()
     };
-    if let Err(e) = state.db.insert_auth_code(&AuthCodeRow {
+    let auth_code_row = AuthCodeRow {
         code: code.clone(),
         client_id: client_id.clone(),
         redirect_uri: redirect_uri.clone(),
@@ -352,7 +388,16 @@ pub async fn handle_authorize(
         code_challenge,
         resource: params.resource.clone(),
         scope: params.scope.clone(),
-    }) {
+    };
+    let db_insert = state.db.clone();
+    if let Err(e) = tokio::task::spawn_blocking(move || db_insert.insert_auth_code(&auth_code_row))
+        .await
+        .unwrap_or_else(|e| {
+            Err(rusqlite::Error::InvalidPath(std::path::PathBuf::from(
+                format!("task panicked: {e}"),
+            )))
+        })
+    {
         tracing::error!(error = %e, "Failed to insert auth code");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -488,24 +533,38 @@ async fn handle_authorization_code(state: AppState, req: TokenRequest) -> Respon
         Some(v) if !v.is_empty() => v.to_string(),
         _ => return invalid_request("code_verifier is required (PKCE mandatory)"),
     };
-    let record = match state.db.take_auth_code(&code) {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            tracing::warn!(client_id = %client_id, "OAuth authorization_code not found");
-            return invalid_grant("Authorization code not found or already used");
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to take auth code");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": "server_error",
-                    "error_description": "Database error"
-                })),
-            )
-                .into_response();
-        }
-    };
+    let db_take = state.db.clone();
+    let code_for_take = code.clone();
+    let record =
+        match tokio::task::spawn_blocking(move || db_take.take_auth_code(&code_for_take)).await {
+            Ok(Ok(Some(r))) => r,
+            Ok(Ok(None)) => {
+                tracing::warn!(client_id = %client_id, "OAuth authorization_code not found");
+                return invalid_grant("Authorization code not found or already used");
+            }
+            Ok(Err(e)) => {
+                tracing::error!(error = %e, "Failed to take auth code");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "server_error",
+                        "error_description": "Database error"
+                    })),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Auth code take task panicked");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "server_error",
+                        "error_description": "Database error"
+                    })),
+                )
+                    .into_response();
+            }
+        };
     let now = chrono_now();
     if record.expires_at.as_str() < now.as_str() {
         tracing::warn!(client_id = %client_id, "OAuth authorization_code expired");
@@ -539,11 +598,28 @@ async fn handle_authorization_code(state: AppState, req: TokenRequest) -> Respon
         tracing::warn!(client_id = %client_id, "OAuth PKCE verification failed");
         return invalid_grant("code_verifier does not match code_challenge");
     }
-    let is_public_client = match state.db.get_oauth_client(&client_id) {
-        Ok(Some(c)) => c.token_endpoint_auth_method == "none",
-        Ok(None) => false,
-        Err(e) => {
+    let db_client = state.db.clone();
+    let client_id_for_lookup = client_id.clone();
+    let is_public_client = match tokio::task::spawn_blocking(move || {
+        db_client.get_oauth_client(&client_id_for_lookup)
+    })
+    .await
+    {
+        Ok(Ok(Some(c))) => c.token_endpoint_auth_method == "none",
+        Ok(Ok(None)) => false,
+        Ok(Err(e)) => {
             tracing::error!(error = %e, "Failed to look up OAuth client");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "server_error",
+                    "error_description": "Database error"
+                })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "OAuth client lookup task panicked");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
@@ -560,12 +636,21 @@ async fn handle_authorization_code(state: AppState, req: TokenRequest) -> Respon
             let future = chrono::Utc::now() + chrono::Duration::hours(1);
             future.format("%Y-%m-%dT%H:%M:%SZ").to_string()
         };
-        if let Err(e) = state.db.insert_access_token(&AccessTokenRow {
+        let at_row = AccessTokenRow {
             token: at.clone(),
             client_id: client_id.clone(),
             scope: record.scope.clone(),
             expires_at: at_expires,
-        }) {
+        };
+        let db_at = state.db.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || db_at.insert_access_token(&at_row))
+            .await
+            .unwrap_or_else(|e| {
+                Err(rusqlite::Error::InvalidPath(std::path::PathBuf::from(
+                    format!("task panicked: {e}"),
+                )))
+            })
+        {
             tracing::error!(error = %e, "Failed to insert access token");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -601,13 +686,22 @@ async fn handle_authorization_code(state: AppState, req: TokenRequest) -> Respon
             let future = chrono::Utc::now() + chrono::Duration::days(30);
             future.format("%Y-%m-%dT%H:%M:%SZ").to_string()
         };
-        if let Err(e) = state.db.insert_refresh_token(&RefreshTokenRow {
+        let rt_row = RefreshTokenRow {
             token: rt.clone(),
             client_id: client_id.clone(),
             access_token: access_token.clone(),
             scope: record.scope.clone(),
             expires_at: rt_expires,
-        }) {
+        };
+        let db_rt = state.db.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || db_rt.insert_refresh_token(&rt_row))
+            .await
+            .unwrap_or_else(|e| {
+                Err(rusqlite::Error::InvalidPath(std::path::PathBuf::from(
+                    format!("task panicked: {e}"),
+                )))
+            })
+        {
             tracing::error!(error = %e, "Failed to insert refresh token");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -645,14 +739,31 @@ async fn handle_refresh_token(state: AppState, req: TokenRequest) -> Response {
         Some(id) if !id.is_empty() => id.to_string(),
         _ => return invalid_request("client_id is required"),
     };
-    let record = match state.db.take_refresh_token(&rt_value) {
-        Ok(Some(r)) => r,
-        Ok(None) => {
+    let db_take_rt = state.db.clone();
+    let rt_for_take = rt_value.clone();
+    let record = match tokio::task::spawn_blocking(move || {
+        db_take_rt.take_refresh_token(&rt_for_take)
+    })
+    .await
+    {
+        Ok(Ok(Some(r))) => r,
+        Ok(Ok(None)) => {
             tracing::warn!(client_id = %client_id, "OAuth refresh_token not found");
             return invalid_grant("Refresh token not found or already used");
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::error!(error = %e, "Failed to take refresh token");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "server_error",
+                    "error_description": "Database error"
+                })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Refresh token take task panicked");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
@@ -672,33 +783,59 @@ async fn handle_refresh_token(state: AppState, req: TokenRequest) -> Response {
         tracing::warn!(client_id = %client_id, "OAuth refresh_token client_id mismatch");
         return invalid_grant("client_id does not match refresh token");
     }
-    let is_public_client = match state.db.get_oauth_client(&client_id) {
-        Ok(Some(c)) => c.token_endpoint_auth_method == "none",
-        Ok(None) => false,
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to look up OAuth client");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": "server_error",
-                    "error_description": "Database error"
-                })),
-            )
-                .into_response();
-        }
-    };
+    let db_client_rt = state.db.clone();
+    let client_id_for_rt = client_id.clone();
+    let is_public_client =
+        match tokio::task::spawn_blocking(move || db_client_rt.get_oauth_client(&client_id_for_rt))
+            .await
+        {
+            Ok(Ok(Some(c))) => c.token_endpoint_auth_method == "none",
+            Ok(Ok(None)) => false,
+            Ok(Err(e)) => {
+                tracing::error!(error = %e, "Failed to look up OAuth client");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "server_error",
+                        "error_description": "Database error"
+                    })),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "OAuth client lookup task panicked");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "server_error",
+                        "error_description": "Database error"
+                    })),
+                )
+                    .into_response();
+            }
+        };
     let access_token = if is_public_client {
         let at = new_uuid();
         let at_expires = {
             let future = chrono::Utc::now() + chrono::Duration::hours(1);
             future.format("%Y-%m-%dT%H:%M:%SZ").to_string()
         };
-        if let Err(e) = state.db.insert_access_token(&AccessTokenRow {
+        let at_row_rt = AccessTokenRow {
             token: at.clone(),
             client_id: client_id.clone(),
             scope: record.scope.clone(),
             expires_at: at_expires,
-        }) {
+        };
+        let db_at_rt = state.db.clone();
+        if let Err(e) =
+            tokio::task::spawn_blocking(move || db_at_rt.insert_access_token(&at_row_rt))
+                .await
+                .unwrap_or_else(|e| {
+                    Err(rusqlite::Error::InvalidPath(std::path::PathBuf::from(
+                        format!("task panicked: {e}"),
+                    )))
+                })
+        {
             tracing::error!(error = %e, "Failed to insert access token");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -725,13 +862,22 @@ async fn handle_refresh_token(state: AppState, req: TokenRequest) -> Response {
         let future = chrono::Utc::now() + chrono::Duration::days(30);
         future.format("%Y-%m-%dT%H:%M:%SZ").to_string()
     };
-    if let Err(e) = state.db.insert_refresh_token(&RefreshTokenRow {
+    let new_rt_row = RefreshTokenRow {
         token: new_rt.clone(),
         client_id: client_id.clone(),
         access_token: access_token.clone(),
         scope: record.scope.clone(),
         expires_at: new_rt_expires,
-    }) {
+    };
+    let db_new_rt = state.db.clone();
+    if let Err(e) = tokio::task::spawn_blocking(move || db_new_rt.insert_refresh_token(&new_rt_row))
+        .await
+        .unwrap_or_else(|e| {
+            Err(rusqlite::Error::InvalidPath(std::path::PathBuf::from(
+                format!("task panicked: {e}"),
+            )))
+        })
+    {
         tracing::error!(error = %e, "Failed to insert refresh token");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1043,6 +1189,7 @@ mod tests {
             rate_limit_read: 10_000,
             rate_limit_write: 10_000,
             rate_limit_window: 60,
+            registration_limit: 5,
         };
         let rate_limit = crate::rate_limit::RateLimitStore::new(&config);
         let state = crate::handlers::AppState {
@@ -1463,6 +1610,7 @@ mod tests {
             rate_limit_read: 10_000,
             rate_limit_write: 10_000,
             rate_limit_window: 60,
+            registration_limit: 5,
         };
         let rate_limit = crate::rate_limit::RateLimitStore::new(&config);
 
@@ -1620,6 +1768,7 @@ mod tests {
             rate_limit_read: 10_000,
             rate_limit_write: 10_000,
             rate_limit_window: 60,
+            registration_limit: 5,
         };
         let rate_limit = crate::rate_limit::RateLimitStore::new(&config);
 

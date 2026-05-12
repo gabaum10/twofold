@@ -107,7 +107,6 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
 // ── Database helpers ──────────────────────────────────────────────────────────
 
 /// Check whether a rusqlite error is a UNIQUE constraint violation.
-#[allow(dead_code)]
 pub fn is_unique_violation(e: &rusqlite::Error) -> bool {
     matches!(
         e,

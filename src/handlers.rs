@@ -150,6 +150,9 @@ pub async fn post_document(
 ) -> Result<Response, AppError> {
     // Auth FIRST — 401 before 400/413
     let principal = check_auth(&state, &headers).await?;
+    if !principal.can_write() {
+        return Err(AppError::Forbidden);
+    }
     let peer_addr = connect_info.map(|c| c.0.ip().to_string());
     let client_ip = extract_client_ip(&headers, peer_addr.as_deref());
 
@@ -163,13 +166,7 @@ pub async fn post_document(
         client_ip,
     };
 
-    let result = tokio::task::spawn_blocking({
-        let db = state.db.clone();
-        let config = state.config.clone();
-        move || crate::service::publish(&db, &config, req)
-    })
-    .await
-    .map_err(|e| AppError::Internal(format!("Task failed: {e}")))??;
+    let result = crate::service::publish(&state.db, &state.config, req).await?;
 
     let response = CreateResponse {
         url: result.url,
@@ -198,6 +195,9 @@ pub async fn put_document(
     body: Bytes,
 ) -> Result<Response, AppError> {
     let principal = check_auth(&state, &headers).await?;
+    if !principal.can_write() {
+        return Err(AppError::Forbidden);
+    }
     let peer_addr = connect_info.map(|c| c.0.ip().to_string());
     let client_ip = extract_client_ip(&headers, peer_addr.as_deref());
 
@@ -211,13 +211,7 @@ pub async fn put_document(
         client_ip,
     };
 
-    let result = tokio::task::spawn_blocking({
-        let db = state.db.clone();
-        let config = state.config.clone();
-        move || crate::service::update(&db, &config, &slug, req)
-    })
-    .await
-    .map_err(|e| AppError::Internal(format!("Task failed: {e}")))??;
+    let result = crate::service::update(&state.db, &state.config, &slug, req).await?;
 
     let response = CreateResponse {
         url: result.url,
@@ -245,16 +239,13 @@ pub async fn delete_document(
     connect_info: Option<ConnectInfo<SocketAddr>>,
 ) -> Result<Response, AppError> {
     let principal = check_auth(&state, &headers).await?;
+    if !principal.can_write() {
+        return Err(AppError::Forbidden);
+    }
     let peer_addr = connect_info.map(|c| c.0.ip().to_string());
     let client_ip = extract_client_ip(&headers, peer_addr.as_deref());
 
-    tokio::task::spawn_blocking({
-        let db = state.db.clone();
-        let config = state.config.clone();
-        move || crate::service::delete(&db, &config, &slug, &principal, &client_ip)
-    })
-    .await
-    .map_err(|e| AppError::Internal(format!("Task failed: {e}")))??;
+    crate::service::delete(&state.db, &state.config, &slug, &principal, &client_ip).await?;
 
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -277,7 +268,7 @@ pub async fn list_documents(
     let limit = params.limit.unwrap_or(20);
     let offset = params.offset.unwrap_or(0);
 
-    let (documents, total) = crate::service::list(&state.db, limit, offset)?;
+    let (documents, total) = crate::service::list(&state.db, limit, offset).await?;
 
     let effective_limit = limit.min(100);
 
@@ -310,10 +301,12 @@ pub async fn list_audit(
     let limit = params.limit.unwrap_or(20);
     let offset = params.offset.unwrap_or(0);
 
-    let (entries, total) = state
-        .db
-        .list_audit_entries(limit, offset)
-        .map_err(AppError::from)?;
+    let db_clone = state.db.clone();
+    let (entries, total) =
+        tokio::task::spawn_blocking(move || db_clone.list_audit_entries(limit, offset))
+            .await
+            .map_err(|e| AppError::Internal(format!("Task failed: {e}")))?
+            .map_err(AppError::from)?;
 
     let effective_limit = limit.min(100);
 
@@ -335,7 +328,11 @@ pub async fn list_audit(
 ///
 /// The db check executes a trivial `SELECT 1` to verify the connection is live.
 pub async fn health_check(State(state): State<AppState>) -> Response {
-    let db_ok = state.db.ping().is_ok();
+    let db_clone = state.db.clone();
+    let db_ok = tokio::task::spawn_blocking(move || db_clone.ping())
+        .await
+        .map(|r| r.is_ok())
+        .unwrap_or(false);
     if db_ok {
         (
             StatusCode::OK,
@@ -457,6 +454,7 @@ mod tests {
             rate_limit_read: 1000,
             rate_limit_write: 1000,
             rate_limit_window: 60,
+            registration_limit: 5,
         };
         let rate_limit = crate::rate_limit::RateLimitStore::new(&config);
         let state = AppState {
@@ -493,6 +491,7 @@ mod tests {
             rate_limit_read: 1000,
             rate_limit_write: 1000,
             rate_limit_window: 60,
+            registration_limit: 5,
         }
     }
 
@@ -581,6 +580,7 @@ mod tests {
             rate_limit_read: 10000,
             rate_limit_write: 10000,
             rate_limit_window: 60,
+            registration_limit: 5,
         };
         let rate_limit = crate::rate_limit::RateLimitStore::new(&config);
         let state = AppState {
@@ -919,6 +919,7 @@ mod tests {
             rate_limit_read: 10000,
             rate_limit_write: 10000,
             rate_limit_window: 60,
+            registration_limit: 5,
         };
         let rate_limit = crate::rate_limit::RateLimitStore::new(&config);
         let state = AppState {

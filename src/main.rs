@@ -122,8 +122,10 @@ async fn run_server() {
     // days ago, giving the 410 page a 30-day window before the tombstone is
     // discarded.
     //
-    // OAuth strategy: hard-delete expired auth codes, access tokens, and refresh
-    // tokens immediately — they serve no purpose once expired.
+    // OAuth strategy: hard-delete expired auth codes, access tokens, refresh
+    // tokens, and registered clients on each reaper tick — they serve no
+    // purpose once expired. Client sweeps previously ran per-request in the
+    // registration handler; that was wasteful and has been moved here.
     let reaper_db = db.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(reaper_interval));
@@ -137,22 +139,35 @@ async fn run_server() {
                 let auth_code_count = db_clone.delete_expired_auth_codes(&now)?;
                 let at_count = db_clone.delete_expired_access_tokens(&now)?;
                 let rt_count = db_clone.delete_expired_refresh_tokens(&now)?;
-                Ok::<_, rusqlite::Error>((doc_count, auth_code_count, at_count, rt_count))
+                // Sweep OAuth clients registered more than 24 hours ago.
+                let client_cutoff = {
+                    let cutoff = chrono::Utc::now() - chrono::Duration::hours(24);
+                    cutoff.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+                };
+                let client_count = db_clone.delete_expired_oauth_clients(&client_cutoff)?;
+                Ok::<_, rusqlite::Error>((
+                    doc_count,
+                    auth_code_count,
+                    at_count,
+                    rt_count,
+                    client_count,
+                ))
             })
             .await;
             match result {
-                Ok(Ok((docs, auth_codes, ats, rts))) => {
+                Ok(Ok((docs, auth_codes, ats, rts, clients))) => {
                     if docs > 0 {
                         tracing::info!(
                             count = docs,
                             "Reaper garbage-collected tombstones older than 30 days"
                         );
                     }
-                    if auth_codes + ats + rts > 0 {
+                    if auth_codes + ats + rts + clients > 0 {
                         tracing::debug!(
                             auth_codes,
                             access_tokens = ats,
                             refresh_tokens = rts,
+                            oauth_clients = clients,
                             "Reaper swept expired OAuth state"
                         );
                     }
@@ -241,11 +256,12 @@ async fn run_server() {
         ))
         .layer(DefaultBodyLimit::max(max_size));
 
-    // MCP HTTP transport — NOT behind DefaultBodyLimit (JSON-RPC payloads can
-    // be large for publish operations). Auth is handled inside the handler.
+    // MCP HTTP transport — 10 MB body limit to accommodate large markdown payloads
+    // while preventing unbounded memory allocation. Auth is handled inside the handler.
+    const MCP_MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
     let mcp_router = Router::new()
         .route("/mcp", post(mcp_http::handle_mcp_post))
-        .layer(DefaultBodyLimit::disable());
+        .layer(DefaultBodyLimit::max(MCP_MAX_BODY_BYTES));
 
     let app = app
         .merge(mcp_router)

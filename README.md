@@ -150,8 +150,8 @@ Runs on stdio (JSON-RPC, newline-delimited). Wire it into Claude Code or any MCP
 
 | Tool | Description |
 |------|-------------|
-| `twofold_publish` | Publish markdown. Accepts `content` (required), `title`, `slug`, `expiry`, `theme`, `description`. Returns URL and slug. |
-| `twofold_update` | Update a document by slug. Accepts `slug` (required), `content` (required), `title`, `description`, `expiry`, `theme`. |
+| `twofold_publish` | Publish markdown. Accepts `content` (required), `title`, `slug`, `expiry`, `theme`, `description`, `agent_content`, `password`. Returns URL and slug. |
+| `twofold_update` | Update a document by slug. Accepts `slug` (required), `content` (required), `title`, `description`, `expiry`, `theme`, `agent_content`, `password`. |
 | `twofold_get` | Retrieve raw markdown by slug. |
 | `twofold_list` | List published documents. Optional `limit` (default 20, max 100). |
 | `twofold_delete` | Delete a document by slug. |
@@ -297,8 +297,8 @@ Twofold applies fixed-window rate limits to protect against abuse. Limits are pe
 
 | Type | Default | Env var |
 |------|---------|---------|
-| Read (per IP) | 60 req/min | `TWOFOLD_READ_RATE_LIMIT` |
-| Write (per token) | 30 req/min | `TWOFOLD_WRITE_RATE_LIMIT` |
+| Read (per IP) | 60 req/min | `TWOFOLD_RATE_LIMIT_READ` |
+| Write (per token) | 30 req/min | `TWOFOLD_RATE_LIMIT_WRITE` |
 | OAuth registration (per IP) | 5 req/window | `TWOFOLD_REGISTRATION_LIMIT` |
 | Window size | 60 seconds | `TWOFOLD_RATE_LIMIT_WINDOW` |
 
@@ -434,8 +434,8 @@ All config is via environment variables. No config files.
 | `TWOFOLD_DEFAULT_THEME` | `clean` | Default theme when none specified |
 | `TWOFOLD_WEBHOOK_URL` | -- | Webhook endpoint (no webhook if unset) |
 | `TWOFOLD_WEBHOOK_SECRET` | -- | HMAC-SHA256 signing secret for webhooks |
-| `TWOFOLD_READ_RATE_LIMIT` | `60` | Max read requests per IP per window |
-| `TWOFOLD_WRITE_RATE_LIMIT` | `30` | Max write requests per token per window |
+| `TWOFOLD_RATE_LIMIT_READ` | `60` | Max read requests per IP per window |
+| `TWOFOLD_RATE_LIMIT_WRITE` | `30` | Max write requests per token per window |
 | `TWOFOLD_RATE_LIMIT_WINDOW` | `60` | Rate limit window size in seconds |
 | `TWOFOLD_REGISTRATION_LIMIT` | `5` | Max OAuth registrations per IP per window |
 | `TWOFOLD_MCP_SERVER` | `http://localhost:3000` | Target server for MCP stdio client |

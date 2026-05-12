@@ -32,8 +32,8 @@ Twofold accepts markdown documents with optional `<!-- @agent -->` / `<!-- @end 
 | `src/auth.rs` | `Principal` type, `PrincipalKind` (Admin/OAuth/Managed), bearer extraction, constant-time comparison, `check_auth` / `check_auth_token` |
 | `src/service.rs` | Document CRUD business logic — pure functions over `&Db` + `&ServeConfig`, no axum extractors; shared by HTTP handlers and MCP HTTP transport |
 | `src/handlers.rs` | HTTP handlers, `AppState`, `AppError`, password flow, theme rendering, audit log endpoint |
-| `src/views.rs` | Read and render handlers (split from handlers.rs — may be in progress) |
-| `src/helpers.rs` | Shared handler utilities (split from handlers.rs — may be in progress) |
+| `src/views.rs` | Read and render handlers |
+| `src/helpers.rs` | Shared handler utilities |
 | `src/oauth.rs` | OAuth 2.0 server: Authorization Code + PKCE, dynamic client registration, refresh rotation, SQLite-backed token store |
 | `src/mcp.rs` | MCP stdio transport — raw JSON-RPC over stdin/stdout; acts as HTTP client to the running server |
 | `src/mcp_http.rs` | MCP HTTP transport — `POST /mcp`; dispatches tool calls directly to the service layer; no loopback |
@@ -159,8 +159,8 @@ TWOFOLD_WEBHOOK_URL="https://..."    # Webhook endpoint (disabled if unset)
 TWOFOLD_WEBHOOK_SECRET="secret"      # HMAC-SHA256 signing secret (optional)
 
 # Rate limiting
-TWOFOLD_READ_RATE_LIMIT="60"         # Reads per IP per window (default: 60)
-TWOFOLD_WRITE_RATE_LIMIT="30"        # Writes per token per window (default: 30)
+TWOFOLD_RATE_LIMIT_READ="60"         # Reads per IP per window (default: 60)
+TWOFOLD_RATE_LIMIT_WRITE="30"        # Writes per token per window (default: 30)
 TWOFOLD_RATE_LIMIT_WINDOW="60"       # Window size in seconds (default: 60)
 TWOFOLD_REGISTRATION_LIMIT="5"       # OAuth registrations per IP per window (default: 5)
 

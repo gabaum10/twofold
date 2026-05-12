@@ -154,8 +154,8 @@ async fn call_tool(
 ) -> Value {
     match tool_name {
         "twofold_publish" => tool_publish(state, principal, args).await,
-        "twofold_get" => tool_get(state, args),
-        "twofold_list" => tool_list(state, args),
+        "twofold_get" => tool_get(state, args).await,
+        "twofold_list" => tool_list(state, args).await,
         "twofold_delete" => tool_delete(state, principal, args).await,
         "twofold_update" => tool_update(state, principal, args).await,
         _ => tool_result_err(format!("Unknown tool: {tool_name}")),
@@ -165,6 +165,9 @@ async fn call_tool(
 // ── Tool implementations ──────────────────────────────────────────────────────
 
 async fn tool_publish(state: &AppState, principal: crate::auth::Principal, args: &Value) -> Value {
+    if !principal.can_write() {
+        return tool_result_err("Forbidden: token does not have write access".to_string());
+    }
     let content = match args.get("content").and_then(|v| v.as_str()) {
         Some(c) => c,
         None => return tool_result_err("Missing required argument: content".to_string()),
@@ -199,7 +202,7 @@ async fn tool_publish(state: &AppState, principal: crate::auth::Principal, args:
         client_ip: "mcp".to_string(),
     };
 
-    match service::publish(&state.db, &state.config, req) {
+    match service::publish(&state.db, &state.config, req).await {
         Ok(result) => {
             let json = serde_json::json!({
                 "slug": result.slug,
@@ -217,6 +220,9 @@ async fn tool_publish(state: &AppState, principal: crate::auth::Principal, args:
 }
 
 async fn tool_update(state: &AppState, principal: crate::auth::Principal, args: &Value) -> Value {
+    if !principal.can_write() {
+        return tool_result_err("Forbidden: token does not have write access".to_string());
+    }
     let slug = match args.get("slug").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => return tool_result_err("Missing required argument: slug".to_string()),
@@ -254,7 +260,7 @@ async fn tool_update(state: &AppState, principal: crate::auth::Principal, args: 
         client_ip: "mcp".to_string(),
     };
 
-    match service::update(&state.db, &state.config, slug, req) {
+    match service::update(&state.db, &state.config, slug, req).await {
         Ok(result) => {
             let json = serde_json::json!({
                 "slug": result.slug,
@@ -280,12 +286,15 @@ async fn tool_update(state: &AppState, principal: crate::auth::Principal, args: 
 }
 
 async fn tool_delete(state: &AppState, principal: crate::auth::Principal, args: &Value) -> Value {
+    if !principal.can_write() {
+        return tool_result_err("Forbidden: token does not have write access".to_string());
+    }
     let slug = match args.get("slug").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => return tool_result_err("Missing required argument: slug".to_string()),
     };
 
-    match service::delete(&state.db, &state.config, slug, &principal, "mcp") {
+    match service::delete(&state.db, &state.config, slug, &principal, "mcp").await {
         Ok(()) => tool_result_ok(serde_json::json!({"success": true}).to_string()),
         Err(crate::handlers::AppError::NotFound) => {
             tool_result_err(format!("Document not found: {slug}"))
@@ -294,13 +303,13 @@ async fn tool_delete(state: &AppState, principal: crate::auth::Principal, args: 
     }
 }
 
-fn tool_get(state: &AppState, args: &Value) -> Value {
+async fn tool_get(state: &AppState, args: &Value) -> Value {
     let slug = match args.get("slug").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => return tool_result_err("Missing required argument: slug".to_string()),
     };
 
-    match service::get(&state.db, slug) {
+    match service::get(&state.db, slug).await {
         Ok(doc) => {
             // Strip password from the content in the response.
             let safe_content = crate::handlers::strip_password_from_content_pub(&doc.raw_content);
@@ -318,10 +327,10 @@ fn tool_get(state: &AppState, args: &Value) -> Value {
     }
 }
 
-fn tool_list(state: &AppState, args: &Value) -> Value {
+async fn tool_list(state: &AppState, args: &Value) -> Value {
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as u32;
 
-    match service::list(&state.db, limit, 0) {
+    match service::list(&state.db, limit, 0).await {
         Ok((documents, total)) => {
             let json = serde_json::json!({
                 "documents": documents,

@@ -870,7 +870,13 @@ pub async fn get_human(
         (slug, false)
     };
 
-    let doc = match state.db.get_by_slug(&slug)? {
+    let slug_for_lookup = slug.clone();
+    let db_lookup = state.db.clone();
+    let doc = match tokio::task::spawn_blocking(move || db_lookup.get_by_slug(&slug_for_lookup))
+        .await
+        .map_err(|e| AppError::Internal(format!("Task failed: {e}")))?
+        .map_err(AppError::from)?
+    {
         Some(d) => d,
         None => return Ok(not_found_response()),
     };
@@ -916,12 +922,16 @@ pub async fn get_human(
 
     // .md suffix → serve raw markdown immediately.
     if force_markdown {
-        return Ok(markdown_response(&doc.raw_content));
+        return Ok(markdown_response(&strip_password_from_content(
+            &doc.raw_content,
+        )));
     }
 
     // ?raw=1 -> return full source
     if params.raw.as_deref() == Some("1") {
-        return Ok(markdown_response(&doc.raw_content));
+        return Ok(markdown_response(&strip_password_from_content(
+            &doc.raw_content,
+        )));
     }
 
     // Content negotiation: Accept header wins over User-Agent.
@@ -936,7 +946,9 @@ pub async fn get_human(
         return Ok(build_json_agent_response(&doc));
     }
     if accept_prefers_markdown(&headers) {
-        return Ok(markdown_response(&doc.raw_content));
+        return Ok(markdown_response(&strip_password_from_content(
+            &doc.raw_content,
+        )));
     }
     // Only check the bot UA when the client has NOT declared a preference for HTML.
     // A browser dev-inspecting via a bot UA will send Accept: text/html; honour it.
@@ -1011,7 +1023,13 @@ pub async fn post_unlock(
     Path(slug): Path<String>,
     Form(form): Form<UnlockForm>,
 ) -> Result<Response, AppError> {
-    let doc = match state.db.get_by_slug(&slug)? {
+    let slug_for_unlock = slug.clone();
+    let db_unlock = state.db.clone();
+    let doc = match tokio::task::spawn_blocking(move || db_unlock.get_by_slug(&slug_for_unlock))
+        .await
+        .map_err(|e| AppError::Internal(format!("Task failed: {e}")))?
+        .map_err(AppError::from)?
+    {
         Some(d) => d,
         None => return Ok(not_found_response()),
     };
@@ -1085,7 +1103,13 @@ pub async fn get_full(
     Path(slug): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let doc = match state.db.get_by_slug(&slug)? {
+    let slug_for_full = slug.clone();
+    let db_full = state.db.clone();
+    let doc = match tokio::task::spawn_blocking(move || db_full.get_by_slug(&slug_for_full))
+        .await
+        .map_err(|e| AppError::Internal(format!("Task failed: {e}")))?
+        .map_err(AppError::from)?
+    {
         Some(d) => d,
         None => return Ok(not_found_response()),
     };
@@ -1169,7 +1193,13 @@ pub async fn get_agent(
     Path(slug): Path<String>,
     Query(params): Query<AgentQuery>,
 ) -> Result<Response, AppError> {
-    let doc = state.db.get_by_slug(&slug)?.ok_or(AppError::NotFound)?;
+    let slug_for_agent = slug.clone();
+    let db_agent = state.db.clone();
+    let doc = tokio::task::spawn_blocking(move || db_agent.get_by_slug(&slug_for_agent))
+        .await
+        .map_err(|e| AppError::Internal(format!("Task failed: {e}")))?
+        .map_err(AppError::from)?
+        .ok_or(AppError::NotFound)?;
 
     if is_expired(&doc) {
         return Err(AppError::Gone);
@@ -1235,6 +1265,7 @@ mod tests {
             rate_limit_read: 1000,
             rate_limit_write: 1000,
             rate_limit_window: 60,
+            registration_limit: 5,
         }
     }
 

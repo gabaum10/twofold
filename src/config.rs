@@ -30,6 +30,8 @@ pub struct ServeConfig {
     pub rate_limit_write: u32,
     /// Window duration in seconds for both buckets (TWOFOLD_RATE_LIMIT_WINDOW — default: 60)
     pub rate_limit_window: u64,
+    /// Max OAuth registrations per IP per window (TWOFOLD_REGISTRATION_LIMIT — default: 5)
+    pub registration_limit: u32,
 }
 
 impl ServeConfig {
@@ -118,6 +120,13 @@ impl ServeConfig {
             Err(_) => 60,
         };
 
+        let registration_limit = match std::env::var("TWOFOLD_REGISTRATION_LIMIT") {
+            Ok(s) => s.parse::<u32>().map_err(|_| {
+                format!("TWOFOLD_REGISTRATION_LIMIT must be a positive integer, got: {s}")
+            })?,
+            Err(_) => 5,
+        };
+
         Ok(ServeConfig {
             token,
             bind,
@@ -131,6 +140,7 @@ impl ServeConfig {
             rate_limit_read,
             rate_limit_write,
             rate_limit_window,
+            registration_limit,
         })
     }
 }
@@ -164,6 +174,7 @@ mod tests {
             "TWOFOLD_RATE_LIMIT_READ",
             "TWOFOLD_RATE_LIMIT_WRITE",
             "TWOFOLD_RATE_LIMIT_WINDOW",
+            "TWOFOLD_REGISTRATION_LIMIT",
         ] {
             std::env::remove_var(key);
         }
@@ -208,6 +219,7 @@ mod tests {
         assert_eq!(cfg.rate_limit_read, 60);
         assert_eq!(cfg.rate_limit_write, 30);
         assert_eq!(cfg.rate_limit_window, 60);
+        assert_eq!(cfg.registration_limit, 5);
     }
 
     /// An invalid TWOFOLD_WEBHOOK_URL fails at startup with a descriptive error.
