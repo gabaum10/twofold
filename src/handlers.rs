@@ -831,7 +831,14 @@ pub async fn get_agent(
 async fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
     let provided = extract_bearer(headers)
         .ok_or(AppError::Unauthorized)?;
+    check_auth_token(state, provided).await
+}
 
+/// Validate a raw token string against the admin token and managed token store.
+///
+/// Extracted so that non-HTTP callers (e.g. oauth.rs) can reuse the same
+/// verification logic without constructing a HeaderMap.
+pub async fn check_auth_token(state: &AppState, provided: &str) -> Result<(), AppError> {
     // Fast path: admin TWOFOLD_TOKEN — constant-time, no argon2.
     if constant_time_eq(provided.as_bytes(), state.config.token.as_bytes()) {
         return Ok(());

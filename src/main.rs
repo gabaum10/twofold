@@ -4,6 +4,8 @@ mod db;
 mod handlers;
 mod highlight;
 mod mcp;
+mod mcp_http;
+mod oauth;
 mod parser;
 mod webhook;
 
@@ -137,6 +139,11 @@ async fn run_server() {
     let app = Router::new()
         // Health check — no auth, checked by load balancers and uptime monitors.
         .route("/health", get(handlers::health_check))
+        // Remote MCP endpoint — unauthenticated. TWOFOLD_MCP_TOKEN used internally
+        // for onward calls to the document API.
+        .route("/mcp", post(mcp_http::handle_mcp_post))
+        // OAuth 2.0 client_credentials token endpoint — harmless, kept for potential use.
+        .route("/oauth/token", post(oauth::handle_oauth_token))
         // Documents: POST (create) and GET (list) share the same path.
         // Axum 0.7: combine with method router chaining.
         .route("/api/v1/documents", post(handlers::post_document).get(handlers::list_documents))
