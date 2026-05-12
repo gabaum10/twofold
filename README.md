@@ -92,10 +92,9 @@ cargo build --release
 
 ## Features
 
-- **Frontmatter** -- title, slug, theme, expiry, password, description (YAML in `---` fences)
+- **Frontmatter** -- title, slug, theme, expiry, description (YAML in `---` fences)
 - **Custom slugs** -- choose your URL or let nanoid generate one
 - **Expiry** -- documents self-destruct (`30m`, `24h`, `7d`, `2w`) with background reaper; live countdown timer on the human view
-- **Password protection** -- per-document, argon2-hashed, cookie-based session
 - **Themes** -- clean (default), dark, paper, minimal, hearth; wider content layout (850px) with enhanced print CSS across all five themes
 - **PDF download** -- toolbar button triggers browser print-to-PDF
 - **Syntax highlighting** -- syntect-powered, theme-aware (light/dark palettes)
@@ -121,9 +120,6 @@ cargo build --release
 | `GET` | `/:slug` | -- | Human view (styled HTML, agent sections stripped) |
 | `GET` | `/:slug?raw=1` | -- | Raw markdown source |
 | `GET` | `/:slug/full` | -- | Full rendered view (all content, markers stripped) |
-| `POST` | `/:slug/unlock` | -- | Password verification (form POST) |
-
-Password-protected documents gate the human view, raw view, and full view. The agent API endpoint is not gated.
 
 ## MCP Server
 
@@ -154,8 +150,8 @@ Runs on stdio (JSON-RPC, newline-delimited). Wire it into Claude Code or any MCP
 
 | Tool | Description |
 |------|-------------|
-| `twofold_publish` | Publish markdown. Accepts `content` (required), `title`, `slug`, `password`, `expiry`, `theme`, `description`. Returns URL and slug. |
-| `twofold_update` | Update a document by slug. Accepts `slug` (required), `content` (required), `title`, `description`, `password`, `expiry`, `theme`. |
+| `twofold_publish` | Publish markdown. Accepts `content` (required), `title`, `slug`, `expiry`, `theme`, `description`. Returns URL and slug. |
+| `twofold_update` | Update a document by slug. Accepts `slug` (required), `content` (required), `title`, `description`, `expiry`, `theme`. |
 | `twofold_get` | Retrieve raw markdown by slug. |
 | `twofold_list` | List published documents. Optional `limit` (default 20, max 100). |
 | `twofold_delete` | Delete a document by slug. |
@@ -262,7 +258,6 @@ twofold serve                                              # Start server
 twofold publish <file|-> --server URL --token T            # Publish document
 twofold publish <file> --title "..." --slug X              # Publish with frontmatter flags
 twofold publish <file> --theme dark --expiry 7d            # Set theme and expiry
-twofold publish <file> --password secret --expiry 24h      # Password-protect with expiry
 twofold list --server URL --token T                        # List documents
 twofold delete <slug> --server URL --token T               # Delete a document
 twofold token create --name "deploy-bot"                   # Create API token

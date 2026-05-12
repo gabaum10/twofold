@@ -240,10 +240,6 @@ fn handle_tools_list(id: Value) -> Response {
                             "type": "string",
                             "description": "Optional custom URL slug."
                         },
-                        "password": {
-                            "type": "string",
-                            "description": "Optional password to protect the document."
-                        },
                         "expiry": {
                             "type": "string",
                             "description": "Optional expiry duration (e.g. '7d', '24h', '2w'). Document is automatically deleted after expiry."
@@ -266,11 +262,7 @@ fn handle_tools_list(id: Value) -> Response {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "slug": { "type": "string", "description": "Document slug." },
-                        "password": {
-                            "type": "string",
-                            "description": "Password for protected documents. Required if the document has a password set."
-                        }
+                        "slug": { "type": "string", "description": "Document slug." }
                     },
                     "required": ["slug"]
                 }
@@ -325,10 +317,6 @@ fn handle_tools_list(id: Value) -> Response {
                         "description": {
                             "type": "string",
                             "description": "Optional document description."
-                        },
-                        "password": {
-                            "type": "string",
-                            "description": "Optional password to protect the document."
                         },
                         "expiry": {
                             "type": "string",
