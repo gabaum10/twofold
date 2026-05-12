@@ -83,6 +83,34 @@ pub struct AuthCodeRecord {
     pub client_id: String,
     pub redirect_uri: String,
     pub expires_at: String, // ISO 8601 UTC
+    /// PKCE code_challenge (base64url SHA256 of the verifier). Mandatory.
+    pub code_challenge: String,
+    /// RFC 8707 resource parameter — stored and validated on exchange.
+    pub resource: Option<String>,
+    /// Scopes requested (space-separated).
+    pub scope: Option<String>,
+}
+
+/// Dynamically-registered OAuth client record (POST /oauth/register).
+#[derive(Clone)]
+pub struct OAuthClientRecord {
+    pub client_id: String,
+    pub client_name: String,
+    pub redirect_uris: Vec<String>,
+    pub grant_types: Vec<String>,
+    pub response_types: Vec<String>,
+    /// "none" = public client (no secret required).
+    pub token_endpoint_auth_method: String,
+}
+
+/// Active refresh token record.
+#[derive(Clone)]
+pub struct RefreshTokenRecord {
+    pub client_id: String,
+    pub access_token: String,
+    pub scope: Option<String>,
+    /// 30-day TTL, ISO 8601 UTC.
+    pub expires_at: String,
 }
 
 /// Shared application state injected into all handlers via axum State extractor.
@@ -93,6 +121,10 @@ pub struct AppState {
     /// In-memory store for pending OAuth authorization codes.
     /// Arc<Mutex<...>> so it is shared across clones of AppState (axum clones per request).
     pub auth_codes: Arc<Mutex<HashMap<String, AuthCodeRecord>>>,
+    /// Dynamically-registered OAuth clients (POST /oauth/register).
+    pub oauth_clients: Arc<Mutex<HashMap<String, OAuthClientRecord>>>,
+    /// Active refresh tokens keyed by token string.
+    pub refresh_tokens: Arc<Mutex<HashMap<String, RefreshTokenRecord>>>,
 }
 
 // ── Templates ────────────────────────────────────────────────────────────────
@@ -1588,7 +1620,13 @@ mod tests {
             webhook_secret: None,
             reaper_interval: 3600,
         });
-        let state = AppState { db, config, auth_codes: Arc::new(Mutex::new(HashMap::new())) };
+        let state = AppState {
+            db,
+            config,
+            auth_codes: Arc::new(Mutex::new(HashMap::new())),
+            oauth_clients: Arc::new(Mutex::new(HashMap::new())),
+            refresh_tokens: Arc::new(Mutex::new(HashMap::new())),
+        };
         Router::new()
             .route(
                 "/api/v1/documents",
@@ -1619,7 +1657,13 @@ mod tests {
             webhook_secret: None,
             reaper_interval: 3600,
         });
-        let state = AppState { db, config, auth_codes: Arc::new(Mutex::new(HashMap::new())) };
+        let state = AppState {
+            db,
+            config,
+            auth_codes: Arc::new(Mutex::new(HashMap::new())),
+            oauth_clients: Arc::new(Mutex::new(HashMap::new())),
+            refresh_tokens: Arc::new(Mutex::new(HashMap::new())),
+        };
         Router::new()
             .route(
                 "/api/v1/documents",
@@ -1718,7 +1762,13 @@ mod tests {
         };
         db.insert_document(&expired_doc).expect("insert expired doc");
 
-        let state = AppState { db, config, auth_codes: Arc::new(Mutex::new(HashMap::new())) };
+        let state = AppState {
+            db,
+            config,
+            auth_codes: Arc::new(Mutex::new(HashMap::new())),
+            oauth_clients: Arc::new(Mutex::new(HashMap::new())),
+            refresh_tokens: Arc::new(Mutex::new(HashMap::new())),
+        };
         let app = Router::new()
             .route(
                 "/api/v1/documents",
@@ -2129,7 +2179,13 @@ mod tests {
             webhook_secret: None,
             reaper_interval: 3600,
         });
-        let state = AppState { db, config, auth_codes: Arc::new(Mutex::new(HashMap::new())) };
+        let state = AppState {
+            db,
+            config,
+            auth_codes: Arc::new(Mutex::new(HashMap::new())),
+            oauth_clients: Arc::new(Mutex::new(HashMap::new())),
+            refresh_tokens: Arc::new(Mutex::new(HashMap::new())),
+        };
         let router = Router::new()
             .route(
                 "/api/v1/documents",
@@ -2253,7 +2309,13 @@ mod tests {
             webhook_secret: None,
             reaper_interval: 3600,
         });
-        let state = AppState { db, config, auth_codes: Arc::new(Mutex::new(HashMap::new())) };
+        let state = AppState {
+            db,
+            config,
+            auth_codes: Arc::new(Mutex::new(HashMap::new())),
+            oauth_clients: Arc::new(Mutex::new(HashMap::new())),
+            refresh_tokens: Arc::new(Mutex::new(HashMap::new())),
+        };
         let router = Router::new()
             .route(
                 "/api/v1/documents",

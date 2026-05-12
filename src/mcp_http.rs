@@ -33,6 +33,16 @@ pub async fn handle_mcp_post(
     body: axum::body::Bytes,
 ) -> Response {
     // Auth check — bearer token must be present and valid.
+    // On 401, include WWW-Authenticate so Cowork can start OAuth discovery.
+    let resource_metadata_url = {
+        let base = state.config.base_url.trim_end_matches('/');
+        format!("{base}/.well-known/oauth-protected-resource")
+    };
+    let www_auth_value = format!("Bearer resource_metadata="{resource_metadata_url}"");
+    let www_auth_header: axum::http::HeaderValue = www_auth_value
+        .parse()
+        .unwrap_or_else(|_| axum::http::HeaderValue::from_static("Bearer"));
+
     let provided = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -43,6 +53,7 @@ pub async fn handle_mcp_post(
         None => {
             return (
                 StatusCode::UNAUTHORIZED,
+                [(axum::http::header::WWW_AUTHENTICATE, www_auth_header)],
                 axum::Json(serde_json::json!({
                     "error": "unauthorized",
                     "error_description": "Bearer token required"
@@ -55,6 +66,7 @@ pub async fn handle_mcp_post(
     if let Err(_) = check_auth_token(&state, &token).await {
         return (
             StatusCode::UNAUTHORIZED,
+            [(axum::http::header::WWW_AUTHENTICATE, www_auth_header)],
             axum::Json(serde_json::json!({
                 "error": "unauthorized",
                 "error_description": "Invalid or expired token"
