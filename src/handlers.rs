@@ -372,9 +372,15 @@ pub async fn post_document(
         None => None,
     };
 
-    // Hash password if provided
+    // Hash password if provided (argon2 is CPU-heavy; run off the async executor).
     let password_hash = match meta.password.as_deref() {
-        Some(pw) if !pw.is_empty() => Some(hash_password(pw)?),
+        Some(pw) if !pw.is_empty() => {
+            let pw_owned = pw.to_string();
+            let hash = tokio::task::spawn_blocking(move || hash_password(&pw_owned))
+                .await
+                .map_err(|e| AppError::Internal(format!("Task failed: {e}")))??;
+            Some(hash)
+        }
         _ => None,
     };
 
@@ -528,8 +534,15 @@ pub async fn put_document(
     };
 
     // Password: None = keep existing, Some("") = clear, Some(value) = set new
+    // argon2 is CPU-heavy; run off the async executor.
     let password_hash = match meta.password.as_deref() {
-        Some(pw) if !pw.is_empty() => Some(hash_password(pw)?),
+        Some(pw) if !pw.is_empty() => {
+            let pw_owned = pw.to_string();
+            let hash = tokio::task::spawn_blocking(move || hash_password(&pw_owned))
+                .await
+                .map_err(|e| AppError::Internal(format!("Task failed: {e}")))??;
+            Some(hash)
+        }
         Some(_) => None,                   // empty string = clear
         None => existing.password.clone(), // absent = preserve
     };
@@ -779,7 +792,7 @@ pub async fn serve_openapi_json(_rl: ReadRateLimit) -> impl IntoResponse {
 
     let json = OPENAPI_JSON.get_or_init(|| {
         let yaml = include_str!("../docs/openapi.yaml");
-        match serde_yaml::from_str::<serde_json::Value>(yaml) {
+        match serde_yml::from_str::<serde_json::Value>(yaml) {
             Ok(val) => serde_json::to_string(&val)
                 .unwrap_or_else(|e| format!("{{\"error\":\"JSON serialization failed: {e}\"}}")),
             Err(e) => format!("{{\"error\":\"YAML parse failed: {e}\"}}"),
@@ -1119,13 +1132,24 @@ pub async fn post_unlock(
         }
     };
 
-    // Verify password
-    if verify_password(&form.password, stored_hash) {
+    // Verify password (argon2 is CPU-heavy; run off the async executor).
+    let pw_owned = form.password.clone();
+    let hash_owned = stored_hash.clone();
+    let verified = tokio::task::spawn_blocking(move || verify_password(&pw_owned, &hash_owned))
+        .await
+        .map_err(|e| AppError::Internal(format!("Task failed: {e}")))?;
+
+    if verified {
         // Set auth cookie and redirect
         let cookie_value = make_auth_cookie(&slug, &state.config.token);
+        let secure_flag = if state.config.base_url.starts_with("https://") {
+            "; Secure"
+        } else {
+            ""
+        };
         let cookie_header = format!(
-            "twofold_auth_{}={}; Path=/{}; HttpOnly; SameSite=Strict; Max-Age=3600",
-            slug, cookie_value, slug
+            "twofold_auth_{}={}; Path=/{}; HttpOnly; SameSite=Strict; Max-Age=3600{}",
+            slug, cookie_value, slug, secure_flag
         );
         Ok((
             StatusCode::SEE_OTHER,
@@ -1267,25 +1291,32 @@ pub async fn get_agent(
 
     // Password gate — same argon2 check as the human view.
     // access_token takes precedence; password is a backward-compat fallback.
+    // argon2 is CPU-heavy; run off the async executor.
     if let Some(stored_hash) = &doc.password {
         let provided = params
             .access_token
             .as_deref()
             .or(params.password.as_deref());
         match provided {
-            Some(provided) if verify_password(provided, stored_hash) => {
-                // Correct password — fall through to serve content.
-            }
-            Some(_) => {
-                return Err(AppError::DocumentPasswordInvalid);
-            }
             None => {
                 return Err(AppError::DocumentPasswordRequired);
+            }
+            Some(pw) => {
+                let pw_owned = pw.to_string();
+                let hash_owned = stored_hash.clone();
+                let verified =
+                    tokio::task::spawn_blocking(move || verify_password(&pw_owned, &hash_owned))
+                        .await
+                        .map_err(|e| AppError::Internal(format!("Task failed: {e}")))?;
+                if !verified {
+                    return Err(AppError::DocumentPasswordInvalid);
+                }
+                // Correct password — fall through to serve content.
             }
         }
     }
 
-    Ok(markdown_response(&doc.raw_content))
+    Ok(markdown_response(&strip_password_from_content(&doc.raw_content)))
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
@@ -1916,11 +1947,15 @@ fn is_unique_violation(e: &rusqlite::Error) -> bool {
 pub fn hash_password(password: &str) -> Result<String, AppError> {
     use argon2::{
         password_hash::{rand_core::OsRng, PasswordHasher, SaltString},
-        Argon2,
+        Algorithm, Argon2, Params, Version,
     };
 
     let salt = SaltString::generate(&mut OsRng);
-    let argon2 = Argon2::default();
+    let argon2 = Argon2::new(
+        Algorithm::Argon2id,
+        Version::V0x13,
+        Params::new(19456, 2, 1, None).expect("argon2 params are valid constants"),
+    );
     let hash = argon2
         .hash_password(password.as_bytes(), &salt)
         .map_err(|e| AppError::Internal(format!("Password hashing failed: {e}")))?;
@@ -1929,15 +1964,19 @@ pub fn hash_password(password: &str) -> Result<String, AppError> {
 
 /// Verify a password against an argon2 hash.
 pub fn verify_password(password: &str, hash: &str) -> bool {
-    use argon2::{Argon2, PasswordHash, PasswordVerifier};
+    use argon2::{Algorithm, Argon2, Params, PasswordHash, PasswordVerifier, Version};
 
     let parsed = match PasswordHash::new(hash) {
         Ok(h) => h,
         Err(_) => return false,
     };
-    Argon2::default()
-        .verify_password(password.as_bytes(), &parsed)
-        .is_ok()
+    Argon2::new(
+        Algorithm::Argon2id,
+        Version::V0x13,
+        Params::new(19456, 2, 1, None).expect("argon2 params are valid constants"),
+    )
+    .verify_password(password.as_bytes(), &parsed)
+    .is_ok()
 }
 
 /// Generate an HMAC-based auth cookie value for a slug.

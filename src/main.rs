@@ -9,6 +9,7 @@ mod mcp_http;
 mod oauth;
 mod parser;
 mod rate_limit;
+mod service;
 mod webhook;
 
 use std::sync::Arc;
@@ -126,18 +127,42 @@ async fn run_server() {
         loop {
             interval.tick().await;
             let now = handlers::chrono_now();
-            match reaper_db.delete_expired_older_than(&now, 30) {
-                Ok(count) if count > 0 => {
+            // SQLite writes are blocking; run off the async executor.
+            let db_clone = reaper_db.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                db_clone.delete_expired_older_than(&now, 30)
+            })
+            .await;
+            match result {
+                Ok(Ok(count)) if count > 0 => {
                     tracing::info!(
                         count,
                         "Reaper garbage-collected tombstones older than 30 days"
                     );
                 }
-                Ok(_) => {} // nothing old enough to reap
-                Err(e) => {
+                Ok(Ok(_)) => {} // nothing old enough to reap
+                Ok(Err(e)) => {
                     tracing::error!(error = %e, "Reaper failed to garbage-collect expired documents");
                 }
+                Err(e) => {
+                    tracing::error!(error = %e, "Reaper task panicked");
+                }
             }
+        }
+    });
+
+    // Spawn the background rate limit eviction task.
+    //
+    // Runs every 5 minutes. Removes buckets whose window started more than
+    // 2× window_secs ago — these are idle IPs/tokens that will never be
+    // mid-window again and would otherwise accumulate indefinitely.
+    let eviction_store = rate_limit.clone();
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(5 * 60));
+        loop {
+            interval.tick().await;
+            eviction_store.evict_expired();
         }
     });
 
