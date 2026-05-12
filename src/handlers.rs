@@ -18,7 +18,7 @@ use crate::{
     db::{AuditEntry, Db, DocumentRecord},
     highlight,
     parser::{extract_frontmatter, extract_title, parse_document, parse_expiry, validate_slug},
-    rate_limit::{RateLimitError, RateLimitStore, ReadRateLimit, WriteRateLimit},
+    rate_limit::{RateLimitStore, ReadRateLimit, WriteRateLimit},
     webhook,
 };
 
@@ -49,36 +49,26 @@ pub enum AppError {
     DocumentPasswordRequired,
     /// Document is password-protected and the supplied password was wrong.
     DocumentPasswordInvalid,
-    /// Rate limit exceeded — carries metadata for response headers.
-    RateLimited(RateLimitError),
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        match self {
-            AppError::RateLimited(ref err) => {
-                crate::rate_limit::too_many_requests_response(err)
+        let (status, msg) = match self {
+            AppError::Unauthorized => (StatusCode::UNAUTHORIZED, "Unauthorized".to_string()),
+            AppError::Forbidden => (StatusCode::FORBIDDEN, "Forbidden".to_string()),
+            AppError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
+            AppError::NotFound => (StatusCode::NOT_FOUND, "Not found".to_string()),
+            AppError::Conflict(m) => (StatusCode::CONFLICT, m),
+            AppError::Gone => (StatusCode::GONE, "Document has expired".to_string()),
+            AppError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
+            AppError::DocumentPasswordRequired => {
+                (StatusCode::UNAUTHORIZED, "Password required".to_string())
             }
-            _ => {
-                let (status, msg) = match self {
-                    AppError::Unauthorized => (StatusCode::UNAUTHORIZED, "Unauthorized".to_string()),
-                    AppError::Forbidden => (StatusCode::FORBIDDEN, "Forbidden".to_string()),
-                    AppError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
-                    AppError::NotFound => (StatusCode::NOT_FOUND, "Not found".to_string()),
-                    AppError::Conflict(m) => (StatusCode::CONFLICT, m),
-                    AppError::Gone => (StatusCode::GONE, "Document has expired".to_string()),
-                    AppError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
-                    AppError::DocumentPasswordRequired => {
-                        (StatusCode::UNAUTHORIZED, "Password required".to_string())
-                    }
-                    AppError::DocumentPasswordInvalid => {
-                        (StatusCode::UNAUTHORIZED, "Invalid password".to_string())
-                    }
-                    AppError::RateLimited(_) => unreachable!(),
-                };
-                (status, Json(serde_json::json!({ "error": msg }))).into_response()
+            AppError::DocumentPasswordInvalid => {
+                (StatusCode::UNAUTHORIZED, "Invalid password".to_string())
             }
-        }
+        };
+        (status, Json(serde_json::json!({ "error": msg }))).into_response()
     }
 }
 
@@ -104,6 +94,7 @@ pub struct AuthCodeRecord {
 
 /// In-memory access token record issued via public-client OAuth flows.
 #[derive(Clone)]
+#[allow(dead_code)] // fields stored for future access policy enforcement
 pub struct AccessTokenRecord {
     pub client_id: String,
     pub scope: Option<String>,
@@ -112,6 +103,7 @@ pub struct AccessTokenRecord {
 
 /// Dynamically-registered OAuth client record (POST /oauth/register).
 #[derive(Clone)]
+#[allow(dead_code)] // fields stored for future access policy enforcement
 pub struct OAuthClientRecord {
     pub client_id: String,
     pub client_name: String,
@@ -125,6 +117,7 @@ pub struct OAuthClientRecord {
 
 /// Active refresh token record.
 #[derive(Clone)]
+#[allow(dead_code)] // fields stored for future access policy enforcement
 pub struct RefreshTokenRecord {
     pub client_id: String,
     pub access_token: String,
@@ -134,6 +127,7 @@ pub struct RefreshTokenRecord {
 
 /// Shared application state injected into all handlers via axum State extractor.
 #[derive(Clone)]
+#[allow(dead_code)] // rate_limit accessed via axum Extension layer, not directly on AppState
 pub struct AppState {
     pub db: Db,
     pub config: Arc<ServeConfig>,
@@ -897,8 +891,7 @@ fn strip_password_from_content(raw: &str) -> String {
 
 /// Build the `DocumentResponse` JSON reply for agent/content-negotiation paths.
 ///
-/// Reused by both `get_human` (content negotiation) and `get_slug_md` to
-/// avoid duplicating doc-lookup logic.
+/// Used by `get_human` for JSON content-negotiation responses.
 fn build_json_agent_response(doc: &crate::db::DocumentRecord) -> Response {
     // Strip password from the content that goes into the response.
     let safe_content = strip_password_from_content(&doc.raw_content);
@@ -918,50 +911,6 @@ fn build_json_agent_response(doc: &crate::db::DocumentRecord) -> Response {
         expires_at: doc.expires_at.clone(),
     };
     (StatusCode::OK, Json(body)).into_response()
-}
-
-// ── GET /:slug.md (raw markdown shortcut) ────────────────────────────────────
-
-/// Serve the raw source markdown for `/:slug.md` requests.
-///
-/// Equivalent to `GET /:slug?raw=1`.  Registered before the `/:slug` catch-all
-/// so Axum's router resolves it first.
-///
-/// Note: in Axum 0.7 / matchit 0.7, `/:slug.md` conflicts with `/:slug/:child`
-/// routes in the same router. To avoid this, the main `get_human` handler strips
-/// a trailing `.md` suffix before looking up the slug — see the `.md` branch there.
-/// This handler is kept as a named function so it can be referenced independently
-/// when the routing layer allows it.
-pub async fn get_slug_md(
-    State(state): State<AppState>,
-    _rl: ReadRateLimit,
-    Path(slug): Path<String>,
-    headers: HeaderMap,
-) -> Result<Response, AppError> {
-    // Strip a trailing .md suffix if present (defensive: in case this handler
-    // is called directly with the raw slug).
-    let bare_slug = slug.strip_suffix(".md").unwrap_or(&slug);
-
-    let doc = match state.db.get_by_slug(bare_slug)? {
-        Some(d) => d,
-        None => return Ok(not_found_response()),
-    };
-
-    if is_expired(&doc) {
-        return Ok(gone_response());
-    }
-
-    // Password-protected documents still require auth cookie for the .md shortcut.
-    if doc.password.is_some() {
-        if !is_password_authed(&headers, bare_slug, &state.config.token) {
-            let template = PasswordTemplate { slug: bare_slug, base_url: state.config.base_url.trim_end_matches('/'), error: None };
-            return Ok(Html(template.render().map_err(|e| {
-                AppError::Internal(format!("Template error: {e}"))
-            })?).into_response());
-        }
-    }
-
-    Ok(markdown_response(&doc.raw_content))
 }
 
 // ── GET /:slug (human view) ──────────────────────────────────────────────────

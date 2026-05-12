@@ -78,7 +78,6 @@ pub struct RegisterRequest {
     pub grant_types: Option<Vec<String>>,
     pub response_types: Option<Vec<String>>,
     pub token_endpoint_auth_method: Option<String>,
-    pub scope: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

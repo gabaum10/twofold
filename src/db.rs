@@ -333,32 +333,6 @@ impl Db {
         Ok(())
     }
 
-    /// Get all non-revoked token hashes for auth verification.
-    ///
-    /// Used as a fallback for legacy tokens (prefix IS NULL) and in tests.
-    pub fn get_active_tokens(&self) -> Result<Vec<TokenRecord>> {
-        let conn = self.pool.get().map_err(pool_err)?;
-        let mut stmt = conn.prepare(
-            "SELECT id, name, hash, created_at, last_used, revoked, prefix
-             FROM tokens WHERE revoked = 0",
-        )?;
-        let tokens = stmt
-            .query_map([], |row| {
-                Ok(TokenRecord {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    hash: row.get(2)?,
-                    created_at: row.get(3)?,
-                    last_used: row.get(4)?,
-                    revoked: row.get::<_, i32>(5)? != 0,
-                    prefix: row.get(6)?,
-                })
-            })?
-            .filter_map(|r| r.map_err(|e| tracing::warn!("Failed to deserialize token row: {}", e)).ok())
-            .collect();
-        Ok(tokens)
-    }
-
     /// Look up a single active token by its 8-character prefix for O(1) auth.
     ///
     /// Returns None if no active token has that prefix, or if the prefix is
