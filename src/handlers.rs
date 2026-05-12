@@ -811,7 +811,13 @@ pub async fn get_agent(
 pub(crate) async fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
     let provided = extract_bearer(headers)
         .ok_or(AppError::Unauthorized)?;
+    check_auth_token(state, provided).await
+}
 
+/// Validate a raw token string (no header parsing).
+///
+/// Used by OAuth and any other path that extracts the credential itself.
+pub(crate) async fn check_auth_token(state: &AppState, provided: &str) -> Result<(), AppError> {
     // Check admin token first (constant-time)
     if constant_time_eq(provided.as_bytes(), state.config.token.as_bytes()) {
         return Ok(());

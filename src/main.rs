@@ -5,6 +5,7 @@ mod handlers;
 mod highlight;
 mod mcp;
 mod mcp_http;
+mod oauth;
 mod parser;
 mod webhook;
 
@@ -162,8 +163,13 @@ async fn run_server() {
         .route("/mcp", post(mcp_http::handle_mcp_post))
         .layer(DefaultBodyLimit::disable());
 
+    // OAuth 2.0 Client Credentials grant — auth handled inside the handler.
+    let oauth_router = Router::new()
+        .route("/oauth/token", post(oauth::handle_oauth_token));
+
     let app = doc_router
         .merge(mcp_router)
+        .merge(oauth_router)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
