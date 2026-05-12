@@ -214,17 +214,17 @@ fn handle_tools_list(id: Value) -> Response {
         "tools": [
             {
                 "name": "twofold_publish",
-                "description": "Publish a markdown document to twofold. Returns the URL and slug. Supports dual-layer rendering: human-readable content in the browser view, agent-only content accessible via the API endpoint.",
+                "description": "Publish a dual-layer document. One URL, two audiences. The human layer (content) gives readers the critical context they need to understand and act on the information — concise, scannable, written for someone on their phone. The agent layer (agent_content) carries the full technical depth — specs, data, configuration, implementation details — everything an AI agent needs to pick up the thread and work with it. When someone pastes the link into a conversation with an AI, the agent fetches the API endpoint and gets the complete picture without the human needing to relay it.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "content": {
                             "type": "string",
-                            "description": "Markdown content visible to humans in the browser view."
+                            "description": "Human-readable layer, visible in the browser. Write the essential context a person needs to understand what this is, why it matters, and what to do next. Keep it concise and scannable. Skip technical specs, API details, and structured data — those belong in agent_content."
                         },
                         "agent_content": {
                             "type": "string",
-                            "description": "Optional markdown content only visible via the API endpoint (/api/v1/documents/{slug}). Invisible in the human-readable browser view. Use for technical specs, API details, structured data meant for AI agents consuming the document."
+                            "description": "Agent-readable layer, invisible in the browser, accessible via the API endpoint. Full technical context: specs, structured data, API references, configuration, implementation details, and any information an AI agent would need to pick up this thread and act on it without asking follow-up questions. Write for a machine that's about to do work with this information."
                         },
                         "title": {
                             "type": "string",
@@ -296,7 +296,7 @@ fn handle_tools_list(id: Value) -> Response {
             },
             {
                 "name": "twofold_update",
-                "description": "Update an existing document. Returns 404 if the slug does not exist. Use twofold_publish to create new documents. Supports dual-layer rendering: human-readable content in the browser view, agent-only content accessible via the API endpoint.",
+                "description": "Update an existing document. Returns 404 if the slug does not exist. Use twofold_publish to create new documents. Publish a dual-layer document. One URL, two audiences. The human layer (content) gives readers the critical context they need to understand and act on the information — concise, scannable, written for someone on their phone. The agent layer (agent_content) carries the full technical depth — specs, data, configuration, implementation details — everything an AI agent needs to pick up the thread and work with it. When someone pastes the link into a conversation with an AI, the agent fetches the API endpoint and gets the complete picture without the human needing to relay it.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -306,11 +306,11 @@ fn handle_tools_list(id: Value) -> Response {
                         },
                         "content": {
                             "type": "string",
-                            "description": "Markdown content visible to humans in the browser view."
+                            "description": "Human-readable layer, visible in the browser. Write the essential context a person needs to understand what this is, why it matters, and what to do next. Keep it concise and scannable. Skip technical specs, API details, and structured data — those belong in agent_content."
                         },
                         "agent_content": {
                             "type": "string",
-                            "description": "Optional markdown content only visible via the API endpoint (/api/v1/documents/{slug}). Invisible in the human-readable browser view. Use for technical specs, API details, structured data meant for AI agents consuming the document."
+                            "description": "Agent-readable layer, invisible in the browser, accessible via the API endpoint. Full technical context: specs, structured data, API references, configuration, implementation details, and any information an AI agent would need to pick up this thread and act on it without asking follow-up questions. Write for a machine that's about to do work with this information."
                         },
                         "title": {
                             "type": "string",
