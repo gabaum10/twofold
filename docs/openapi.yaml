@@ -2,7 +2,7 @@ openapi: "3.1.0"
 
 info:
   title: Twofold
-  version: "0.3.0"
+  version: "0.3.9"
   description: |
     One document, two views. Twofold is a self-hosted markdown share service that serves
     styled HTML to humans and raw markdown to agents from the same document.

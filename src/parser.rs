@@ -14,7 +14,7 @@ pub struct Frontmatter {
     pub description: Option<String>,
     /// Catch-all for unknown fields (forward-compatible).
     #[serde(flatten)]
-    pub _extra: HashMap<String, serde_yaml::Value>,
+    pub _extra: HashMap<String, serde_yml::Value>,
 }
 
 /// Result of extracting frontmatter from raw content.
@@ -73,8 +73,7 @@ pub fn extract_frontmatter(source: &str) -> Result<FrontmatterResult, String> {
     let meta: Frontmatter = if yaml_content.trim().is_empty() {
         Frontmatter::default()
     } else {
-        serde_yaml::from_str(&yaml_content)
-            .map_err(|e| format!("Invalid frontmatter: {e}"))?
+        serde_yml::from_str(&yaml_content).map_err(|e| format!("Invalid frontmatter: {e}"))?
     };
 
     // Body is everything after the closing `---`
@@ -207,7 +206,11 @@ pub fn parse_expiry(s: &str) -> Result<u64, String> {
         "h" => num * 3600,
         "d" => num * 86400,
         "w" => num * 604800,
-        _ => return Err(format!("Invalid expiry unit: '{unit}' (expected m, h, d, or w)")),
+        _ => {
+            return Err(format!(
+                "Invalid expiry unit: '{unit}' (expected m, h, d, or w)"
+            ))
+        }
     };
 
     let min_seconds = 5 * 60; // 5 minutes
@@ -249,7 +252,18 @@ pub fn validate_slug(slug: &str) -> Result<(), String> {
         }
     }
 
-    let reserved = ["api", "health", "status", "favicon.ico", "robots.txt"];
+    let reserved = [
+        "api",
+        "health",
+        "status",
+        "favicon.ico",
+        "robots.txt",
+        "authorize",
+        "oauth",
+        "mcp",
+        "icon.png",
+        ".well-known",
+    ];
     if reserved.contains(&slug) {
         return Err(format!("Slug '{slug}' is reserved"));
     }
@@ -273,7 +287,8 @@ mod tests {
 
     #[test]
     fn strips_multiple_sections() {
-        let src = "A.\n<!-- @agent -->\nH1.\n<!-- @end -->\nB.\n<!-- @agent -->\nH2.\n<!-- @end -->\nC.";
+        let src =
+            "A.\n<!-- @agent -->\nH1.\n<!-- @end -->\nB.\n<!-- @agent -->\nH2.\n<!-- @end -->\nC.";
         let r = parse_document(src, "test");
         assert!(r.human.contains("A.") && r.human.contains("B.") && r.human.contains("C."));
         assert!(!r.human.contains("H1.") && !r.human.contains("H2."));
@@ -330,7 +345,10 @@ mod tests {
 
     #[test]
     fn extract_title_basic() {
-        assert_eq!(extract_title("# Hello World\n\nContent.", "fallback"), "Hello World");
+        assert_eq!(
+            extract_title("# Hello World\n\nContent.", "fallback"),
+            "Hello World"
+        );
     }
 
     #[test]
@@ -445,5 +463,14 @@ mod tests {
     #[test]
     fn validate_slug_reserved() {
         assert!(validate_slug("api").is_err());
+    }
+
+    #[test]
+    fn validate_slug_reserved_oauth_routes() {
+        assert!(validate_slug("authorize").is_err());
+        assert!(validate_slug("oauth").is_err());
+        assert!(validate_slug("mcp").is_err());
+        assert!(validate_slug("icon.png").is_err());
+        assert!(validate_slug(".well-known").is_err());
     }
 }

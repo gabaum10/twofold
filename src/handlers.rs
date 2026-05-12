@@ -17,12 +17,13 @@ use crate::{
     config::ServeConfig,
     db::{AuditEntry, Db, DocumentRecord},
     highlight,
-    parser::{extract_frontmatter, extract_title, parse_document, parse_expiry, validate_slug},
+    parser::{extract_frontmatter, extract_title, parse_document, parse_expiry},
     rate_limit::{RateLimitStore, ReadRateLimit, WriteRateLimit},
     webhook,
 };
 
 /// URL-safe slug alphabet: alphanumeric + hyphen.
+#[allow(dead_code)]
 const SLUG_ALPHABET: [char; 63] = [
     '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i',
     'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', 'A', 'B',
@@ -326,149 +327,35 @@ pub async fn post_document(
     // Auth FIRST — 401 before 400/413
     let principal = check_auth(&state, &headers).await?;
     let peer_addr = connect_info.map(|c| c.0.ip().to_string());
-
-    // Body validation
-    if body.is_empty() {
-        return Err(AppError::BadRequest(
-            "Request body must not be empty".to_string(),
-        ));
-    }
+    let client_ip = extract_client_ip(&headers, peer_addr.as_deref());
 
     let raw_content = std::str::from_utf8(&body)
         .map_err(|_| AppError::BadRequest("Request body must be valid UTF-8".to_string()))?
         .to_string();
 
-    // Parse frontmatter
-    let fm_result = extract_frontmatter(&raw_content).map_err(AppError::BadRequest)?;
-
-    let meta = fm_result.meta.unwrap_or_default();
-    let body_text = &fm_result.body;
-
-    // Determine slug
-    let slug = if let Some(ref custom_slug) = meta.slug {
-        validate_slug(custom_slug).map_err(AppError::BadRequest)?;
-        custom_slug.clone()
-    } else {
-        nanoid::nanoid!(10, &SLUG_ALPHABET)
-    };
-
-    // Determine title: frontmatter > H1 > slug
-    let title = meta
-        .title
-        .unwrap_or_else(|| extract_title(body_text, &slug));
-
-    // Determine theme
-    let theme = meta
-        .theme
-        .unwrap_or_else(|| state.config.default_theme.clone());
-
-    // Parse expiry
-    let now = chrono_now();
-    let expires_at = match meta.expiry.as_deref() {
-        Some(exp) => {
-            let seconds = parse_expiry(exp).map_err(AppError::BadRequest)?;
-            Some(add_seconds_to_now(&now, seconds))
-        }
-        None => None,
-    };
-
-    // Hash password if provided (argon2 is CPU-heavy; run off the async executor).
-    let password_hash = match meta.password.as_deref() {
-        Some(pw) if !pw.is_empty() => {
-            let pw_owned = pw.to_string();
-            let hash = tokio::task::spawn_blocking(move || hash_password(&pw_owned))
-                .await
-                .map_err(|e| AppError::Internal(format!("Task failed: {e}")))??;
-            Some(hash)
-        }
-        _ => None,
-    };
-
-    let doc = DocumentRecord {
-        id: slug.clone(),
-        slug: slug.clone(),
-        title: title.clone(),
+    let req = crate::service::PublishRequest {
         raw_content,
-        theme,
-        password: password_hash,
-        description: meta.description.clone(),
-        created_at: now.clone(),
-        expires_at: expires_at.clone(),
-        updated_at: now.clone(),
+        principal,
+        client_ip,
     };
 
-    // Insert (handle slug collision).
-    // On a random-slug collision: retry once with a new slug and carry the final
-    // slug forward so the single audit write below uses the correct value.
-    let final_doc = match state.db.insert_document(&doc) {
-        Ok(()) => doc,
-        Err(e) if is_unique_violation(&e) => {
-            // Custom slug collision -> 409 Conflict
-            if meta.slug.is_some() {
-                return Err(AppError::Conflict(format!(
-                    "Slug '{}' is already in use",
-                    slug
-                )));
-            }
-            // Random slug collision (extremely rare) -> retry once
-            let new_slug = nanoid::nanoid!(10, &SLUG_ALPHABET);
-            let retry_doc = DocumentRecord {
-                id: new_slug.clone(),
-                slug: new_slug.clone(),
-                ..doc
-            };
-            state.db.insert_document(&retry_doc).map_err(|e2| {
-                tracing::error!(error = %e2, "Slug collision retry failed");
-                AppError::Internal("Failed to allocate unique slug".to_string())
-            })?;
-            retry_doc
-        }
-        Err(e) => return Err(AppError::from(e)),
-    };
+    let result = tokio::task::spawn_blocking({
+        let db = state.db.clone();
+        let config = state.config.clone();
+        move || crate::service::publish(&db, &config, req)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("Task failed: {e}")))??;
 
-    // Response — uses final_doc.slug so collision-retry path gets the correct slug.
-    let base = state.config.base_url.trim_end_matches('/');
     let response = CreateResponse {
-        url: format!("{base}/{}", final_doc.slug),
-        slug: final_doc.slug.clone(),
-        api_url: format!("{base}/api/v1/documents/{}", final_doc.slug),
-        title: final_doc.title.clone(),
-        description: final_doc.description.clone(),
-        created_at: final_doc.created_at.clone(),
-        expires_at: final_doc.expires_at.clone(),
+        url: result.url,
+        slug: result.slug,
+        api_url: result.api_url,
+        title: result.title,
+        description: result.description,
+        created_at: result.created_at,
+        expires_at: result.expires_at,
     };
-
-    // Dispatch webhook fire-and-forget AFTER building response.
-    // Webhook failure never affects the 201 response.
-    if let Some(ref wh_url) = state.config.webhook_url {
-        webhook::dispatch_webhook(
-            wh_url.clone(),
-            state.config.webhook_secret.clone(),
-            "document.created",
-            now.clone(),
-            webhook::WebhookDocument {
-                slug: final_doc.slug.clone(),
-                title: final_doc.title.clone(),
-                url: response.url.clone(),
-                api_url: response.api_url.clone(),
-            },
-        );
-    }
-
-    // Single audit write site — after slug-collision branch resolves, using the
-    // final slug and a fresh timestamp. Fire-and-forget.
-    let ip_address = extract_client_ip(&headers, peer_addr.as_deref());
-    let audit_entry = AuditEntry {
-        id: nanoid::nanoid!(10),
-        timestamp: chrono_now(),
-        action: "create".to_string(),
-        slug: final_doc.slug.clone(),
-        token_name: principal.display_name,
-        ip_address,
-    };
-    if let Err(e) = state.db.insert_audit_entry(&audit_entry) {
-        tracing::error!(error = %e, "Failed to write audit entry");
-    }
 
     Ok((StatusCode::CREATED, Json(response)).into_response())
 }
@@ -883,6 +770,10 @@ fn is_known_bot(headers: &HeaderMap) -> bool {
 /// Only removes lines inside the opening `---` ... closing `---` block.
 /// Does not modify content that has no frontmatter or no password field.
 /// Returns a new String; the stored document is never modified.
+pub fn strip_password_from_content_pub(raw: &str) -> String {
+    strip_password_from_content(raw)
+}
+
 fn strip_password_from_content(raw: &str) -> String {
     let lines: Vec<&str> = raw.lines().collect();
 
@@ -1434,14 +1325,23 @@ fn strip_marker_comments(source: &str) -> String {
 }
 
 /// Render markdown to HTML using comrak with GFM extensions.
+/// Render markdown to HTML using comrak with GFM extensions.
+///
+/// `render.unsafe_` is intentionally false — raw HTML in document content is
+/// NOT passed through to the output. ammonia then sanitizes the rendered HTML
+/// as a second layer, stripping any script tags, event handlers, iframes, or
+/// other XSS vectors that comrak's own sanitization might miss.
 fn render_markdown(source: &str) -> String {
     let mut options = Options::default();
     options.extension.table = true;
     options.extension.strikethrough = true;
     options.extension.autolink = true;
     options.extension.tasklist = true;
-    options.render.unsafe_ = true;
-    markdown_to_html(source, &options)
+    options.render.unsafe_ = false;
+    let rendered = markdown_to_html(source, &options);
+    // Second layer: ammonia removes script tags, event handlers, iframes, and
+    // any other XSS-capable constructs while preserving safe formatting HTML.
+    ammonia::clean(&rendered)
 }
 
 /// Render a themed HTML response with syntax highlighting.
@@ -1936,6 +1836,7 @@ fn add_seconds_to_now(_now: &str, seconds: u64) -> String {
 }
 
 /// Check whether a rusqlite error is a UNIQUE constraint violation.
+#[allow(dead_code)]
 fn is_unique_violation(e: &rusqlite::Error) -> bool {
     matches!(
         e,
@@ -2754,7 +2655,6 @@ mod tests {
     /// Returns (Router, plaintext_managed_token). The admin TWOFOLD_TOKEN is set
     /// to "admin-token" so both paths can be exercised separately.
     fn test_app_with_managed_token() -> (Router, String) {
-        use crate::config::ServeConfig;
         use crate::db::{Db, TokenRecord};
 
         let db = Db::open(":memory:").expect("in-memory db");
@@ -2905,7 +2805,6 @@ mod tests {
     /// yet it should be excluded by `WHERE revoked = 0`.
     #[tokio::test]
     async fn test_revoked_managed_token_rejected() {
-        use crate::config::ServeConfig;
         use crate::db::{Db, TokenRecord};
 
         let db = Db::open(":memory:").expect("in-memory db");

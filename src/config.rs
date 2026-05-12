@@ -46,19 +46,21 @@ impl ServeConfig {
             return Err("TWOFOLD_TOKEN must not be empty.".to_string());
         }
 
-        let bind = std::env::var("TWOFOLD_BIND")
-            .unwrap_or_else(|_| "127.0.0.1:3000".to_string());
+        let bind = std::env::var("TWOFOLD_BIND").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
 
-        let db_path = std::env::var("TWOFOLD_DB_PATH")
-            .unwrap_or_else(|_| "./twofold.db".to_string());
+        let db_path =
+            std::env::var("TWOFOLD_DB_PATH").unwrap_or_else(|_| "./twofold.db".to_string());
 
         let base_url = std::env::var("TWOFOLD_BASE_URL")
             .unwrap_or_else(|_| "http://localhost:3000".to_string());
+        url::Url::parse(&base_url).map_err(|e| {
+            format!("TWOFOLD_BASE_URL is not a valid URL (got '{base_url}'): {e}")
+        })?;
 
         let max_size = match std::env::var("TWOFOLD_MAX_SIZE") {
-            Ok(s) => s.parse::<usize>().map_err(|_| {
-                format!("TWOFOLD_MAX_SIZE must be a positive integer, got: {s}")
-            })?,
+            Ok(s) => s
+                .parse::<usize>()
+                .map_err(|_| format!("TWOFOLD_MAX_SIZE must be a positive integer, got: {s}"))?,
             Err(_) => 1_048_576,
         };
 
@@ -69,17 +71,29 @@ impl ServeConfig {
             Err(_) => 60,
         };
 
-        let default_theme = std::env::var("TWOFOLD_DEFAULT_THEME")
-            .unwrap_or_else(|_| "clean".to_string());
+        let default_theme =
+            std::env::var("TWOFOLD_DEFAULT_THEME").unwrap_or_else(|_| "clean".to_string());
 
         // Webhook configuration — both are optional. No webhook fired if URL is unset.
-        let webhook_url = std::env::var("TWOFOLD_WEBHOOK_URL")
-            .ok()
-            .and_then(|s| if s.is_empty() { None } else { Some(s) });
+        let webhook_url = std::env::var("TWOFOLD_WEBHOOK_URL").ok().and_then(|s| {
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
+        });
+        if let Some(ref u) = webhook_url {
+            url::Url::parse(u)
+                .map_err(|e| format!("TWOFOLD_WEBHOOK_URL is not a valid URL (got '{u}'): {e}"))?;
+        }
 
-        let webhook_secret = std::env::var("TWOFOLD_WEBHOOK_SECRET")
-            .ok()
-            .and_then(|s| if s.is_empty() { None } else { Some(s) });
+        let webhook_secret = std::env::var("TWOFOLD_WEBHOOK_SECRET").ok().and_then(|s| {
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
+        });
 
         // Rate limiting configuration — all optional with sensible defaults.
         let rate_limit_read = match std::env::var("TWOFOLD_RATE_LIMIT_READ") {

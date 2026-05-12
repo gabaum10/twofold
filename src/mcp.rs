@@ -48,11 +48,21 @@ pub(crate) struct JsonRpcError {
 
 impl Response {
     pub(crate) fn ok(id: Value, result: Value) -> Self {
-        Self { jsonrpc: "2.0", id, result: Some(result), error: None }
+        Self {
+            jsonrpc: "2.0",
+            id,
+            result: Some(result),
+            error: None,
+        }
     }
 
     pub(crate) fn err(id: Value, code: i32, message: String) -> Self {
-        Self { jsonrpc: "2.0", id, result: None, error: Some(JsonRpcError { code, message }) }
+        Self {
+            jsonrpc: "2.0",
+            id,
+            result: None,
+            error: Some(JsonRpcError { code, message }),
+        }
     }
 }
 
@@ -79,6 +89,11 @@ fn tool_result_err(message: String) -> Value {
 /// (possibly with surrounding whitespace), to prevent breaking out of the
 /// agent layer containment.
 fn contains_marker_directive(s: &str) -> bool {
+    contains_marker_directive_pub(s)
+}
+
+/// Public re-export of the marker directive check for use by mcp_http.rs.
+pub fn contains_marker_directive_pub(s: &str) -> bool {
     s.lines().any(|line| {
         let t = line.trim();
         t == "<!-- @agent -->" || t == "<!-- @end -->"
@@ -103,8 +118,8 @@ pub(crate) fn build_client() -> reqwest::blocking::Client {
 /// Run the MCP server on stdio. Reads JSON-RPC messages line-by-line.
 /// Each line is one complete JSON-RPC message.
 pub fn run_mcp_server() {
-    let server_url = std::env::var("TWOFOLD_MCP_SERVER")
-        .unwrap_or_else(|_| "http://localhost:3000".to_string());
+    let server_url =
+        std::env::var("TWOFOLD_MCP_SERVER").unwrap_or_else(|_| "http://localhost:3000".to_string());
     let server_url = server_url.trim_end_matches('/').to_string();
 
     // Token: TWOFOLD_MCP_TOKEN falls back to TWOFOLD_TOKEN
@@ -137,11 +152,7 @@ pub fn run_mcp_server() {
             Err(e) => {
                 // Parse error — send JSON-RPC parse error if we can determine an id.
                 // Since we can't parse, use null id per spec.
-                let resp = Response::err(
-                    Value::Null,
-                    -32700,
-                    format!("Parse error: {e}"),
-                );
+                let resp = Response::err(Value::Null, -32700, format!("Parse error: {e}"));
                 write_response(&stdout, &resp);
                 continue;
             }
@@ -197,141 +208,153 @@ pub(crate) fn handle_request(
 }
 
 fn handle_initialize(id: Value) -> Response {
-    Response::ok(id, serde_json::json!({
-        "protocolVersion": "2024-11-05",
-        "serverInfo": {
-            "name": "twofold",
-            "version": env!("CARGO_PKG_VERSION"),
-            "icons": [
-                {
-                    "url": "https://share.hearth.observer/icon.png",
-                    "mime_type": "image/jpeg"
-                }
-            ]
-        },
-        "capabilities": {
-            "tools": {}
-        }
-    }))
+    Response::ok(
+        id,
+        serde_json::json!({
+            "protocolVersion": "2024-11-05",
+            "serverInfo": {
+                "name": "twofold",
+                "version": env!("CARGO_PKG_VERSION"),
+                "icons": [
+                    {
+                        "url": "https://share.hearth.observer/icon.png",
+                        "mime_type": "image/jpeg"
+                    }
+                ]
+            },
+            "capabilities": {
+                "tools": {}
+            }
+        }),
+    )
+}
+
+/// Public entry point for the tools/list response, shared between the stdio
+/// and HTTP MCP transports so both advertise identical tool schemas.
+pub fn tools_list_response(id: Value) -> Response {
+    handle_tools_list(id)
 }
 
 fn handle_tools_list(id: Value) -> Response {
-    Response::ok(id, serde_json::json!({
-        "tools": [
-            {
-                "name": "twofold_publish",
-                "description": "Publish a dual-layer document. One URL, two audiences. The human layer (content) gives readers the critical context they need to understand and act on the information — concise, scannable, written for someone on their phone. The agent layer (agent_content) carries the full technical depth — specs, data, configuration, implementation details — everything an AI agent needs to pick up the thread and work with it. When someone pastes the link into a conversation with an AI, the agent fetches the API endpoint and gets the complete picture without the human needing to relay it.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "content": {
-                            "type": "string",
-                            "description": "Human-readable layer, visible in the browser. Write the essential context a person needs to understand what this is, why it matters, and what to do next. Keep it concise and scannable. Skip technical specs, API details, and structured data — those belong in agent_content."
+    Response::ok(
+        id,
+        serde_json::json!({
+            "tools": [
+                {
+                    "name": "twofold_publish",
+                    "description": "Publish a dual-layer document. One URL, two audiences. The human layer (content) gives readers the critical context they need to understand and act on the information — concise, scannable, written for someone on their phone. The agent layer (agent_content) carries the full technical depth — specs, data, configuration, implementation details — everything an AI agent needs to pick up the thread and work with it. When someone pastes the link into a conversation with an AI, the agent fetches the API endpoint and gets the complete picture without the human needing to relay it.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "content": {
+                                "type": "string",
+                                "description": "Human-readable layer, visible in the browser. Write the essential context a person needs to understand what this is, why it matters, and what to do next. Keep it concise and scannable. Skip technical specs, API details, and structured data — those belong in agent_content."
+                            },
+                            "agent_content": {
+                                "type": "string",
+                                "description": "Agent-readable layer, invisible in the browser, accessible via the API endpoint. Full technical context: specs, structured data, API references, configuration, implementation details, and any information an AI agent would need to pick up this thread and act on it without asking follow-up questions. Write for a machine that's about to do work with this information."
+                            },
+                            "title": {
+                                "type": "string",
+                                "description": "The document title. Displayed in browser tabs, search results, OpenGraph previews, and social cards. Always set this explicitly. If omitted, falls back to the first heading in the content, which may not be what you want."
+                            },
+                            "slug": {
+                                "type": "string",
+                                "description": "Optional custom URL slug."
+                            },
+                            "expiry": {
+                                "type": "string",
+                                "description": "Optional expiry duration (e.g. '7d', '24h', '2w'). Document is automatically deleted after expiry."
+                            },
+                            "theme": {
+                                "type": "string",
+                                "description": "Optional theme name."
+                            },
+                            "description": {
+                                "type": "string",
+                                "description": "Optional document description."
+                            }
                         },
-                        "agent_content": {
-                            "type": "string",
-                            "description": "Agent-readable layer, invisible in the browser, accessible via the API endpoint. Full technical context: specs, structured data, API references, configuration, implementation details, and any information an AI agent would need to pick up this thread and act on it without asking follow-up questions. Write for a machine that's about to do work with this information."
+                        "required": ["content"]
+                    }
+                },
+                {
+                    "name": "twofold_get",
+                    "description": "Retrieve raw markdown content for a slug.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "slug": { "type": "string", "description": "Document slug." }
                         },
-                        "title": {
-                            "type": "string",
-                            "description": "The document title. Displayed in browser tabs, search results, OpenGraph previews, and social cards. Always set this explicitly. If omitted, falls back to the first heading in the content, which may not be what you want."
-                        },
-                        "slug": {
-                            "type": "string",
-                            "description": "Optional custom URL slug."
-                        },
-                        "expiry": {
-                            "type": "string",
-                            "description": "Optional expiry duration (e.g. '7d', '24h', '2w'). Document is automatically deleted after expiry."
-                        },
-                        "theme": {
-                            "type": "string",
-                            "description": "Optional theme name."
-                        },
-                        "description": {
-                            "type": "string",
-                            "description": "Optional document description."
-                        }
-                    },
-                    "required": ["content"]
-                }
-            },
-            {
-                "name": "twofold_get",
-                "description": "Retrieve raw markdown content for a slug.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "slug": { "type": "string", "description": "Document slug." }
-                    },
-                    "required": ["slug"]
-                }
-            },
-            {
-                "name": "twofold_list",
-                "description": "List published documents.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "limit": {
-                            "type": "integer",
-                            "description": "Maximum results (default 20, max 100).",
-                            "default": 20
+                        "required": ["slug"]
+                    }
+                },
+                {
+                    "name": "twofold_list",
+                    "description": "List published documents.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "limit": {
+                                "type": "integer",
+                                "description": "Maximum results (default 20, max 100).",
+                                "default": 20
+                            }
                         }
                     }
+                },
+                {
+                    "name": "twofold_delete",
+                    "description": "Delete a document by slug.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "slug": { "type": "string", "description": "Document slug to delete." }
+                        },
+                        "required": ["slug"]
+                    }
+                },
+                {
+                    "name": "twofold_update",
+                    "description": "Update an existing document. Returns 404 if the slug does not exist. Use twofold_publish to create new documents. Publish a dual-layer document. One URL, two audiences. The human layer (content) gives readers the critical context they need to understand and act on the information — concise, scannable, written for someone on their phone. The agent layer (agent_content) carries the full technical depth — specs, data, configuration, implementation details — everything an AI agent needs to pick up the thread and work with it. When someone pastes the link into a conversation with an AI, the agent fetches the API endpoint and gets the complete picture without the human needing to relay it.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "slug": {
+                                "type": "string",
+                                "description": "Slug of the document to update."
+                            },
+                            "content": {
+                                "type": "string",
+                                "description": "Human-readable layer, visible in the browser. Write the essential context a person needs to understand what this is, why it matters, and what to do next. Keep it concise and scannable. Skip technical specs, API details, and structured data — those belong in agent_content."
+                            },
+                            "agent_content": {
+                                "type": "string",
+                                "description": "Agent-readable layer, invisible in the browser, accessible via the API endpoint. Full technical context: specs, structured data, API references, configuration, implementation details, and any information an AI agent would need to pick up this thread and act on it without asking follow-up questions. Write for a machine that's about to do work with this information."
+                            },
+                            "title": {
+                                "type": "string",
+                                "description": "The document title. Displayed in browser tabs, search results, OpenGraph previews, and social cards. Always set this explicitly. If omitted, falls back to the first heading in the content, which may not be what you want."
+                            },
+                            "description": {
+                                "type": "string",
+                                "description": "Optional document description."
+                            },
+                            "expiry": {
+                                "type": "string",
+                                "description": "Optional expiry duration (e.g. '7d', '24h', '2w'). Document is automatically deleted after expiry."
+                            },
+                            "theme": {
+                                "type": "string",
+                                "description": "Optional theme name."
+                            }
+                        },
+                        "required": ["slug", "content"]
+                    }
                 }
-            },
-            {
-                "name": "twofold_delete",
-                "description": "Delete a document by slug.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "slug": { "type": "string", "description": "Document slug to delete." }
-                    },
-                    "required": ["slug"]
-                }
-            },
-            {
-                "name": "twofold_update",
-                "description": "Update an existing document. Returns 404 if the slug does not exist. Use twofold_publish to create new documents. Publish a dual-layer document. One URL, two audiences. The human layer (content) gives readers the critical context they need to understand and act on the information — concise, scannable, written for someone on their phone. The agent layer (agent_content) carries the full technical depth — specs, data, configuration, implementation details — everything an AI agent needs to pick up the thread and work with it. When someone pastes the link into a conversation with an AI, the agent fetches the API endpoint and gets the complete picture without the human needing to relay it.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "slug": {
-                            "type": "string",
-                            "description": "Slug of the document to update."
-                        },
-                        "content": {
-                            "type": "string",
-                            "description": "Human-readable layer, visible in the browser. Write the essential context a person needs to understand what this is, why it matters, and what to do next. Keep it concise and scannable. Skip technical specs, API details, and structured data — those belong in agent_content."
-                        },
-                        "agent_content": {
-                            "type": "string",
-                            "description": "Agent-readable layer, invisible in the browser, accessible via the API endpoint. Full technical context: specs, structured data, API references, configuration, implementation details, and any information an AI agent would need to pick up this thread and act on it without asking follow-up questions. Write for a machine that's about to do work with this information."
-                        },
-                        "title": {
-                            "type": "string",
-                            "description": "The document title. Displayed in browser tabs, search results, OpenGraph previews, and social cards. Always set this explicitly. If omitted, falls back to the first heading in the content, which may not be what you want."
-                        },
-                        "description": {
-                            "type": "string",
-                            "description": "Optional document description."
-                        },
-                        "expiry": {
-                            "type": "string",
-                            "description": "Optional expiry duration (e.g. '7d', '24h', '2w'). Document is automatically deleted after expiry."
-                        },
-                        "theme": {
-                            "type": "string",
-                            "description": "Optional theme name."
-                        }
-                    },
-                    "required": ["slug", "content"]
-                }
-            }
-        ]
-    }))
+            ]
+        }),
+    )
 }
 
 fn handle_tools_call(
@@ -351,7 +374,10 @@ fn handle_tools_call(
         None => return Response::err(id, -32602, "Missing tool name".to_string()),
     };
 
-    let args = params.get("arguments").cloned().unwrap_or(Value::Object(Default::default()));
+    let args = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or(Value::Object(Default::default()));
 
     let result = match tool_name {
         "twofold_publish" => tool_publish(client, server_url, token, &args),
@@ -392,8 +418,12 @@ fn tool_publish(
     let agent_content = args.get("agent_content").and_then(|v| v.as_str());
 
     // Determine whether to inject frontmatter.
-    let has_fm_args = title.is_some() || slug.is_some() || password.is_some()
-        || expiry.is_some() || theme.is_some() || description.is_some();
+    let has_fm_args = title.is_some()
+        || slug.is_some()
+        || password.is_some()
+        || expiry.is_some()
+        || theme.is_some()
+        || description.is_some();
     let mut body = if !has_fm_args {
         // No args to inject — send content as-is.
         content.to_string()
@@ -615,8 +645,11 @@ fn tool_update(
 
     // Inject frontmatter for provided fields.
     // When content already has frontmatter, merge args in (args win on conflict).
-    let has_fm_args = title.is_some() || description.is_some() || password.is_some()
-        || expiry.is_some() || theme.is_some();
+    let has_fm_args = title.is_some()
+        || description.is_some()
+        || password.is_some()
+        || expiry.is_some()
+        || theme.is_some();
     let mut body = if !has_fm_args {
         content.to_string()
     } else if content.trim_start().starts_with("---") {
@@ -708,8 +741,9 @@ fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 2);
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
-            | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }
@@ -739,6 +773,20 @@ pub fn yaml_escape_value_pub(s: &str) -> String {
 
 fn yaml_escape_value(s: &str) -> String {
     yaml_escape_value_pub(s)
+}
+
+/// Public alias for `merge_fm_args` so `mcp_http` can call it directly.
+#[allow(clippy::too_many_arguments)]
+pub fn merge_fm_args_pub(
+    content: &str,
+    title: Option<&str>,
+    slug: Option<&str>,
+    password: Option<&str>,
+    expiry: Option<&str>,
+    theme: Option<&str>,
+    description: Option<&str>,
+) -> String {
+    merge_fm_args(content, title, slug, password, expiry, theme, description)
 }
 
 /// Merge MCP tool args into existing frontmatter.
@@ -798,12 +846,24 @@ fn merge_fm_args(
 
     // Collect which keys we want to set, track which ones we've written.
     let mut args: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
-    if let Some(t) = title { args.insert("title", t); }
-    if let Some(s) = slug { args.insert("slug", s); }
-    if let Some(p) = password { args.insert("password", p); }
-    if let Some(ex) = expiry { args.insert("expiry", ex); }
-    if let Some(th) = theme { args.insert("theme", th); }
-    if let Some(d) = description { args.insert("description", d); }
+    if let Some(t) = title {
+        args.insert("title", t);
+    }
+    if let Some(s) = slug {
+        args.insert("slug", s);
+    }
+    if let Some(p) = password {
+        args.insert("password", p);
+    }
+    if let Some(ex) = expiry {
+        args.insert("expiry", ex);
+    }
+    if let Some(th) = theme {
+        args.insert("theme", th);
+    }
+    if let Some(d) = description {
+        args.insert("description", d);
+    }
 
     let mut written_keys: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut fm_lines: Vec<String> = Vec::new();

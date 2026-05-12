@@ -95,7 +95,30 @@ impl RateLimitStore {
     /// Hard limit: 5 requests per 60-second window. Legitimate clients register
     /// once; this budget is generous enough for retries while blocking spam.
     pub fn check_registration(&self, ip: &str) -> Result<(), RateLimitError> {
-        check_bucket(&self.registration_store, ip, REGISTRATION_LIMIT, REGISTRATION_WINDOW_SECS)
+        check_bucket(
+            &self.registration_store,
+            ip,
+            REGISTRATION_LIMIT,
+            REGISTRATION_WINDOW_SECS,
+        )
+    }
+
+    /// Evict stale buckets from all rate limit stores.
+    ///
+    /// Retains only buckets whose window started within the last 2× window_secs.
+    /// Buckets older than that will never be mid-window again — they are dead weight.
+    /// Call periodically (e.g., every 5 minutes) to prevent unbounded memory growth
+    /// from IPs/tokens that are seen once and never again.
+    pub fn evict_expired(&self) {
+        let cutoff_secs = self.window_secs * 2;
+        let registration_cutoff = REGISTRATION_WINDOW_SECS * 2;
+
+        self.read_store
+            .retain(|_, bucket| bucket.window_start.elapsed().as_secs() < cutoff_secs);
+        self.write_store
+            .retain(|_, bucket| bucket.window_start.elapsed().as_secs() < cutoff_secs);
+        self.registration_store
+            .retain(|_, bucket| bucket.window_start.elapsed().as_secs() < registration_cutoff);
     }
 }
 
@@ -235,12 +258,18 @@ where
             .get::<Arc<RateLimitStore>>()
             .cloned()
             .ok_or_else(|| {
-                (StatusCode::INTERNAL_SERVER_ERROR, "Rate limit store missing").into_response()
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Rate limit store missing",
+                )
+                    .into_response()
             })?;
 
         let ip = extract_client_ip(parts);
 
-        store.check_read(&ip).map_err(|e| too_many_requests_response(&e))?;
+        store
+            .check_read(&ip)
+            .map_err(|e| too_many_requests_response(&e))?;
         Ok(ReadRateLimit)
     }
 }
@@ -268,12 +297,18 @@ where
             .get::<Arc<RateLimitStore>>()
             .cloned()
             .ok_or_else(|| {
-                (StatusCode::INTERNAL_SERVER_ERROR, "Rate limit store missing").into_response()
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Rate limit store missing",
+                )
+                    .into_response()
             })?;
 
         let ip = extract_client_ip(parts);
 
-        store.check_registration(&ip).map_err(|e| too_many_requests_response(&e))?;
+        store
+            .check_registration(&ip)
+            .map_err(|e| too_many_requests_response(&e))?;
         Ok(RegistrationRateLimit)
     }
 }
@@ -300,14 +335,20 @@ where
             .get::<Arc<RateLimitStore>>()
             .cloned()
             .ok_or_else(|| {
-                (StatusCode::INTERNAL_SERVER_ERROR, "Rate limit store missing").into_response()
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Rate limit store missing",
+                )
+                    .into_response()
             })?;
 
         // If there's no bearer token, let the request through to the handler's
         // own auth check which will return 401. We don't rate-limit unauthenticated
         // requests on the write bucket.
         if let Some(token) = extract_bearer_from_headers(&parts.headers) {
-            store.check_write(&token).map_err(|e| too_many_requests_response(&e))?;
+            store
+                .check_write(&token)
+                .map_err(|e| too_many_requests_response(&e))?;
         }
 
         Ok(WriteRateLimit)

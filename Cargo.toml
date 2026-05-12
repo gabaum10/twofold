@@ -28,7 +28,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 nanoid = "0.4"
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 subtle = "2"
-serde_yaml = "0.9"
+serde_yml = "0.0.12"
+ammonia = "4"
 argon2 = "0.5"
 rand = "0.8"
 base64 = "0.22"
