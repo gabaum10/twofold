@@ -7,6 +7,7 @@ mod mcp;
 mod mcp_http;
 mod oauth;
 mod parser;
+mod rate_limit;
 mod webhook;
 
 use std::sync::Arc;
@@ -26,6 +27,7 @@ use cli::{Cli, Commands, TokenAction};
 use config::ServeConfig;
 use db::Db;
 use handlers::AppState;
+use rate_limit::RateLimitStore;
 
 fn main() {
     let cli = Cli::parse();
@@ -92,10 +94,16 @@ async fn run_server() {
     let bind_addr = config.bind.clone();
     let reaper_interval = config.reaper_interval;
 
+    // Build the rate limit store from config before moving config into Arc.
+    let rate_limit = RateLimitStore::new(&config);
+
     let state = AppState {
         db: db.clone(),
         config: Arc::new(config),
         auth_codes: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        oauth_clients: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        refresh_tokens: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        rate_limit: rate_limit.clone(),
     };
 
     // Spawn the background reaper task for expired documents.
@@ -143,8 +151,7 @@ async fn run_server() {
         .route("/authorize", get(oauth::handle_authorize))
         // OAuth 2.0 token endpoint — client_credentials and authorization_code.
         .route("/oauth/token", post(oauth::handle_oauth_token))
-        // Remote MCP endpoint — bearer token required (token from OAuth flow).
-        .route("/mcp", post(mcp_http::handle_mcp_post))
+
         // Documents: POST (create) and GET (list) share the same path.
         // Axum 0.7: combine with method router chaining.
         .route("/api/v1/documents", post(handlers::post_document).get(handlers::list_documents))
@@ -161,16 +168,29 @@ async fn run_server() {
             axum::http::header::CONTENT_SECURITY_POLICY,
             csp,
         ))
-        .layer(DefaultBodyLimit::max(max_size))
+        .layer(DefaultBodyLimit::max(max_size));
+
+    // MCP HTTP transport — NOT behind DefaultBodyLimit (JSON-RPC payloads can
+    // be large for publish operations). Auth is handled inside the handler.
+    let mcp_router = Router::new()
+        .route("/mcp", post(mcp_http::handle_mcp_post))
+        .layer(DefaultBodyLimit::disable());
+
+    let app = app
+        .merge(mcp_router)
         .layer(TraceLayer::new_for_http())
+        // Inject the rate limit store into request extensions so that the
+        // ReadRateLimit and WriteRateLimit extractors can access it without
+        // requiring the AppState — keeps the extractor module generic.
+        .layer(axum::Extension(rate_limit))
         .with_state(state);
 
     // Wrap the entire router with NormalizePath so trailing slashes are stripped
     // before Axum's router sees the request path. NormalizePathLayer::layer()
-    // produces a Service, not a MakeService, so we call into_make_service() on
-    // the wrapped service via axum::ServiceExt.
+    // produces a Service, not a MakeService, so we call into_make_service_with_connect_info()
+    // on the wrapped service to expose the client socket address for IP extraction.
     let app = NormalizePathLayer::trim_trailing_slash().layer(app);
-    let app = axum::ServiceExt::<axum::http::Request<axum::body::Body>>::into_make_service(app);
+    let app = axum::ServiceExt::<axum::http::Request<axum::body::Body>>::into_make_service_with_connect_info::<std::net::SocketAddr>(app);
 
     let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
         Ok(l) => l,

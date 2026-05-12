@@ -17,6 +17,7 @@ use crate::{
     db::{Db, DocumentRecord},
     highlight,
     parser::{extract_frontmatter, extract_title, parse_document, parse_expiry, validate_slug},
+    rate_limit::{RateLimitError, RateLimitStore, ReadRateLimit, WriteRateLimit},
     webhook,
 };
 
@@ -46,25 +47,35 @@ pub enum AppError {
     DocumentPasswordRequired,
     /// Document is password-protected and the supplied password was wrong.
     DocumentPasswordInvalid,
+    /// Rate limit exceeded — carries metadata for response headers.
+    RateLimited(RateLimitError),
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        let (status, msg) = match self {
-            AppError::Unauthorized => (StatusCode::UNAUTHORIZED, "Unauthorized".to_string()),
-            AppError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
-            AppError::NotFound => (StatusCode::NOT_FOUND, "Not found".to_string()),
-            AppError::Conflict(m) => (StatusCode::CONFLICT, m),
-            AppError::Gone => (StatusCode::GONE, "Document has expired".to_string()),
-            AppError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
-            AppError::DocumentPasswordRequired => {
-                (StatusCode::UNAUTHORIZED, "Password required".to_string())
+        match self {
+            AppError::RateLimited(ref err) => {
+                crate::rate_limit::too_many_requests_response(err)
             }
-            AppError::DocumentPasswordInvalid => {
-                (StatusCode::UNAUTHORIZED, "Invalid password".to_string())
+            _ => {
+                let (status, msg) = match self {
+                    AppError::Unauthorized => (StatusCode::UNAUTHORIZED, "Unauthorized".to_string()),
+                    AppError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
+                    AppError::NotFound => (StatusCode::NOT_FOUND, "Not found".to_string()),
+                    AppError::Conflict(m) => (StatusCode::CONFLICT, m),
+                    AppError::Gone => (StatusCode::GONE, "Document has expired".to_string()),
+                    AppError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
+                    AppError::DocumentPasswordRequired => {
+                        (StatusCode::UNAUTHORIZED, "Password required".to_string())
+                    }
+                    AppError::DocumentPasswordInvalid => {
+                        (StatusCode::UNAUTHORIZED, "Invalid password".to_string())
+                    }
+                    AppError::RateLimited(_) => unreachable!(),
+                };
+                (status, Json(serde_json::json!({ "error": msg }))).into_response()
             }
-        };
-        (status, Json(serde_json::json!({ "error": msg }))).into_response()
+        }
     }
 }
 
@@ -125,6 +136,7 @@ pub struct AppState {
     pub oauth_clients: Arc<Mutex<HashMap<String, OAuthClientRecord>>>,
     /// Active refresh tokens keyed by token string.
     pub refresh_tokens: Arc<Mutex<HashMap<String, RefreshTokenRecord>>>,
+    pub rate_limit: Arc<RateLimitStore>,
 }
 
 // ── Templates ────────────────────────────────────────────────────────────────
@@ -247,6 +259,7 @@ pub struct ListResponse {
 /// v0.2: parses frontmatter for title, slug, theme, expiry, password, description.
 pub async fn post_document(
     State(state): State<AppState>,
+    _rl: WriteRateLimit,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
@@ -387,6 +400,7 @@ pub async fn post_document(
 /// Handle document update.
 pub async fn put_document(
     State(state): State<AppState>,
+    _rl: WriteRateLimit,
     Path(slug): Path<String>,
     headers: HeaderMap,
     body: Bytes,
@@ -493,6 +507,7 @@ pub async fn put_document(
 /// Handle document deletion.
 pub async fn delete_document(
     State(state): State<AppState>,
+    _rl: WriteRateLimit,
     Path(slug): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
@@ -540,6 +555,7 @@ pub async fn delete_document(
 /// Expired documents excluded at SQL level.
 pub async fn list_documents(
     State(state): State<AppState>,
+    _rl: WriteRateLimit,
     headers: HeaderMap,
     Query(params): Query<ListQuery>,
 ) -> Result<Response, AppError> {
@@ -594,7 +610,7 @@ pub async fn health_check(State(state): State<AppState>) -> Response {
 ///
 /// Content included at compile time via include_str! — no runtime file I/O,
 /// no startup panic if file is missing (compile error instead).
-pub async fn serve_openapi_yaml() -> impl IntoResponse {
+pub async fn serve_openapi_yaml(_rl: ReadRateLimit) -> impl IntoResponse {
     // include_str! embeds the file at compile time. The path is relative to src/.
     let yaml = include_str!("../docs/openapi.yaml");
     (
@@ -608,7 +624,7 @@ pub async fn serve_openapi_yaml() -> impl IntoResponse {
 ///
 /// Converted from YAML at first call, cached via OnceLock.
 /// serde_yaml → serde_json at startup eliminates repeated conversion cost.
-pub async fn serve_openapi_json() -> impl IntoResponse {
+pub async fn serve_openapi_json(_rl: ReadRateLimit) -> impl IntoResponse {
     use std::sync::OnceLock;
     static OPENAPI_JSON: OnceLock<String> = OnceLock::new();
 
@@ -638,6 +654,7 @@ pub async fn serve_openapi_json() -> impl IntoResponse {
 /// Password-protected documents show a password prompt.
 pub async fn get_human(
     State(state): State<AppState>,
+    _rl: ReadRateLimit,
     Path(slug): Path<String>,
     Query(params): Query<SlugQuery>,
     headers: HeaderMap,
@@ -703,6 +720,7 @@ pub async fn get_human(
 /// Handle password verification and cookie setting.
 pub async fn post_unlock(
     State(state): State<AppState>,
+    _rl: ReadRateLimit,
     Path(slug): Path<String>,
     Form(form): Form<UnlockForm>,
 ) -> Result<Response, AppError> {
@@ -760,6 +778,7 @@ pub async fn post_unlock(
 /// Password-protected documents still require authentication.
 pub async fn get_full(
     State(state): State<AppState>,
+    _rl: ReadRateLimit,
     Path(slug): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
@@ -821,6 +840,7 @@ pub struct AgentQuery {
 /// the document is protected and the password is missing or incorrect.
 pub async fn get_agent(
     State(state): State<AppState>,
+    _rl: ReadRateLimit,
     Path(slug): Path<String>,
     Query(params): Query<AgentQuery>,
 ) -> Result<Response, AppError> {
@@ -863,6 +883,7 @@ pub async fn get_agent(
 async fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
     let provided = extract_bearer(headers)
         .ok_or(AppError::Unauthorized)?;
+
     check_auth_token(state, provided).await
 }
 
@@ -1609,7 +1630,7 @@ mod tests {
     /// Build a minimal test router backed by an in-memory database.
     fn test_app(token: &str) -> Router {
         let db = crate::db::Db::open(":memory:").expect("in-memory db");
-        let config = Arc::new(crate::config::ServeConfig {
+        let config = crate::config::ServeConfig {
             token: token.to_string(),
             db_path: ":memory:".to_string(),
             bind: "127.0.0.1:0".to_string(),
@@ -1619,13 +1640,17 @@ mod tests {
             webhook_url: None,
             webhook_secret: None,
             reaper_interval: 3600,
-        });
+            rate_limit_read: 1000,
+            rate_limit_write: 1000,
+            rate_limit_window: 60,
+        };
+        let rate_limit = crate::rate_limit::RateLimitStore::new(&config);
         let state = AppState {
-            db,
-            config,
+            db, config: Arc::new(config),
             auth_codes: Arc::new(Mutex::new(HashMap::new())),
             oauth_clients: Arc::new(Mutex::new(HashMap::new())),
             refresh_tokens: Arc::new(Mutex::new(HashMap::new())),
+            rate_limit: rate_limit.clone(),
         };
         Router::new()
             .route(
@@ -1638,6 +1663,7 @@ mod tests {
                     .put(crate::handlers::put_document)
                     .delete(crate::handlers::delete_document),
             )
+            .layer(axum::Extension(rate_limit))
             .with_state(state)
     }
 
@@ -1646,7 +1672,7 @@ mod tests {
     /// Used for testing themed error pages (404/410) from the human view.
     fn test_app_full(token: &str) -> Router {
         let db = crate::db::Db::open(":memory:").expect("in-memory db");
-        let config = Arc::new(crate::config::ServeConfig {
+        let config = crate::config::ServeConfig {
             token: token.to_string(),
             db_path: ":memory:".to_string(),
             bind: "127.0.0.1:0".to_string(),
@@ -1656,13 +1682,17 @@ mod tests {
             webhook_url: None,
             webhook_secret: None,
             reaper_interval: 3600,
-        });
+            rate_limit_read: 1000,
+            rate_limit_write: 1000,
+            rate_limit_window: 60,
+        };
+        let rate_limit = crate::rate_limit::RateLimitStore::new(&config);
         let state = AppState {
-            db,
-            config,
+            db, config: Arc::new(config),
             auth_codes: Arc::new(Mutex::new(HashMap::new())),
             oauth_clients: Arc::new(Mutex::new(HashMap::new())),
             refresh_tokens: Arc::new(Mutex::new(HashMap::new())),
+            rate_limit: rate_limit.clone(),
         };
         Router::new()
             .route(
@@ -1678,6 +1708,7 @@ mod tests {
             .route("/:slug/unlock", post(crate::handlers::post_unlock))
             .route("/:slug/full", get(crate::handlers::get_full))
             .route("/:slug", get(crate::handlers::get_human))
+            .layer(axum::Extension(rate_limit))
             .with_state(state)
     }
 
@@ -1735,7 +1766,7 @@ mod tests {
         // DB handle so we can pre-seed the expired record.
 
         let db = crate::db::Db::open(":memory:").expect("in-memory db");
-        let config = Arc::new(crate::config::ServeConfig {
+        let config = crate::config::ServeConfig {
             token: token.to_string(),
             db_path: ":memory:".to_string(),
             bind: "127.0.0.1:0".to_string(),
@@ -1745,7 +1776,10 @@ mod tests {
             webhook_url: None,
             webhook_secret: None,
             reaper_interval: 3600,
-        });
+            rate_limit_read: 1000,
+            rate_limit_write: 1000,
+            rate_limit_window: 60,
+        };
 
         // Insert an already-expired document directly.
         let expired_doc = crate::db::DocumentRecord {
@@ -1762,12 +1796,13 @@ mod tests {
         };
         db.insert_document(&expired_doc).expect("insert expired doc");
 
+        let rate_limit = crate::rate_limit::RateLimitStore::new(&config);
         let state = AppState {
-            db,
-            config,
+            db, config: Arc::new(config),
             auth_codes: Arc::new(Mutex::new(HashMap::new())),
             oauth_clients: Arc::new(Mutex::new(HashMap::new())),
             refresh_tokens: Arc::new(Mutex::new(HashMap::new())),
+            rate_limit: rate_limit.clone(),
         };
         let app = Router::new()
             .route(
@@ -1783,6 +1818,7 @@ mod tests {
             .route("/:slug/unlock", post(crate::handlers::post_unlock))
             .route("/:slug/full", get(crate::handlers::get_full))
             .route("/:slug", get(crate::handlers::get_human))
+            .layer(axum::Extension(rate_limit))
             .with_state(state);
 
         let req = Request::builder()
@@ -2168,7 +2204,7 @@ mod tests {
         };
         db.insert_token(&record).expect("insert managed token");
 
-        let config = Arc::new(ServeConfig {
+        let config = crate::config::ServeConfig {
             token: "admin-token".to_string(),
             db_path: ":memory:".to_string(),
             bind: "127.0.0.1:0".to_string(),
@@ -2178,13 +2214,17 @@ mod tests {
             webhook_url: None,
             webhook_secret: None,
             reaper_interval: 3600,
-        });
+            rate_limit_read: 10000,
+            rate_limit_write: 10000,
+            rate_limit_window: 60,
+        };
+        let rate_limit = crate::rate_limit::RateLimitStore::new(&config);
         let state = AppState {
-            db,
-            config,
+            db, config: Arc::new(config),
             auth_codes: Arc::new(Mutex::new(HashMap::new())),
             oauth_clients: Arc::new(Mutex::new(HashMap::new())),
             refresh_tokens: Arc::new(Mutex::new(HashMap::new())),
+            rate_limit: rate_limit.clone(),
         };
         let router = Router::new()
             .route(
@@ -2197,6 +2237,7 @@ mod tests {
                     .put(crate::handlers::put_document)
                     .delete(crate::handlers::delete_document),
             )
+            .layer(axum::Extension(rate_limit))
             .with_state(state);
         (router, managed_plain.to_string())
     }
@@ -2298,7 +2339,7 @@ mod tests {
         };
         db.insert_token(&record).expect("insert revoked token");
 
-        let config = Arc::new(ServeConfig {
+        let config = crate::config::ServeConfig {
             token: "admin-token".to_string(),
             db_path: ":memory:".to_string(),
             bind: "127.0.0.1:0".to_string(),
@@ -2308,19 +2349,24 @@ mod tests {
             webhook_url: None,
             webhook_secret: None,
             reaper_interval: 3600,
-        });
+            rate_limit_read: 10000,
+            rate_limit_write: 10000,
+            rate_limit_window: 60,
+        };
+        let rate_limit = crate::rate_limit::RateLimitStore::new(&config);
         let state = AppState {
-            db,
-            config,
+            db, config: Arc::new(config),
             auth_codes: Arc::new(Mutex::new(HashMap::new())),
             oauth_clients: Arc::new(Mutex::new(HashMap::new())),
             refresh_tokens: Arc::new(Mutex::new(HashMap::new())),
+            rate_limit: rate_limit.clone(),
         };
         let router = Router::new()
             .route(
                 "/api/v1/documents",
                 post(crate::handlers::post_document).get(crate::handlers::list_documents),
             )
+            .layer(axum::Extension(rate_limit))
             .with_state(state);
 
         let req = Request::builder()

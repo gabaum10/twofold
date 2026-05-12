@@ -38,7 +38,7 @@ pub async fn handle_mcp_post(
         let base = state.config.base_url.trim_end_matches('/');
         format!("{base}/.well-known/oauth-protected-resource")
     };
-    let www_auth_value = format!("Bearer resource_metadata="{resource_metadata_url}"");
+    let www_auth_value = format!("Bearer resource_metadata=\"{resource_metadata_url}\"");
     let www_auth_header: axum::http::HeaderValue = www_auth_value
         .parse()
         .unwrap_or_else(|_| axum::http::HeaderValue::from_static("Bearer"));
@@ -53,7 +53,7 @@ pub async fn handle_mcp_post(
         None => {
             return (
                 StatusCode::UNAUTHORIZED,
-                [(axum::http::header::WWW_AUTHENTICATE, www_auth_header)],
+                [(axum::http::header::WWW_AUTHENTICATE, www_auth_header.clone())],
                 axum::Json(serde_json::json!({
                     "error": "unauthorized",
                     "error_description": "Bearer token required"
