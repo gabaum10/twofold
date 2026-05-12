@@ -1000,4 +1000,741 @@ mod tests {
     fn unsafe_redirect_not_a_url() {
         assert!(!is_safe_redirect_uri("not-a-url"));
     }
+
+    // ── HTTP API integration tests ────────────────────────────────────────────
+    //
+    // All tests go through the full axum handler stack using oneshot requests.
+    // No internal storage types are accessed for assertions — tests work whether
+    // OAuth state is in-memory or SQLite. The two tests that inject pre-built
+    // state (token_auth_code_expired, token_refresh_expired) seed the SQLite DB
+    // directly via Db methods, so they remain storage-agnostic at the HTTP level.
+
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+        routing::{get, post},
+        Router,
+    };
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    // ── Test router ──────────────────────────────────────────────────────────
+
+    /// Build a minimal OAuth router backed by an in-memory SQLite database.
+    ///
+    /// Mirrors the route registration in main.rs for the OAuth endpoints.
+    fn oauth_app(token: &str) -> Router {
+        let db = crate::db::Db::open(":memory:").expect("in-memory db");
+        let config = crate::config::ServeConfig {
+            token: token.to_string(),
+            db_path: ":memory:".to_string(),
+            bind: "127.0.0.1:0".to_string(),
+            base_url: "http://localhost".to_string(),
+            default_theme: "clean".to_string(),
+            max_size: 1_048_576,
+            webhook_url: None,
+            webhook_secret: None,
+            reaper_interval: 3600,
+            // High limits so individual tests don't hit read/write caps.
+            rate_limit_read: 10_000,
+            rate_limit_write: 10_000,
+            rate_limit_window: 60,
+        };
+        let rate_limit = crate::rate_limit::RateLimitStore::new(&config);
+        let state = crate::handlers::AppState {
+            db,
+            config: Arc::new(config),
+            rate_limit: rate_limit.clone(),
+        };
+        Router::new()
+            .route("/oauth/register", post(crate::oauth::handle_register))
+            .route("/authorize", get(crate::oauth::handle_authorize))
+            .route("/oauth/token", post(crate::oauth::handle_oauth_token))
+            .layer(axum::Extension(rate_limit))
+            .with_state(state)
+    }
+
+    /// Build an OAuth router for registration rate-limit testing.
+    ///
+    /// The registration_store bucket uses REGISTRATION_LIMIT (5) and
+    /// REGISTRATION_WINDOW_SECS (60) regardless of the per-read/write config,
+    /// so this is functionally identical to oauth_app. The separation makes
+    /// the test intent explicit.
+    fn oauth_app_tight_registration(token: &str) -> Router {
+        oauth_app(token)
+    }
+
+    // ── Flow helpers ─────────────────────────────────────────────────────────
+
+    /// POST /oauth/register with the given redirect_uris; returns the client_id.
+    async fn register_client(app: Router, redirect_uris: &[&str]) -> String {
+        let body = serde_json::json!({
+            "client_name": "test-client",
+            "redirect_uris": redirect_uris,
+            "token_endpoint_auth_method": "none"
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/oauth/register")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED, "register_client: expected 201");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        json["client_id"].as_str().unwrap().to_string()
+    }
+
+    /// Compute a PKCE S256 code_challenge from a verifier string.
+    fn pkce_challenge(verifier: &str) -> String {
+        let hash = Sha256::digest(verifier.as_bytes());
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash)
+    }
+
+    /// GET /authorize and extract `code` from the Location header.
+    async fn authorize(
+        app: Router,
+        client_id: &str,
+        redirect_uri: &str,
+        verifier: &str,
+        scope: Option<&str>,
+        resource: Option<&str>,
+    ) -> String {
+        let challenge = pkce_challenge(verifier);
+        let mut uri = format!(
+            "/authorize?response_type=code&client_id={client_id}&redirect_uri={redirect_uri}&code_challenge={challenge}&code_challenge_method=S256",
+        );
+        if let Some(s) = scope {
+            // Percent-encode spaces so the URI is valid (scope values can contain spaces).
+            let encoded = s.replace(' ', "%20");
+            uri.push_str(&format!("&scope={encoded}"));
+        }
+        if let Some(r) = resource {
+            // Percent-encode colons and slashes for safety in query parameter values.
+            let encoded = r.replace(':', "%3A").replace('/', "%2F");
+            uri.push_str(&format!("&resource={encoded}"));
+        }
+        let req = Request::builder()
+            .method("GET")
+            .uri(&uri)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let location = resp
+            .headers()
+            .get("location")
+            .expect("authorize: no Location header")
+            .to_str()
+            .unwrap()
+            .to_string();
+        extract_query_param(&location, "code").expect("authorize: no code in Location")
+    }
+
+    /// POST /oauth/token with grant_type=authorization_code; returns the raw response.
+    async fn exchange_code(
+        app: Router,
+        client_id: &str,
+        code: &str,
+        redirect_uri: &str,
+        verifier: &str,
+        resource: Option<&str>,
+    ) -> axum::response::Response {
+        let mut params = format!(
+            "grant_type=authorization_code&client_id={client_id}&code={code}&redirect_uri={redirect_uri}&code_verifier={verifier}"
+        );
+        if let Some(r) = resource {
+            params.push_str(&format!("&resource={r}"));
+        }
+        let req = Request::builder()
+            .method("POST")
+            .uri("/oauth/token")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(params))
+            .unwrap();
+        app.oneshot(req).await.unwrap()
+    }
+
+    /// Extract a named query parameter value from a URL string.
+    fn extract_query_param(url: &str, name: &str) -> Option<String> {
+        let query = url.split_once('?')?.1;
+        for pair in query.split('&') {
+            if let Some((k, v)) = pair.split_once('=') {
+                if k == name {
+                    return Some(v.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    // ── Registration ─────────────────────────────────────────────────────────
+
+    /// POST /oauth/register happy path — returns 201 with a client_id.
+    #[tokio::test]
+    async fn register_returns_client_id() {
+        let app = oauth_app("admin-token");
+        let body = serde_json::json!({
+            "client_name": "my-client",
+            "redirect_uris": ["https://example.com/callback"],
+            "token_endpoint_auth_method": "none"
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/oauth/register")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert!(json["client_id"].as_str().is_some(), "response must include client_id");
+        assert_eq!(json["client_name"].as_str().unwrap(), "my-client");
+        assert_eq!(
+            json["redirect_uris"][0].as_str().unwrap(),
+            "https://example.com/callback"
+        );
+        assert_eq!(json["token_endpoint_auth_method"].as_str().unwrap(), "none");
+    }
+
+    /// POST /oauth/register with empty redirect_uris — rejects with 400.
+    #[tokio::test]
+    async fn register_requires_redirect_uris() {
+        let app = oauth_app("admin-token");
+        let body = serde_json::json!({
+            "client_name": "bad-client",
+            "redirect_uris": []
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/oauth/register")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"].as_str().unwrap(), "invalid_client_metadata");
+    }
+
+    /// The 6th POST /oauth/register within 60 s from the same IP returns 429.
+    ///
+    /// The registration bucket is hard-coded at 5 req / 60 s per IP. The test
+    /// injects a consistent X-Forwarded-For header so all requests share one bucket.
+    #[tokio::test]
+    async fn register_rate_limited() {
+        let app = oauth_app_tight_registration("admin-token");
+
+        let good_body = serde_json::json!({
+            "client_name": "client",
+            "redirect_uris": ["https://example.com/cb"]
+        })
+        .to_string();
+
+        // 5 requests — all must succeed (budget is exactly 5).
+        for i in 0..5u8 {
+            let req = Request::builder()
+                .method("POST")
+                .uri("/oauth/register")
+                .header("Content-Type", "application/json")
+                .header("X-Forwarded-For", "10.0.0.42")
+                .body(Body::from(good_body.clone()))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::CREATED,
+                "request {i} should succeed"
+            );
+        }
+
+        // 6th request — bucket exhausted, must be 429.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/oauth/register")
+            .header("Content-Type", "application/json")
+            .header("X-Forwarded-For", "10.0.0.42")
+            .body(Body::from(good_body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    // ── Authorization ─────────────────────────────────────────────────────────
+
+    /// /authorize without code_challenge returns 400.
+    #[tokio::test]
+    async fn authorize_requires_pkce() {
+        let app = oauth_app("admin-token");
+        let client_id = register_client(app.clone(), &["https://example.com/cb"]).await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!(
+                "/authorize?response_type=code&client_id={client_id}&redirect_uri=https://example.com/cb"
+            ))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"].as_str().unwrap(), "invalid_request");
+    }
+
+    /// Unknown client + non-HTTPS, non-localhost redirect — returns 400.
+    ///
+    /// The is_safe_redirect_uri guard applies to unregistered clients: plain
+    /// http://evil.com must be rejected before a code is issued.
+    #[tokio::test]
+    async fn authorize_requires_registered_client_or_safe_redirect() {
+        let app = oauth_app("admin-token");
+        let challenge = pkce_challenge("some-verifier");
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!(
+                "/authorize?response_type=code&client_id=unknown-id&redirect_uri=http://evil.com/cb&code_challenge={challenge}&code_challenge_method=S256"
+            ))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"].as_str().unwrap(), "invalid_request");
+    }
+
+    /// Registered client with a redirect_uri not in its registered list — returns 400.
+    #[tokio::test]
+    async fn authorize_validates_redirect_uri_for_registered_client() {
+        let app = oauth_app("admin-token");
+        let client_id = register_client(app.clone(), &["https://example.com/cb"]).await;
+        let challenge = pkce_challenge("verifier");
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!(
+                "/authorize?response_type=code&client_id={client_id}&redirect_uri=https://other.com/cb&code_challenge={challenge}&code_challenge_method=S256"
+            ))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"].as_str().unwrap(), "invalid_request");
+    }
+
+    /// /authorize happy path — redirects with a `code` query parameter.
+    #[tokio::test]
+    async fn authorize_happy_path() {
+        let app = oauth_app("admin-token");
+        let client_id = register_client(app.clone(), &["https://example.com/cb"]).await;
+        let challenge = pkce_challenge("my-verifier");
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!(
+                "/authorize?response_type=code&client_id={client_id}&redirect_uri=https://example.com/cb&code_challenge={challenge}&code_challenge_method=S256"
+            ))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        let status = resp.status().as_u16();
+        assert!(
+            status == 302 || status == 303,
+            "expected redirect, got {status}"
+        );
+        let location = resp
+            .headers()
+            .get("location")
+            .expect("missing Location header")
+            .to_str()
+            .unwrap();
+        let code = extract_query_param(location, "code");
+        assert!(code.is_some(), "Location must contain code param: {location}");
+        assert!(!code.unwrap().is_empty());
+    }
+
+    // ── Token exchange ────────────────────────────────────────────────────────
+
+    /// Full flow: register → authorize → token exchange → access_token.
+    #[tokio::test]
+    async fn token_auth_code_happy_path() {
+        let app = oauth_app("admin-token");
+        let redirect_uri = "https://example.com/cb";
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+
+        let client_id = register_client(app.clone(), &[redirect_uri]).await;
+        let code = authorize(app.clone(), &client_id, redirect_uri, verifier, None, None).await;
+        let resp = exchange_code(app, &client_id, &code, redirect_uri, verifier, None).await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert!(json["access_token"].as_str().is_some(), "must have access_token");
+        assert_eq!(json["token_type"].as_str().unwrap(), "bearer");
+        assert!(json["expires_in"].as_u64().unwrap() > 0);
+    }
+
+    /// Wrong PKCE verifier at token exchange — returns invalid_grant.
+    #[tokio::test]
+    async fn token_auth_code_bad_verifier() {
+        let app = oauth_app("admin-token");
+        let redirect_uri = "https://example.com/cb";
+        let verifier = "correct-verifier-string-that-is-long-enough";
+
+        let client_id = register_client(app.clone(), &[redirect_uri]).await;
+        let code = authorize(app.clone(), &client_id, redirect_uri, verifier, None, None).await;
+        // Deliberately use a different verifier.
+        let resp =
+            exchange_code(app, &client_id, &code, redirect_uri, "wrong-verifier", None).await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"].as_str().unwrap(), "invalid_grant");
+    }
+
+    /// Expired authorization code — token exchange returns invalid_grant.
+    ///
+    /// An already-expired row is inserted directly via Db::insert_auth_code so the
+    /// test does not need to wait for a real timeout. This is the storage-agnostic
+    /// injection point: if the backing store changes, only this setup changes; the
+    /// HTTP assertion is identical.
+    #[tokio::test]
+    async fn token_auth_code_expired() {
+        let token = "admin-token";
+        let db = crate::db::Db::open(":memory:").expect("in-memory db");
+        let config = crate::config::ServeConfig {
+            token: token.to_string(),
+            db_path: ":memory:".to_string(),
+            bind: "127.0.0.1:0".to_string(),
+            base_url: "http://localhost".to_string(),
+            default_theme: "clean".to_string(),
+            max_size: 1_048_576,
+            webhook_url: None,
+            webhook_secret: None,
+            reaper_interval: 3600,
+            rate_limit_read: 10_000,
+            rate_limit_write: 10_000,
+            rate_limit_window: 60,
+        };
+        let rate_limit = crate::rate_limit::RateLimitStore::new(&config);
+
+        let redirect_uri = "https://example.com/cb";
+        let verifier = "test-verifier-for-expired-code";
+        let challenge = pkce_challenge(verifier);
+        let expired_code = "expired-code-0000000000000000000000000000000000000000";
+
+        // Seed an expired auth code directly into the database.
+        db.insert_auth_code(&crate::db::AuthCodeRow {
+            code: expired_code.to_string(),
+            client_id: "any-client".to_string(),
+            redirect_uri: redirect_uri.to_string(),
+            expires_at: "2000-01-01T00:00:00Z".to_string(), // firmly in the past
+            code_challenge: challenge,
+            resource: None,
+            scope: None,
+        })
+        .expect("seed expired auth code");
+
+        let state = crate::handlers::AppState {
+            db,
+            config: Arc::new(config),
+            rate_limit: rate_limit.clone(),
+        };
+        let app = Router::new()
+            .route("/oauth/register", post(crate::oauth::handle_register))
+            .route("/authorize", get(crate::oauth::handle_authorize))
+            .route("/oauth/token", post(crate::oauth::handle_oauth_token))
+            .layer(axum::Extension(rate_limit))
+            .with_state(state);
+
+        let params = format!(
+            "grant_type=authorization_code&client_id=any-client&code={expired_code}&redirect_uri={redirect_uri}&code_verifier={verifier}"
+        );
+        let req = Request::builder()
+            .method("POST")
+            .uri("/oauth/token")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(params))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"].as_str().unwrap(), "invalid_grant");
+    }
+
+    /// Reusing an authorization code returns invalid_grant (codes are single-use).
+    #[tokio::test]
+    async fn token_auth_code_replay() {
+        let app = oauth_app("admin-token");
+        let redirect_uri = "https://example.com/cb";
+        let verifier = "replay-test-verifier-long-enough-to-be-valid";
+
+        let client_id = register_client(app.clone(), &[redirect_uri]).await;
+        let code = authorize(app.clone(), &client_id, redirect_uri, verifier, None, None).await;
+
+        // First exchange — must succeed.
+        let resp1 =
+            exchange_code(app.clone(), &client_id, &code, redirect_uri, verifier, None).await;
+        assert_eq!(resp1.status(), StatusCode::OK, "first exchange must succeed");
+
+        // Second exchange with the same code — must fail.
+        let resp2 = exchange_code(app, &client_id, &code, redirect_uri, verifier, None).await;
+        assert_eq!(resp2.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp2.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"].as_str().unwrap(), "invalid_grant");
+    }
+
+    // ── Refresh token ─────────────────────────────────────────────────────────
+
+    /// Full refresh rotation: register → authorize (offline_access) → exchange → refresh.
+    #[tokio::test]
+    async fn token_refresh_happy_path() {
+        let app = oauth_app("admin-token");
+        let redirect_uri = "https://example.com/cb";
+        let verifier = "refresh-verifier-long-enough-to-be-valid-here";
+
+        let client_id = register_client(app.clone(), &[redirect_uri]).await;
+        let code = authorize(
+            app.clone(),
+            &client_id,
+            redirect_uri,
+            verifier,
+            Some("mcp:tools offline_access"),
+            None,
+        )
+        .await;
+        let resp =
+            exchange_code(app.clone(), &client_id, &code, redirect_uri, verifier, None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let token_resp: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        let refresh_token = token_resp["refresh_token"]
+            .as_str()
+            .expect("must have refresh_token when scope includes offline_access");
+
+        // Use the refresh token.
+        let params = format!(
+            "grant_type=refresh_token&client_id={client_id}&refresh_token={refresh_token}"
+        );
+        let req = Request::builder()
+            .method("POST")
+            .uri("/oauth/token")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(params))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let rotated: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert!(rotated["access_token"].as_str().is_some());
+        // Rotation: new refresh token must be present and different.
+        let new_rt = rotated["refresh_token"]
+            .as_str()
+            .expect("rotated refresh_token must be present");
+        assert_ne!(new_rt, refresh_token, "refresh token must rotate on use");
+    }
+
+    /// Expired refresh token returns invalid_grant.
+    ///
+    /// The stale row is inserted directly via Db::insert_refresh_token so the
+    /// test does not wait for a real expiry. Storage-agnostic injection point.
+    #[tokio::test]
+    async fn token_refresh_expired() {
+        let token = "admin-token";
+        let db = crate::db::Db::open(":memory:").expect("in-memory db");
+        let config = crate::config::ServeConfig {
+            token: token.to_string(),
+            db_path: ":memory:".to_string(),
+            bind: "127.0.0.1:0".to_string(),
+            base_url: "http://localhost".to_string(),
+            default_theme: "clean".to_string(),
+            max_size: 1_048_576,
+            webhook_url: None,
+            webhook_secret: None,
+            reaper_interval: 3600,
+            rate_limit_read: 10_000,
+            rate_limit_write: 10_000,
+            rate_limit_window: 60,
+        };
+        let rate_limit = crate::rate_limit::RateLimitStore::new(&config);
+
+        let stale_rt = "stale-refresh-token-value-00000000000000000000000000000000";
+        let client_id = "test-client-for-expired-rt";
+
+        // Seed an already-expired refresh token directly into the database.
+        db.insert_refresh_token(&crate::db::RefreshTokenRow {
+            token: stale_rt.to_string(),
+            client_id: client_id.to_string(),
+            access_token: "old-access-token".to_string(),
+            scope: Some("mcp:tools offline_access".to_string()),
+            expires_at: "2000-01-01T00:00:00Z".to_string(), // firmly in the past
+        })
+        .expect("seed stale refresh token");
+
+        let state = crate::handlers::AppState {
+            db,
+            config: Arc::new(config),
+            rate_limit: rate_limit.clone(),
+        };
+        let app = Router::new()
+            .route("/oauth/register", post(crate::oauth::handle_register))
+            .route("/authorize", get(crate::oauth::handle_authorize))
+            .route("/oauth/token", post(crate::oauth::handle_oauth_token))
+            .layer(axum::Extension(rate_limit))
+            .with_state(state);
+
+        let params = format!(
+            "grant_type=refresh_token&client_id={client_id}&refresh_token={stale_rt}"
+        );
+        let req = Request::builder()
+            .method("POST")
+            .uri("/oauth/token")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(params))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"].as_str().unwrap(), "invalid_grant");
+    }
+
+    // ── Client credentials ────────────────────────────────────────────────────
+
+    /// client_credentials with the admin secret returns an access_token.
+    #[tokio::test]
+    async fn token_client_credentials_happy_path() {
+        let admin_token = "super-secret-admin-token";
+        let app = oauth_app(admin_token);
+
+        let body = format!(
+            "grant_type=client_credentials&client_id=my-service&client_secret={admin_token}"
+        );
+        let req = Request::builder()
+            .method("POST")
+            .uri("/oauth/token")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(json["access_token"].as_str().is_some());
+        assert_eq!(json["token_type"].as_str().unwrap(), "bearer");
+    }
+
+    /// client_credentials with a wrong secret returns 401 invalid_client.
+    #[tokio::test]
+    async fn token_client_credentials_bad_secret() {
+        let app = oauth_app("real-admin-token");
+
+        let body = "grant_type=client_credentials&client_id=attacker&client_secret=wrong-secret";
+        let req = Request::builder()
+            .method("POST")
+            .uri("/oauth/token")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"].as_str().unwrap(), "invalid_client");
+    }
+
+    // ── Scope ─────────────────────────────────────────────────────────────────
+
+    /// scope from /authorize is preserved in the token response.
+    #[tokio::test]
+    async fn authorize_scope_stored() {
+        let app = oauth_app("admin-token");
+        let redirect_uri = "https://example.com/cb";
+        let verifier = "scope-test-verifier-long-enough-to-be-valid";
+
+        let client_id = register_client(app.clone(), &[redirect_uri]).await;
+        let code = authorize(
+            app.clone(),
+            &client_id,
+            redirect_uri,
+            verifier,
+            Some("mcp:tools"),
+            None,
+        )
+        .await;
+        let resp = exchange_code(app, &client_id, &code, redirect_uri, verifier, None).await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let scope = json["scope"]
+            .as_str()
+            .expect("scope must be present in token response");
+        assert!(scope.contains("mcp:tools"), "scope must round-trip: got {scope}");
+    }
+
+    /// resource mismatch between /authorize and /oauth/token — returns invalid_grant.
+    ///
+    /// RFC 8707: if the authorization code captured a resource, the token request
+    /// must present the same value.
+    #[tokio::test]
+    async fn resource_binding() {
+        let app = oauth_app("admin-token");
+        let redirect_uri = "https://example.com/cb";
+        let verifier = "resource-binding-verifier-long-enough";
+
+        let client_id = register_client(app.clone(), &[redirect_uri]).await;
+        // Authorize binding resource=https://api.example.com
+        let code = authorize(
+            app.clone(),
+            &client_id,
+            redirect_uri,
+            verifier,
+            None,
+            Some("https://api.example.com"),
+        )
+        .await;
+
+        // Token exchange with a different resource — must be rejected.
+        let resp = exchange_code(
+            app,
+            &client_id,
+            &code,
+            redirect_uri,
+            verifier,
+            Some("https://other.example.com"),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"].as_str().unwrap(), "invalid_grant");
+    }
 }
