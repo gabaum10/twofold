@@ -18,8 +18,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::auth::check_auth_token;
 use crate::handlers::{
-    check_auth_token, chrono_now, AccessTokenRecord, AppState, OAuthClientRecord,
+    chrono_now, AccessTokenRecord, AppState, OAuthClientRecord,
     RefreshTokenRecord,
 };
 use crate::rate_limit::{ReadRateLimit, RegistrationRateLimit};

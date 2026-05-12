@@ -22,7 +22,8 @@ use axum::{
 use serde_json::Value;
 
 use crate::{
-    handlers::{check_auth_token, AppState},
+    auth::check_auth_token,
+    handlers::AppState,
     mcp,
 };
 
@@ -66,17 +67,20 @@ pub async fn handle_mcp_post(
         }
     };
 
-    if check_auth_token(&state, &token).await.is_err() {
-        return (
-            StatusCode::UNAUTHORIZED,
-            [(axum::http::header::WWW_AUTHENTICATE, www_auth_header)],
-            axum::Json(serde_json::json!({
-                "error": "unauthorized",
-                "error_description": "Invalid or expired token"
-            })),
-        )
-            .into_response();
-    }
+    let _principal = match check_auth_token(&state, &token).await {
+        Ok(p) => p,
+        Err(_) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                [(axum::http::header::WWW_AUTHENTICATE, www_auth_header)],
+                axum::Json(serde_json::json!({
+                    "error": "unauthorized",
+                    "error_description": "Invalid or expired token"
+                })),
+            )
+                .into_response();
+        }
+    };
 
     // Parse the JSON-RPC request.
     let request: mcp::Request = match serde_json::from_slice(&body) {

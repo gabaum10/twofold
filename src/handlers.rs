@@ -324,7 +324,7 @@ pub async fn post_document(
     body: Bytes,
 ) -> Result<Response, AppError> {
     // Auth FIRST — 401 before 400/413
-    let token_name = check_auth(&state, &headers).await?;
+    let principal = check_auth(&state, &headers).await?;
     let peer_addr = connect_info.map(|c| c.0.ip().to_string());
 
     // Body validation
@@ -457,7 +457,7 @@ pub async fn post_document(
         timestamp: chrono_now(),
         action: "create".to_string(),
         slug: final_doc.slug.clone(),
-        token_name,
+        token_name: principal.display_name,
         ip_address,
     };
     if let Err(e) = state.db.insert_audit_entry(&audit_entry) {
@@ -479,7 +479,7 @@ pub async fn put_document(
     body: Bytes,
 ) -> Result<Response, AppError> {
     // Auth first
-    let token_name = check_auth(&state, &headers).await?;
+    let principal = check_auth(&state, &headers).await?;
     let peer_addr = connect_info.map(|c| c.0.ip().to_string());
 
     // Body validation
@@ -583,7 +583,7 @@ pub async fn put_document(
         timestamp: now,
         action: "update".to_string(),
         slug: slug.clone(),
-        token_name,
+        token_name: principal.display_name,
         ip_address,
     };
     if let Err(e) = state.db.insert_audit_entry(&audit_entry) {
@@ -604,7 +604,7 @@ pub async fn delete_document(
     connect_info: Option<ConnectInfo<SocketAddr>>,
 ) -> Result<Response, AppError> {
     // Auth first
-    let token_name = check_auth(&state, &headers).await?;
+    let principal = check_auth(&state, &headers).await?;
     let peer_addr = connect_info.map(|c| c.0.ip().to_string());
 
     // Check document exists — capture title/slug for webhook before delete.
@@ -643,7 +643,7 @@ pub async fn delete_document(
         timestamp: now,
         action: "delete".to_string(),
         slug: slug.clone(),
-        token_name,
+        token_name: principal.display_name,
         ip_address,
     };
     if let Err(e) = state.db.insert_audit_entry(&audit_entry) {
@@ -666,7 +666,7 @@ pub async fn list_documents(
     headers: HeaderMap,
     Query(params): Query<ListQuery>,
 ) -> Result<Response, AppError> {
-    check_auth(&state, &headers).await?;
+    let _principal = check_auth(&state, &headers).await?;
 
     // Default limit 20, max 100. Cap is enforced in db::list_documents.
     let limit = params.limit.unwrap_or(20);
@@ -701,8 +701,8 @@ pub async fn list_audit(
     headers: HeaderMap,
     Query(params): Query<AuditQuery>,
 ) -> Result<Response, AppError> {
-    let identity = check_auth(&state, &headers).await?;
-    if identity != "admin" {
+    let principal = check_auth(&state, &headers).await?;
+    if !principal.is_admin() {
         return Err(AppError::Forbidden);
     }
 
@@ -1290,99 +1290,12 @@ pub async fn get_agent(
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
 
-/// Auth check: admin token (constant-time) OR managed token (argon2 verify).
+/// Auth check: delegates to [`crate::auth::check_auth`].
 ///
-/// Performance contract:
-/// 1. Admin token: O(1) constant-time compare, no argon2.
-/// 2. Managed tokens (v0.4+): prefix lookup → O(1) indexed DB query → at most
-///    1 argon2 verification per request, run in `spawn_blocking`.
-/// 3. Legacy tokens (prefix IS NULL, created before v0.4): O(n) fallback with
-///    argon2 per record, also in `spawn_blocking`. Degrades gracefully for
-///    existing deployments; new tokens never hit this path.
-async fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<String, AppError> {
-    let provided = extract_bearer(headers).ok_or(AppError::Unauthorized)?;
-
-    check_auth_token(state, provided).await
-}
-
-/// Validate a raw token string against the admin token and managed token store.
-///
-/// Extracted so that non-HTTP callers (e.g. oauth.rs) can reuse the same
-/// verification logic without constructing a HeaderMap.
-pub async fn check_auth_token(state: &AppState, provided: &str) -> Result<String, AppError> {
-    // Fast path: admin TWOFOLD_TOKEN — constant-time, no argon2.
-    if constant_time_eq(provided.as_bytes(), state.config.token.as_bytes()) {
-        return Ok("admin".to_string());
-    }
-
-    // In-memory access tokens issued to public OAuth clients (UUID tokens).
-    // Sweep expired entries on access, then check for a match.
-    {
-        let now = chrono_now();
-        let mut tokens = state
-            .access_tokens
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        tokens.retain(|_, v| v.expires_at.as_str() >= now.as_str());
-        if tokens.contains_key(provided) {
-            return Ok("oauth".to_string());
-        }
-    }
-
-    // Prefix-based O(1) lookup: use first 8 chars of the provided token
-    // to look up the one candidate record, then verify with argon2.
-    let prefix: String = provided.chars().take(8).collect();
-
-    let candidate = state
-        .db
-        .get_token_by_prefix(&prefix)
-        .map_err(|_| AppError::Internal("Failed to check tokens".to_string()))?;
-
-    if let Some(token_record) = candidate {
-        let provided_owned = provided.to_string();
-        let hash_owned = token_record.hash.clone();
-        let verified =
-            tokio::task::spawn_blocking(move || verify_password(&provided_owned, &hash_owned))
-                .await
-                .map_err(|e| AppError::Internal(format!("Auth task failed: {e}")))?;
-
-        if verified {
-            let now = chrono_now();
-            let _ = state.db.touch_token(&token_record.id, &now);
-            return Ok(token_record.name.clone());
-        }
-        // Prefix matched but hash didn't — fall through to legacy check and
-        // ultimately return Unauthorized (prefix collision is astronomically rare).
-    }
-
-    // Legacy fallback: tokens created before v0.4 have no prefix stored.
-    // On a fresh database this query returns 0 rows immediately.
-    let legacy_tokens = state
-        .db
-        .get_legacy_active_tokens()
-        .map_err(|_| AppError::Internal("Failed to check tokens".to_string()))?;
-
-    if !legacy_tokens.is_empty() {
-        let provided_owned = provided.to_string();
-        let result = tokio::task::spawn_blocking(move || {
-            for token_record in &legacy_tokens {
-                if verify_password(&provided_owned, &token_record.hash) {
-                    return Some((token_record.id.clone(), token_record.name.clone()));
-                }
-            }
-            None
-        })
-        .await
-        .map_err(|e| AppError::Internal(format!("Auth task failed: {e}")))?;
-
-        if let Some((id, name)) = result {
-            let now = chrono_now();
-            let _ = state.db.touch_token(&id, &now);
-            return Ok(name);
-        }
-    }
-
-    Err(AppError::Unauthorized)
+/// Kept as a thin shim so the call-sites inside this module don't need
+/// to be updated to a full module path.
+async fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<crate::auth::Principal, AppError> {
+    crate::auth::check_auth(state, headers).await
 }
 
 /// Extract the client IP address for audit logging.
@@ -1420,12 +1333,6 @@ pub fn extract_client_ip(headers: &HeaderMap, fallback: Option<&str>) -> String 
         }
     }
     "unknown".to_string()
-}
-
-/// Extract the Bearer token from the Authorization header.
-fn extract_bearer(headers: &HeaderMap) -> Option<&str> {
-    let auth = headers.get("authorization")?.to_str().ok()?;
-    auth.strip_prefix("Bearer ")
 }
 
 /// Build a `text/markdown; charset=utf-8` response.
@@ -1997,15 +1904,6 @@ fn add_seconds_to_now(_now: &str, seconds: u64) -> String {
     future.format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
-/// Constant-time byte comparison.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    use subtle::ConstantTimeEq;
-    if a.len() != b.len() {
-        return false;
-    }
-    a.ct_eq(b).into()
-}
-
 /// Check whether a rusqlite error is a UNIQUE constraint violation.
 fn is_unique_violation(e: &rusqlite::Error) -> bool {
     matches!(
@@ -2121,7 +2019,7 @@ fn is_password_authed(headers: &HeaderMap, slug: &str, server_secret: &str) -> b
     };
 
     // Constant-time comparison of signatures
-    constant_time_eq(&provided_sig, &expected_sig)
+    crate::auth::constant_time_eq(&provided_sig, &expected_sig)
 }
 
 #[cfg(test)]
