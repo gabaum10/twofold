@@ -105,7 +105,7 @@ impl Db {
                 revoked    INTEGER NOT NULL DEFAULT 0,
                 prefix     TEXT
             );
-            CREATE INDEX IF NOT EXISTS idx_tokens_prefix ON tokens(prefix);",
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_tokens_prefix ON tokens(prefix);",
         )?;
         Ok(())
     }
@@ -160,7 +160,7 @@ impl Db {
             )?;
         }
         conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_tokens_prefix ON tokens(prefix);"
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tokens_prefix ON tokens(prefix);"
         )?;
 
         Ok(())
@@ -317,7 +317,7 @@ impl Db {
                     prefix: row.get(6)?,
                 })
             })?
-            .filter_map(|r| r.ok())
+            .filter_map(|r| r.map_err(|e| tracing::warn!("Failed to deserialize token row: {}", e)).ok())
             .collect();
         Ok(tokens)
     }
@@ -371,7 +371,7 @@ impl Db {
                     prefix: row.get(6)?,
                 })
             })?
-            .filter_map(|r| r.ok())
+            .filter_map(|r| r.map_err(|e| tracing::warn!("Failed to deserialize token row: {}", e)).ok())
             .collect();
         Ok(tokens)
     }
@@ -395,7 +395,7 @@ impl Db {
                     prefix: row.get(6)?,
                 })
             })?
-            .filter_map(|r| r.ok())
+            .filter_map(|r| r.map_err(|e| tracing::warn!("Failed to deserialize token row: {}", e)).ok())
             .collect();
         Ok(tokens)
     }
