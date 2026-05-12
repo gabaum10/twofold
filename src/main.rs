@@ -171,6 +171,7 @@ async fn run_server() {
         .route("/favicon.ico", get(handlers::serve_favicon))
         .route("/:slug/unlock", post(handlers::post_unlock))
         .route("/:slug/full", get(handlers::get_full))
+        // /:slug handles both plain slugs and /:slug.md (suffix stripped inside handler).
         .route("/:slug", get(handlers::get_human))
         .layer(SetResponseHeaderLayer::overriding(
             axum::http::header::CONTENT_SECURITY_POLICY,
