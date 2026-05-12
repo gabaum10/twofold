@@ -16,7 +16,8 @@ use crate::{
     auth::Principal,
     config::ServeConfig,
     db::{AuditEntry, Db, DocumentRecord, DocumentSummary},
-    handlers::{hash_password, AppError},
+    handlers::AppError,
+    helpers::hash_password,
     parser::{extract_frontmatter, extract_title, parse_expiry, validate_slug},
     webhook,
 };
@@ -93,7 +94,7 @@ pub fn publish(
         .theme
         .unwrap_or_else(|| config.default_theme.clone());
 
-    let now = crate::handlers::chrono_now();
+    let now = crate::helpers::chrono_now();
 
     let expires_at = match meta.expiry.as_deref() {
         Some(exp) => {
@@ -169,7 +170,7 @@ pub fn publish(
     // Audit — single write site.
     let audit_entry = AuditEntry {
         id: nanoid::nanoid!(10),
-        timestamp: crate::handlers::chrono_now(),
+        timestamp: crate::helpers::chrono_now(),
         action: "create".to_string(),
         slug: final_doc.slug.clone(),
         token_name: req.principal.display_name,
@@ -226,7 +227,7 @@ pub fn update(
         .theme
         .unwrap_or_else(|| config.default_theme.clone());
 
-    let now = crate::handlers::chrono_now();
+    let now = crate::helpers::chrono_now();
 
     let expires_at = match meta.expiry.as_deref() {
         Some(exp) if !exp.is_empty() => {
@@ -319,7 +320,7 @@ pub fn delete(
 
     db.delete_by_slug(slug)?;
 
-    let now = crate::handlers::chrono_now();
+    let now = crate::helpers::chrono_now();
 
     // Webhook — fire-and-forget.
     if let Some(ref wh_url) = config.webhook_url {
@@ -385,7 +386,7 @@ pub fn list(
 
 fn is_expired_doc(doc: &DocumentRecord) -> bool {
     match &doc.expires_at {
-        Some(exp) => exp.as_str() < crate::handlers::chrono_now().as_str(),
+        Some(exp) => exp.as_str() < crate::helpers::chrono_now().as_str(),
         None => false,
     }
 }

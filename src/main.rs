@@ -6,6 +6,7 @@ mod config;
 mod db;
 mod frontmatter;
 mod handlers;
+mod helpers;
 mod highlight;
 mod mcp;
 mod mcp_http;
@@ -13,6 +14,7 @@ mod oauth;
 mod parser;
 mod rate_limit;
 mod service;
+mod views;
 mod webhook;
 
 use std::sync::Arc;
@@ -127,7 +129,7 @@ async fn run_server() {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(reaper_interval));
         loop {
             interval.tick().await;
-            let now = handlers::chrono_now();
+            let now = helpers::chrono_now();
             // SQLite writes are blocking; run off the async executor.
             let db_clone = reaper_db.clone();
             let result = tokio::task::spawn_blocking(move || {
@@ -220,7 +222,7 @@ async fn run_server() {
         .route("/api/v1/audit", get(handlers::list_audit))
         .route(
             "/api/v1/documents/:slug",
-            get(handlers::get_agent)
+            get(views::get_agent)
                 .put(handlers::put_document)
                 .delete(handlers::delete_document),
         )
@@ -230,10 +232,10 @@ async fn run_server() {
         // Icon and favicon — embedded at compile time, no auth.
         .route("/icon.png", get(handlers::serve_icon))
         .route("/favicon.ico", get(handlers::serve_favicon))
-        .route("/:slug/unlock", post(handlers::post_unlock))
-        .route("/:slug/full", get(handlers::get_full))
+        .route("/:slug/unlock", post(views::post_unlock))
+        .route("/:slug/full", get(views::get_full))
         // /:slug handles both plain slugs and /:slug.md (suffix stripped inside handler).
-        .route("/:slug", get(handlers::get_human))
+        .route("/:slug", get(views::get_human))
         .layer(SetResponseHeaderLayer::overriding(
             axum::http::header::CONTENT_SECURITY_POLICY,
             csp,
@@ -662,7 +664,7 @@ fn token_create(name: &str, db_path: &str) {
     use base64::Engine;
     use rand::RngCore;
 
-    let now = handlers::chrono_now();
+    let now = helpers::chrono_now();
 
     let token_plain = 'generate: {
         for attempt in 0..3u8 {
@@ -673,7 +675,7 @@ fn token_create(name: &str, db_path: &str) {
                 base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token_bytes)
             );
 
-            let hash = match handlers::hash_password(&plain) {
+            let hash = match helpers::hash_password(&plain) {
                 Ok(h) => h,
                 Err(_) => {
                     eprintln!("Failed to hash token");

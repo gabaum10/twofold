@@ -103,7 +103,7 @@ pub async fn check_auth_token(state: &AppState, provided: &str) -> Result<Princi
     // requires WAL read, at negligible overhead for one row).
     match state.db.get_access_token(provided) {
         Ok(Some(record)) => {
-            let now = crate::handlers::chrono_now();
+            let now = crate::helpers::chrono_now();
             if record.expires_at.as_str() >= now.as_str() {
                 let client_id = record.client_id.clone();
                 let scopes: Vec<String> = record
@@ -139,12 +139,12 @@ pub async fn check_auth_token(state: &AppState, provided: &str) -> Result<Princi
         let provided_owned = provided.to_string();
         let hash_owned = token_record.hash.clone();
         let verified =
-            tokio::task::spawn_blocking(move || crate::handlers::verify_password(&provided_owned, &hash_owned))
+            tokio::task::spawn_blocking(move || crate::helpers::verify_password(&provided_owned, &hash_owned))
                 .await
                 .map_err(|e| AppError::Internal(format!("Auth task failed: {e}")))?;
 
         if verified {
-            let now = crate::handlers::chrono_now();
+            let now = crate::helpers::chrono_now();
             let _ = state.db.touch_token(&token_record.id, &now);
             let name = token_record.name.clone();
             return Ok(Principal {
@@ -166,7 +166,7 @@ pub async fn check_auth_token(state: &AppState, provided: &str) -> Result<Princi
         let provided_owned = provided.to_string();
         let result = tokio::task::spawn_blocking(move || {
             for token_record in &legacy_tokens {
-                if crate::handlers::verify_password(&provided_owned, &token_record.hash) {
+                if crate::helpers::verify_password(&provided_owned, &token_record.hash) {
                     return Some((token_record.id.clone(), token_record.name.clone()));
                 }
             }
@@ -176,7 +176,7 @@ pub async fn check_auth_token(state: &AppState, provided: &str) -> Result<Princi
         .map_err(|e| AppError::Internal(format!("Auth task failed: {e}")))?;
 
         if let Some((id, name)) = result {
-            let now = crate::handlers::chrono_now();
+            let now = crate::helpers::chrono_now();
             let _ = state.db.touch_token(&id, &now);
             return Ok(Principal {
                 display_name: format!("managed:{name}"),
