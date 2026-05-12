@@ -357,7 +357,7 @@ fn handle_initialize(id: Value) -> mcp::Response {
                 "version": env!("CARGO_PKG_VERSION"),
                 "icons": [
                     {
-                        "url": "https://share.hearth.observer/icon.png",
+                        "src": "https://share.hearth.observer/icon.png",
                         "mime_type": "image/jpeg"
                     }
                 ]
