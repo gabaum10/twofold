@@ -808,7 +808,7 @@ pub async fn get_agent(
 // ── Internal helpers ─────────────────────────────────────────────────────────
 
 /// Auth check: admin token (constant-time) OR managed token (argon2 verify).
-async fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
+pub(crate) async fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
     let provided = extract_bearer(headers)
         .ok_or(AppError::Unauthorized)?;
 

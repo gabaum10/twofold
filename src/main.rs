@@ -4,6 +4,7 @@ mod db;
 mod handlers;
 mod highlight;
 mod mcp;
+mod mcp_http;
 mod parser;
 mod webhook;
 
@@ -133,7 +134,8 @@ async fn run_server() {
         "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'",
     );
 
-    let app = Router::new()
+    // Document routes — body size is capped at max_size.
+    let doc_router = Router::new()
         // Health check — no auth, checked by load balancers and uptime monitors.
         .route("/health", get(handlers::health_check))
         // Documents: POST (create) and GET (list) share the same path.
@@ -152,7 +154,16 @@ async fn run_server() {
             axum::http::header::CONTENT_SECURITY_POLICY,
             csp,
         ))
-        .layer(DefaultBodyLimit::max(max_size))
+        .layer(DefaultBodyLimit::max(max_size));
+
+    // MCP HTTP transport — NOT behind DefaultBodyLimit (JSON-RPC payloads can
+    // be large for publish operations). Auth is handled inside the handler.
+    let mcp_router = Router::new()
+        .route("/mcp", post(mcp_http::handle_mcp_post))
+        .layer(DefaultBodyLimit::disable());
+
+    let app = doc_router
+        .merge(mcp_router)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 

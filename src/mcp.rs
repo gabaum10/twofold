@@ -22,16 +22,16 @@ use serde_json::Value;
 // ── JSON-RPC types ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
-struct Request {
+pub(crate) struct Request {
     #[allow(dead_code)]
     jsonrpc: String,
-    id: Option<Value>,
-    method: String,
-    params: Option<Value>,
+    pub(crate) id: Option<Value>,
+    pub(crate) method: String,
+    pub(crate) params: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
-struct Response {
+pub(crate) struct Response {
     jsonrpc: &'static str,
     id: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -41,17 +41,17 @@ struct Response {
 }
 
 #[derive(Debug, Serialize)]
-struct JsonRpcError {
-    code: i32,
-    message: String,
+pub(crate) struct JsonRpcError {
+    pub(crate) code: i32,
+    pub(crate) message: String,
 }
 
 impl Response {
-    fn ok(id: Value, result: Value) -> Self {
+    pub(crate) fn ok(id: Value, result: Value) -> Self {
         Self { jsonrpc: "2.0", id, result: Some(result), error: None }
     }
 
-    fn err(id: Value, code: i32, message: String) -> Self {
+    pub(crate) fn err(id: Value, code: i32, message: String) -> Self {
         Self { jsonrpc: "2.0", id, result: None, error: Some(JsonRpcError { code, message }) }
     }
 }
@@ -90,7 +90,7 @@ fn contains_marker_directive(s: &str) -> bool {
 /// Build the reqwest client with conservative timeouts.
 /// connect_timeout: 10s — prevents indefinite hang on unreachable server.
 /// timeout: 30s — covers slow publish operations.
-fn build_client() -> reqwest::blocking::Client {
+pub(crate) fn build_client() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(30))
@@ -181,7 +181,7 @@ fn write_response(stdout: &std::io::Stdout, resp: &Response) {
 
 // ── Request dispatch ──────────────────────────────────────────────────────────
 
-fn handle_request(
+pub(crate) fn handle_request(
     client: &reqwest::blocking::Client,
     server_url: &str,
     token: &str,
