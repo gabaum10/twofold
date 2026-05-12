@@ -94,6 +94,17 @@ pub struct AuthCodeRecord {
     pub client_id: String,
     pub redirect_uri: String,
     pub expires_at: String, // ISO 8601 UTC
+    pub code_challenge: String,
+    pub resource: Option<String>,
+    pub scope: Option<String>,
+}
+
+/// In-memory access token record issued via public-client OAuth flows.
+#[derive(Clone)]
+pub struct AccessTokenRecord {
+    pub client_id: String,
+    pub scope: Option<String>,
+    pub expires_at: String, // ISO 8601 UTC
 }
 
 /// Dynamically-registered OAuth client record (POST /oauth/register).
@@ -105,6 +116,8 @@ pub struct OAuthClientRecord {
     pub grant_types: Vec<String>,
     pub response_types: Vec<String>,
     pub token_endpoint_auth_method: String,
+    /// RFC 3339 timestamp of registration — used by the 24-hour expiry sweep.
+    pub created_at: String,
 }
 
 /// Active refresh token record.
@@ -124,6 +137,7 @@ pub struct AppState {
     pub auth_codes: Arc<Mutex<HashMap<String, AuthCodeRecord>>>,
     pub oauth_clients: Arc<Mutex<HashMap<String, OAuthClientRecord>>>,
     pub refresh_tokens: Arc<Mutex<HashMap<String, RefreshTokenRecord>>>,
+    pub access_tokens: Arc<Mutex<HashMap<String, AccessTokenRecord>>>,
     pub rate_limit: Arc<RateLimitStore>,
 }
 
@@ -136,10 +150,13 @@ struct CleanTemplate<'a> {
     title: &'a str,
     content: &'a str,
     slug: &'a str,
+    base_url: &'a str,
     /// When true, toolbar shows "Summary view" instead of "Full detail".
     full_view: bool,
     body_empty: bool,
     expires_at: Option<String>,
+    /// First ~150 chars of plain text content for meta description / OpenGraph.
+    description: String,
 }
 
 /// Dark theme template.
@@ -149,8 +166,10 @@ struct DarkTemplate<'a> {
     title: &'a str,
     content: &'a str,
     slug: &'a str,
+    base_url: &'a str,
     body_empty: bool,
     expires_at: Option<String>,
+    description: String,
 }
 
 /// Paper theme template.
@@ -160,8 +179,10 @@ struct PaperTemplate<'a> {
     title: &'a str,
     content: &'a str,
     slug: &'a str,
+    base_url: &'a str,
     body_empty: bool,
     expires_at: Option<String>,
+    description: String,
 }
 
 /// Minimal theme template.
@@ -171,8 +192,10 @@ struct MinimalTemplate<'a> {
     title: &'a str,
     content: &'a str,
     slug: &'a str,
+    base_url: &'a str,
     body_empty: bool,
     expires_at: Option<String>,
+    description: String,
 }
 
 /// Hearth theme template.
@@ -182,9 +205,11 @@ struct HearthTemplate<'a> {
     title: &'a str,
     content: &'a str,
     slug: &'a str,
+    base_url: &'a str,
     full_view: bool,
     body_empty: bool,
     expires_at: Option<String>,
+    description: String,
 }
 
 /// Password prompt template.
@@ -213,6 +238,22 @@ pub struct CreateResponse {
 #[derive(Deserialize)]
 pub struct SlugQuery {
     pub raw: Option<String>,
+}
+
+/// JSON response body for a single document (agent/content-negotiation view).
+///
+/// Returned when the caller signals `Accept: application/json` or is a known
+/// AI crawler, so agents can consume the full document (including agent-layer
+/// content) from the same human-facing URL without hitting the API endpoint.
+#[derive(Serialize)]
+pub struct DocumentResponse {
+    pub slug: String,
+    pub title: String,
+    pub content: String,          // full raw markdown (including agent sections)
+    pub theme: String,
+    pub description: Option<String>,
+    pub created_at: String,
+    pub expires_at: Option<String>,
 }
 
 /// Form data for password unlock
@@ -633,6 +674,136 @@ pub async fn serve_openapi_json(_rl: ReadRateLimit) -> impl IntoResponse {
     )
 }
 
+// ── GET /icon.png and GET /favicon.ico ──────────────────────────────────────
+
+/// Serve the Twofold icon. Embedded at compile time; no runtime file I/O.
+/// The file is a JPEG served under the /icon.png path for URL stability.
+pub async fn serve_icon() -> impl IntoResponse {
+    let bytes = include_bytes!("../assets/icon.jpg");
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "image/jpeg")],
+        bytes.as_ref(),
+    )
+}
+
+/// Serve favicon — redirect to /icon.png.
+pub async fn serve_favicon() -> impl IntoResponse {
+    Redirect::permanent("/icon.png")
+}
+
+// ── Content negotiation helpers ──────────────────────────────────────────────
+
+/// Returns true if the Accept header expresses a preference for JSON.
+///
+/// Matches any Accept value that contains `application/json`, including
+/// quality-factored lists such as `application/json, */*;q=0.5`.
+fn accept_prefers_json(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.contains("application/json"))
+        .unwrap_or(false)
+}
+
+/// Returns true if the Accept header expresses a preference for Markdown.
+///
+/// Matches `text/markdown` in any position in the Accept header value.
+fn accept_prefers_markdown(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.contains("text/markdown"))
+        .unwrap_or(false)
+}
+
+/// Known AI crawler User-Agent substrings (case-insensitive).
+const KNOWN_BOT_AGENTS: &[&str] = &[
+    "gptbot",
+    "chatgpt-user",
+    "claudebot",
+    "claude-user",
+    "google-extended",
+    "googlebot",
+    "bingbot",
+    "perplexitybot",
+    "anthropic",
+    "google-agent",
+];
+
+/// Returns true if the User-Agent header matches a known AI crawler.
+fn is_known_bot(headers: &HeaderMap) -> bool {
+    let ua = match headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(s) => s.to_lowercase(),
+        None => return false,
+    };
+    KNOWN_BOT_AGENTS.iter().any(|bot| ua.contains(bot))
+}
+
+/// Build the `DocumentResponse` JSON reply for agent/content-negotiation paths.
+///
+/// Reused by both `get_human` (content negotiation) and `get_slug_md` to
+/// avoid duplicating doc-lookup logic.
+fn build_json_agent_response(doc: &crate::db::DocumentRecord) -> Response {
+    let body = DocumentResponse {
+        slug: doc.slug.clone(),
+        title: doc.title.clone(),
+        content: doc.raw_content.clone(),
+        theme: doc.theme.clone(),
+        description: doc.description.clone(),
+        created_at: doc.created_at.clone(),
+        expires_at: doc.expires_at.clone(),
+    };
+    (StatusCode::OK, Json(body)).into_response()
+}
+
+// ── GET /:slug.md (raw markdown shortcut) ────────────────────────────────────
+
+/// Serve the raw source markdown for `/:slug.md` requests.
+///
+/// Equivalent to `GET /:slug?raw=1`.  Registered before the `/:slug` catch-all
+/// so Axum's router resolves it first.
+///
+/// Note: in Axum 0.7 / matchit 0.7, `/:slug.md` conflicts with `/:slug/:child`
+/// routes in the same router. To avoid this, the main `get_human` handler strips
+/// a trailing `.md` suffix before looking up the slug — see the `.md` branch there.
+/// This handler is kept as a named function so it can be referenced independently
+/// when the routing layer allows it.
+pub async fn get_slug_md(
+    State(state): State<AppState>,
+    _rl: ReadRateLimit,
+    Path(slug): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    // Strip a trailing .md suffix if present (defensive: in case this handler
+    // is called directly with the raw slug).
+    let bare_slug = slug.strip_suffix(".md").unwrap_or(&slug);
+
+    let doc = match state.db.get_by_slug(bare_slug)? {
+        Some(d) => d,
+        None => return Ok(not_found_response()),
+    };
+
+    if is_expired(&doc) {
+        return Ok(gone_response());
+    }
+
+    // Password-protected documents still require auth cookie for the .md shortcut.
+    if doc.password.is_some() {
+        if !is_password_authed(&headers, bare_slug, &state.config.token) {
+            let template = PasswordTemplate { slug: bare_slug, error: None };
+            return Ok(Html(template.render().map_err(|e| {
+                AppError::Internal(format!("Template error: {e}"))
+            })?).into_response());
+        }
+    }
+
+    Ok(markdown_response(&doc.raw_content))
+}
+
 // ── GET /:slug (human view) ──────────────────────────────────────────────────
 
 /// Handle human view and raw-shortcut view.
@@ -640,6 +811,12 @@ pub async fn serve_openapi_json(_rl: ReadRateLimit) -> impl IntoResponse {
 /// Without `?raw=1`: renders the human corpus as themed HTML.
 /// With `?raw=1`: returns the full raw source.
 /// Password-protected documents show a password prompt.
+///
+/// Content negotiation (checked after expiry/password):
+/// - `Accept: application/json` → full `DocumentResponse` JSON (agent layer included)
+/// - `Accept: text/markdown` → raw source markdown
+/// - Known AI crawler User-Agent with no Accept preference → JSON
+/// - Everything else → themed HTML (existing behaviour)
 pub async fn get_human(
     State(state): State<AppState>,
     _rl: ReadRateLimit,
@@ -647,6 +824,15 @@ pub async fn get_human(
     Query(params): Query<SlugQuery>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
+    // .md suffix handling: `/:slug` catches `/my-doc.md` with slug = "my-doc.md".
+    // Strip the suffix and serve raw markdown (same as ?raw=1).
+    // This runs before the DB lookup so the bare slug is used throughout.
+    let (slug, force_markdown) = if let Some(bare) = slug.strip_suffix(".md") {
+        (bare.to_string(), true)
+    } else {
+        (slug, false)
+    };
+
     let doc = match state.db.get_by_slug(&slug)? {
         Some(d) => d,
         None => return Ok(not_found_response()),
@@ -667,9 +853,39 @@ pub async fn get_human(
         }
     }
 
+    // .md suffix → serve raw markdown immediately.
+    if force_markdown {
+        return Ok(markdown_response(&doc.raw_content));
+    }
+
     // ?raw=1 -> return full source
     if params.raw.as_deref() == Some("1") {
         return Ok(markdown_response(&doc.raw_content));
+    }
+
+    // Content negotiation: Accept header wins over User-Agent.
+    //
+    // Priority:
+    //   1. Accept: application/json  → JSON  (agent content)
+    //   2. Accept: text/markdown     → raw markdown
+    //   3. Accept: text/html         → HTML  (browser dev-inspect with bot UA)
+    //   4. No/neutral Accept + bot User-Agent → JSON
+    //   5. Everything else           → themed HTML (default)
+    if accept_prefers_json(&headers) {
+        return Ok(build_json_agent_response(&doc));
+    }
+    if accept_prefers_markdown(&headers) {
+        return Ok(markdown_response(&doc.raw_content));
+    }
+    // Only check the bot UA when the client has NOT declared a preference for HTML.
+    // A browser dev-inspecting via a bot UA will send Accept: text/html; honour it.
+    let accept_explicitly_html = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.contains("text/html"))
+        .unwrap_or(false);
+    if !accept_explicitly_html && is_known_bot(&headers) {
+        return Ok(build_json_agent_response(&doc));
     }
 
     // Human view: extract body (strip frontmatter), parse markers, render.
@@ -685,6 +901,8 @@ pub async fn get_human(
     let theme = doc.theme.clone();
     let slug_owned = slug.clone();
     let expires_at = doc.expires_at.clone();
+    let base_url = state.config.base_url.trim_end_matches('/').to_string();
+    let base_url_clone = base_url.clone();
 
     let html_result = tokio::task::spawn_blocking(move || {
         let fm_result = extract_frontmatter(&raw_content)
@@ -695,12 +913,23 @@ pub async fn get_human(
 
         let parse_result = parse_document(&fm_result.body, &slug_owned);
         let rendered_html = render_markdown(&parse_result.human);
-        render_themed_sync(&title, &rendered_html, &slug_owned, &theme, false, expires_at)
+        render_themed_sync(&title, &rendered_html, &slug_owned, &theme, &base_url_clone, false, expires_at)
     })
     .await
     .map_err(|e| AppError::Internal(format!("Render task failed: {e}")))?;
 
-    html_result
+    // Add Link header pointing to the JSON API endpoint.
+    let link_header = format!(
+        "<{base_url}/api/v1/documents/{slug}>; rel=\"alternate\"; type=\"application/json\"",
+    );
+    let html_response = html_result?;
+    let mut response = html_response.into_response();
+    response.headers_mut().insert(
+        axum::http::header::LINK,
+        axum::http::HeaderValue::from_str(&link_header)
+            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("")),
+    );
+    Ok(response)
 }
 
 // ── POST /:slug/unlock ───────────────────────────────────────────────────────
@@ -795,6 +1024,8 @@ pub async fn get_full(
     let theme = doc.theme.clone();
     let slug_owned = slug.clone();
     let expires_at = doc.expires_at.clone();
+    let base_url = state.config.base_url.trim_end_matches('/').to_string();
+    let base_url_clone = base_url.clone();
 
     let html_result = tokio::task::spawn_blocking(move || {
         let fm_result = extract_frontmatter(&raw_content)
@@ -805,12 +1036,23 @@ pub async fn get_full(
 
         let stripped = strip_marker_comments(&fm_result.body);
         let rendered_html = render_markdown(&stripped);
-        render_themed_sync(&title, &rendered_html, &slug_owned, &theme, true, expires_at)
+        render_themed_sync(&title, &rendered_html, &slug_owned, &theme, &base_url_clone, true, expires_at)
     })
     .await
     .map_err(|e| AppError::Internal(format!("Render task failed: {e}")))?;
 
-    html_result
+    // Add Link header pointing to the JSON API endpoint.
+    let link_header = format!(
+        "<{base_url}/api/v1/documents/{slug}>; rel=\"alternate\"; type=\"application/json\"",
+    );
+    let html_response = html_result?;
+    let mut response = html_response.into_response();
+    response.headers_mut().insert(
+        axum::http::header::LINK,
+        axum::http::HeaderValue::from_str(&link_header)
+            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("")),
+    );
+    Ok(response)
 }
 
 // ── GET /api/v1/documents/:slug (agent view) ─────────────────────────────────
@@ -883,6 +1125,17 @@ pub async fn check_auth_token(state: &AppState, provided: &str) -> Result<(), Ap
     // Fast path: admin TWOFOLD_TOKEN — constant-time, no argon2.
     if constant_time_eq(provided.as_bytes(), state.config.token.as_bytes()) {
         return Ok(());
+    }
+
+    // In-memory access tokens issued to public OAuth clients (UUID tokens).
+    // Sweep expired entries on access, then check for a match.
+    {
+        let now = chrono_now();
+        let mut tokens = state.access_tokens.lock().unwrap_or_else(|e| e.into_inner());
+        tokens.retain(|_, v| v.expires_at.as_str() >= now.as_str());
+        if tokens.contains_key(provided) {
+            return Ok(());
+        }
     }
 
     // Prefix-based O(1) lookup: use first 8 chars of the provided token
@@ -1033,7 +1286,7 @@ fn render_markdown(source: &str) -> String {
 ///
 /// Named `_sync` because it is called from `spawn_blocking` contexts (not directly from async).
 /// This avoids stack overflow in async worker threads during syntect init/tokenization.
-fn render_themed_sync(title: &str, content: &str, slug: &str, theme: &str, full_view: bool, expires_at: Option<String>) -> Result<Response, AppError> {
+fn render_themed_sync(title: &str, content: &str, slug: &str, theme: &str, base_url: &str, full_view: bool, expires_at: Option<String>) -> Result<Response, AppError> {
     // Apply syntax highlighting to the pre-rendered HTML.
     // Dark theme gets dark syntax palette; all others get light.
     let is_dark = theme == "dark";
@@ -1041,32 +1294,79 @@ fn render_themed_sync(title: &str, content: &str, slug: &str, theme: &str, full_
 
     let body_empty = highlighted.trim().is_empty();
 
+    // Compute plain-text excerpt for meta description / OpenGraph.
+    // Strip HTML tags from the rendered content, collapse whitespace, truncate at 150 chars.
+    let description = plain_text_excerpt(&highlighted, 150);
+
     let html = match theme {
         "dark" => {
-            let t = DarkTemplate { title, content: &highlighted, slug, body_empty, expires_at };
+            let t = DarkTemplate { title, content: &highlighted, slug, base_url, body_empty, expires_at, description };
             t.render()
         }
         "paper" => {
-            let t = PaperTemplate { title, content: &highlighted, slug, body_empty, expires_at };
+            let t = PaperTemplate { title, content: &highlighted, slug, base_url, body_empty, expires_at, description };
             t.render()
         }
         "minimal" => {
-            let t = MinimalTemplate { title, content: &highlighted, slug, body_empty, expires_at };
+            let t = MinimalTemplate { title, content: &highlighted, slug, base_url, body_empty, expires_at, description };
             t.render()
         }
         "hearth" => {
-            let t = HearthTemplate { title, content: &highlighted, slug, full_view, body_empty, expires_at };
+            let t = HearthTemplate { title, content: &highlighted, slug, base_url, full_view, body_empty, expires_at, description };
             t.render()
         }
         _ => {
             // "clean" or unknown -> default
-            let t = CleanTemplate { title, content: &highlighted, slug, full_view, body_empty, expires_at };
+            let t = CleanTemplate { title, content: &highlighted, slug, base_url, full_view, body_empty, expires_at, description };
             t.render()
         }
     };
 
     html.map(|h| Html(h).into_response())
         .map_err(|e| AppError::Internal(format!("Template render error: {e}")))
+}
+
+/// Strip HTML tags and extract plain text, collapsing whitespace.
+/// Returns up to `max_chars` characters, suitable for meta description tags.
+fn plain_text_excerpt(html: &str, max_chars: usize) -> String {
+    let mut result = String::with_capacity(html.len().min(512));
+    let mut in_tag = false;
+    let mut last_was_space = true; // start true so we don't lead with a space
+
+    for ch in html.chars() {
+        match ch {
+            '<' => { in_tag = true; }
+            '>' => {
+                in_tag = false;
+                // Treat closing/block tags as whitespace boundaries.
+                if !last_was_space {
+                    result.push(' ');
+                    last_was_space = true;
+                }
+            }
+            _ if in_tag => {}
+            '\n' | '\r' | '\t' | ' ' => {
+                if !last_was_space {
+                    result.push(' ');
+                    last_was_space = true;
+                }
+            }
+            _ => {
+                result.push(ch);
+                last_was_space = false;
+            }
+        }
+    }
+
+    let trimmed = result.trim().to_string();
+
+    // Truncate at max_chars on a char boundary, appending ellipsis if cut.
+    if trimmed.chars().count() <= max_chars {
+        trimmed
+    } else {
+        let cut: String = trimmed.chars().take(max_chars).collect();
+        format!("{cut}...")
+    }
 }
 
 // ── Themed error page HTML ───────────────────────────────────────────────────
@@ -1638,6 +1938,7 @@ mod tests {
             auth_codes: Arc::new(Mutex::new(HashMap::new())),
             oauth_clients: Arc::new(Mutex::new(HashMap::new())),
             refresh_tokens: Arc::new(Mutex::new(HashMap::new())),
+            access_tokens: Arc::new(Mutex::new(HashMap::new())),
             rate_limit: rate_limit.clone(),
         };
         Router::new()
@@ -1680,6 +1981,7 @@ mod tests {
             auth_codes: Arc::new(Mutex::new(HashMap::new())),
             oauth_clients: Arc::new(Mutex::new(HashMap::new())),
             refresh_tokens: Arc::new(Mutex::new(HashMap::new())),
+            access_tokens: Arc::new(Mutex::new(HashMap::new())),
             rate_limit: rate_limit.clone(),
         };
         Router::new()
@@ -1790,6 +2092,7 @@ mod tests {
             auth_codes: Arc::new(Mutex::new(HashMap::new())),
             oauth_clients: Arc::new(Mutex::new(HashMap::new())),
             refresh_tokens: Arc::new(Mutex::new(HashMap::new())),
+            access_tokens: Arc::new(Mutex::new(HashMap::new())),
             rate_limit: rate_limit.clone(),
         };
         let app = Router::new()
@@ -2212,6 +2515,7 @@ mod tests {
             auth_codes: Arc::new(Mutex::new(HashMap::new())),
             oauth_clients: Arc::new(Mutex::new(HashMap::new())),
             refresh_tokens: Arc::new(Mutex::new(HashMap::new())),
+            access_tokens: Arc::new(Mutex::new(HashMap::new())),
             rate_limit: rate_limit.clone(),
         };
         let router = Router::new()
@@ -2347,6 +2651,7 @@ mod tests {
             auth_codes: Arc::new(Mutex::new(HashMap::new())),
             oauth_clients: Arc::new(Mutex::new(HashMap::new())),
             refresh_tokens: Arc::new(Mutex::new(HashMap::new())),
+            access_tokens: Arc::new(Mutex::new(HashMap::new())),
             rate_limit: rate_limit.clone(),
         };
         let router = Router::new()
@@ -2367,5 +2672,148 @@ mod tests {
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED,
             "revoked token must not authenticate");
+    }
+
+    // ── Content negotiation tests ─────────────────────────────────────────────
+
+    /// Helper: publish a doc through the full-app router (which includes /:slug).
+    async fn publish_doc_full(app: Router, token: &str, slug: &str, content: &str) -> String {
+        let body = format!("---\nslug: {slug}\n---\n{content}");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/documents")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "text/markdown")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED, "publish failed");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        json["slug"].as_str().unwrap().to_string()
+    }
+
+    /// Accept: text/html → returns HTML (existing behaviour unchanged).
+    #[tokio::test]
+    async fn test_content_neg_html_accept_returns_html() {
+        let token = "test-token";
+        let app = test_app_full(token);
+        let slug = publish_doc_full(app.clone(), token, "cn-html", "# Hello").await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/{slug}"))
+            .header("Accept", "text/html,application/xhtml+xml,*/*;q=0.9")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        assert!(ct.contains("text/html"), "expected HTML, got {ct}");
+    }
+
+    /// Accept: application/json → returns JSON with document fields.
+    #[tokio::test]
+    async fn test_content_neg_json_accept_returns_json() {
+        let token = "test-token";
+        let app = test_app_full(token);
+        let slug = publish_doc_full(app.clone(), token, "cn-json", "# Hello\n\nAgent content.").await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/{slug}"))
+            .header("Accept", "application/json")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        assert!(ct.contains("application/json"), "expected JSON, got {ct}");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["slug"].as_str().unwrap(), "cn-json");
+        assert!(json["content"].as_str().unwrap().contains("Hello"));
+    }
+
+    /// Accept: text/markdown → returns raw markdown source.
+    #[tokio::test]
+    async fn test_content_neg_markdown_accept_returns_markdown() {
+        let token = "test-token";
+        let app = test_app_full(token);
+        let slug = publish_doc_full(app.clone(), token, "cn-md-accept", "# Markdown test").await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/{slug}"))
+            .header("Accept", "text/markdown")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        assert!(ct.contains("text/markdown"), "expected markdown, got {ct}");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = std::str::from_utf8(&bytes).unwrap();
+        assert!(body.contains("Markdown test"), "expected raw markdown in body");
+    }
+
+    /// Bot User-Agent with no Accept → returns JSON.
+    #[tokio::test]
+    async fn test_content_neg_bot_ua_returns_json() {
+        let token = "test-token";
+        let app = test_app_full(token);
+        let slug = publish_doc_full(app.clone(), token, "cn-bot", "# Bot content").await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/{slug}"))
+            .header("User-Agent", "GPTBot/1.0")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        assert!(ct.contains("application/json"), "expected JSON for bot UA, got {ct}");
+    }
+
+    /// Browser Accept + bot User-Agent → Accept wins, returns HTML.
+    #[tokio::test]
+    async fn test_content_neg_html_accept_beats_bot_ua() {
+        let token = "test-token";
+        let app = test_app_full(token);
+        let slug = publish_doc_full(app.clone(), token, "cn-ua-html", "# Dev inspect").await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/{slug}"))
+            .header("Accept", "text/html")
+            .header("User-Agent", "ClaudeBot/1.0")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        assert!(ct.contains("text/html"), "Accept: text/html should beat bot UA, got {ct}");
+    }
+
+    /// GET /:slug.md → returns raw markdown.
+    #[tokio::test]
+    async fn test_slug_md_route_returns_markdown() {
+        let token = "test-token";
+        let app = test_app_full(token);
+        let slug = publish_doc_full(app.clone(), token, "cn-dotmd", "# Dotmd test").await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/{slug}.md"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        assert!(ct.contains("text/markdown"), "expected markdown content-type, got {ct}");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = std::str::from_utf8(&bytes).unwrap();
+        assert!(body.contains("Dotmd test"), "expected raw markdown in body");
     }
 }
