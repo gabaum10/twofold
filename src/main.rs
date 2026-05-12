@@ -103,6 +103,7 @@ async fn run_server() {
         auth_codes: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         oauth_clients: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         refresh_tokens: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        access_tokens: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         rate_limit: rate_limit.clone(),
     };
 
@@ -147,11 +148,15 @@ async fn run_server() {
     let app = Router::new()
         // Health check — no auth, checked by load balancers and uptime monitors.
         .route("/health", get(handlers::health_check))
+        // OAuth 2.0 well-known metadata — no auth required (RFC 8707, RFC 8414).
+        .route("/.well-known/oauth-protected-resource", get(oauth::handle_protected_resource_metadata))
+        .route("/.well-known/oauth-authorization-server", get(oauth::handle_authorization_server_metadata))
+        // OAuth 2.0 dynamic client registration — public per RFC 7591.
+        .route("/oauth/register", post(oauth::handle_register))
         // OAuth 2.0 Authorization Code flow — browser redirect, auto-approve.
         .route("/authorize", get(oauth::handle_authorize))
-        // OAuth 2.0 token endpoint — client_credentials and authorization_code.
+        // OAuth 2.0 token endpoint — client_credentials, authorization_code, refresh_token.
         .route("/oauth/token", post(oauth::handle_oauth_token))
-
         // Documents: POST (create) and GET (list) share the same path.
         // Axum 0.7: combine with method router chaining.
         .route("/api/v1/documents", post(handlers::post_document).get(handlers::list_documents))

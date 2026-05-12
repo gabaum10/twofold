@@ -19,7 +19,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::handlers::{
-    check_auth_token, chrono_now, AppState, OAuthClientRecord, RefreshTokenRecord,
+    check_auth_token, chrono_now, AccessTokenRecord, AppState, OAuthClientRecord,
+    RefreshTokenRecord,
 };
 
 use chrono;
@@ -125,7 +126,10 @@ pub async fn handle_register(
         token_endpoint_auth_method: token_endpoint_auth_method.clone(),
     };
     {
-        let mut clients = state.oauth_clients.lock().unwrap();
+        let mut clients = state
+            .oauth_clients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         clients.insert(client_id.clone(), record);
     }
     tracing::info!(client_id = %client_id, client_name = %client_name, "OAuth dynamic client registered");
@@ -155,6 +159,10 @@ pub struct AuthorizeParams {
 }
 
 /// GET /authorize — PKCE (S256) required. Auto-approves, issues code, redirects.
+///
+/// Security: validates client_id against registered clients and validates
+/// redirect_uri against the client's registered redirect_uris to prevent
+/// open redirect attacks.
 pub async fn handle_authorize(
     State(state): State<AppState>,
     Query(params): Query<AuthorizeParams>,
@@ -225,18 +233,59 @@ pub async fn handle_authorize(
                 .into_response();
         }
     }
+
+    // Validate client_id and redirect_uri against registered clients.
+    // For unregistered clients (admin-token-backed), still validate redirect_uri format.
+    {
+        let clients = state
+            .oauth_clients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(client) = clients.get(&client_id) {
+            // Registered client: redirect_uri must be in the allowed list.
+            if !client.redirect_uris.contains(&redirect_uri) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(OAuthError {
+                        error: "invalid_request",
+                        error_description: "redirect_uri does not match registered redirect URIs",
+                    }),
+                )
+                    .into_response();
+            }
+        } else {
+            // Pre-registered / admin-token client: require HTTPS unless localhost.
+            if !is_safe_redirect_uri(&redirect_uri) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(OAuthError {
+                        error: "invalid_request",
+                        error_description: "redirect_uri must use HTTPS (localhost is permitted over HTTP)",
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    }
+
     let code = {
         use rand::RngCore;
         let mut bytes = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut bytes);
         hex_encode(&bytes)
     };
+    let now = chrono_now();
     let expires_at = {
         let future = chrono::Utc::now() + chrono::Duration::minutes(5);
         future.format("%Y-%m-%dT%H:%M:%SZ").to_string()
     };
     {
-        let mut codes = state.auth_codes.lock().unwrap();
+        let mut codes = state
+            .auth_codes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Sweep expired codes on insert to keep the map bounded.
+        codes.retain(|_, v| v.expires_at.as_str() >= now.as_str());
         codes.insert(
             code.clone(),
             crate::handlers::AuthCodeRecord {
@@ -250,13 +299,14 @@ pub async fn handle_authorize(
         );
     }
     tracing::info!(client_id = %client_id, scope = ?params.scope, "OAuth authorization_code issued");
+    // URL-encode state (arbitrary client data may contain special characters).
     let redirect_url = match params.state.as_deref() {
         Some(s) if !s.is_empty() => format!(
             "{}{}code={}&state={}",
             redirect_uri,
             if redirect_uri.contains('?') { "&" } else { "?" },
             code,
-            s,
+            percent_encode(s),
         ),
         _ => format!(
             "{}{}code={}",
@@ -373,7 +423,10 @@ async fn handle_authorization_code(state: AppState, req: TokenRequest) -> Respon
         _ => return invalid_request("code_verifier is required (PKCE mandatory)"),
     };
     let record = {
-        let mut codes = state.auth_codes.lock().unwrap();
+        let mut codes = state
+            .auth_codes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         match codes.remove(&code) {
             Some(r) => r,
             None => {
@@ -395,11 +448,19 @@ async fn handle_authorization_code(state: AppState, req: TokenRequest) -> Respon
         tracing::warn!(client_id = %client_id, "OAuth authorization_code redirect_uri mismatch");
         return invalid_grant("redirect_uri does not match authorization request");
     }
+    // Resource binding: if the auth code captured a resource, the token request
+    // must include the same resource. If no resource on the code, that is fine.
     if let Some(ref stored_resource) = record.resource {
-        if let Some(ref req_resource) = req.resource {
-            if stored_resource != req_resource {
+        match req.resource.as_deref() {
+            Some(req_resource) if req_resource == stored_resource => {}
+            Some(_) => {
                 tracing::warn!(client_id = %client_id, "OAuth resource parameter mismatch");
                 return invalid_grant("resource parameter does not match authorization request");
+            }
+            None => {
+                // Auth code has resource, token request omits it — reject.
+                tracing::warn!(client_id = %client_id, "OAuth token request missing required resource parameter");
+                return invalid_grant("resource parameter is required for this authorization code");
             }
         }
     }
@@ -408,14 +469,39 @@ async fn handle_authorization_code(state: AppState, req: TokenRequest) -> Respon
         return invalid_grant("code_verifier does not match code_challenge");
     }
     let is_public_client = {
-        let clients = state.oauth_clients.lock().unwrap();
+        let clients = state
+            .oauth_clients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         clients
             .get(&client_id)
             .map(|c| c.token_endpoint_auth_method == "none")
             .unwrap_or(false)
     };
     let access_token = if is_public_client {
-        new_uuid()
+        let at = new_uuid();
+        // Store the access token in the in-memory map with a 1-hour expiry.
+        let at_expires = {
+            let future = chrono::Utc::now() + chrono::Duration::hours(1);
+            future.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+        };
+        {
+            let mut tokens = state
+                .access_tokens
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            // Sweep expired entries on insert.
+            tokens.retain(|_, v| v.expires_at.as_str() >= now.as_str());
+            tokens.insert(
+                at.clone(),
+                AccessTokenRecord {
+                    client_id: client_id.clone(),
+                    scope: record.scope.clone(),
+                    expires_at: at_expires,
+                },
+            );
+        }
+        at
     } else {
         let client_secret = match req.client_secret.as_deref() {
             Some(s) if !s.is_empty() => s.to_string(),
@@ -446,7 +532,12 @@ async fn handle_authorization_code(state: AppState, req: TokenRequest) -> Respon
             scope: record.scope.clone(),
             expires_at: rt_expires,
         };
-        let mut tokens = state.refresh_tokens.lock().unwrap();
+        let mut tokens = state
+            .refresh_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Sweep expired refresh tokens on insert.
+        tokens.retain(|_, v| v.expires_at.as_str() >= now.as_str());
         tokens.insert(rt.clone(), rt_record);
         Some(rt)
     } else {
@@ -476,7 +567,10 @@ async fn handle_refresh_token(state: AppState, req: TokenRequest) -> Response {
         _ => return invalid_request("client_id is required"),
     };
     let record = {
-        let mut tokens = state.refresh_tokens.lock().unwrap();
+        let mut tokens = state
+            .refresh_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         match tokens.remove(&rt_value) {
             Some(r) => r,
             None => {
@@ -495,14 +589,38 @@ async fn handle_refresh_token(state: AppState, req: TokenRequest) -> Response {
         return invalid_grant("client_id does not match refresh token");
     }
     let is_public_client = {
-        let clients = state.oauth_clients.lock().unwrap();
+        let clients = state
+            .oauth_clients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         clients
             .get(&client_id)
             .map(|c| c.token_endpoint_auth_method == "none")
             .unwrap_or(false)
     };
     let access_token = if is_public_client {
-        new_uuid()
+        let at = new_uuid();
+        let at_expires = {
+            let future = chrono::Utc::now() + chrono::Duration::hours(1);
+            future.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+        };
+        {
+            let mut tokens = state
+                .access_tokens
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            // Sweep expired entries on insert.
+            tokens.retain(|_, v| v.expires_at.as_str() >= now.as_str());
+            tokens.insert(
+                at.clone(),
+                AccessTokenRecord {
+                    client_id: client_id.clone(),
+                    scope: record.scope.clone(),
+                    expires_at: at_expires,
+                },
+            );
+        }
+        at
     } else {
         let client_secret = match req.client_secret.as_deref() {
             Some(s) if !s.is_empty() => s.to_string(),
@@ -519,7 +637,12 @@ async fn handle_refresh_token(state: AppState, req: TokenRequest) -> Response {
         future.format("%Y-%m-%dT%H:%M:%SZ").to_string()
     };
     {
-        let mut tokens = state.refresh_tokens.lock().unwrap();
+        let mut tokens = state
+            .refresh_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Sweep expired refresh tokens on insert.
+        tokens.retain(|_, v| v.expires_at.as_str() >= now.as_str());
         tokens.insert(
             new_rt.clone(),
             RefreshTokenRecord {
@@ -586,6 +709,45 @@ fn new_uuid() -> String {
 
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Percent-encode a string for safe inclusion in a URL query parameter value.
+/// Encodes all characters except unreserved (ALPHA / DIGIT / "-" / "." / "_" / "~").
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for byte in s.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(char::from(*byte));
+            }
+            b => {
+                out.push('%');
+                out.push(
+                    char::from_digit((*b >> 4) as u32, 16)
+                        .unwrap()
+                        .to_ascii_uppercase(),
+                );
+                out.push(
+                    char::from_digit((*b & 0xf) as u32, 16)
+                        .unwrap()
+                        .to_ascii_uppercase(),
+                );
+            }
+        }
+    }
+    out
+}
+
+/// Validate that a redirect_uri is safe for use with an unregistered client.
+/// Requires HTTPS unless the host is localhost or 127.0.0.1.
+fn is_safe_redirect_uri(uri: &str) -> bool {
+    if uri.starts_with("https://") {
+        return true;
+    }
+    if uri.starts_with("http://localhost") || uri.starts_with("http://127.0.0.1") {
+        return true;
+    }
+    false
 }
 
 fn url_decode(s: &str) -> String {

@@ -94,12 +94,17 @@ pub struct AuthCodeRecord {
     pub client_id: String,
     pub redirect_uri: String,
     pub expires_at: String, // ISO 8601 UTC
-    /// PKCE code_challenge (base64url SHA256 of the verifier). Mandatory.
     pub code_challenge: String,
-    /// RFC 8707 resource parameter — stored and validated on exchange.
     pub resource: Option<String>,
-    /// Scopes requested (space-separated).
     pub scope: Option<String>,
+}
+
+/// In-memory access token record issued via public-client OAuth flows.
+#[derive(Clone)]
+pub struct AccessTokenRecord {
+    pub client_id: String,
+    pub scope: Option<String>,
+    pub expires_at: String, // ISO 8601 UTC
 }
 
 /// Dynamically-registered OAuth client record (POST /oauth/register).
@@ -110,7 +115,6 @@ pub struct OAuthClientRecord {
     pub redirect_uris: Vec<String>,
     pub grant_types: Vec<String>,
     pub response_types: Vec<String>,
-    /// "none" = public client (no secret required).
     pub token_endpoint_auth_method: String,
 }
 
@@ -120,7 +124,6 @@ pub struct RefreshTokenRecord {
     pub client_id: String,
     pub access_token: String,
     pub scope: Option<String>,
-    /// 30-day TTL, ISO 8601 UTC.
     pub expires_at: String,
 }
 
@@ -129,13 +132,10 @@ pub struct RefreshTokenRecord {
 pub struct AppState {
     pub db: Db,
     pub config: Arc<ServeConfig>,
-    /// In-memory store for pending OAuth authorization codes.
-    /// Arc<Mutex<...>> so it is shared across clones of AppState (axum clones per request).
     pub auth_codes: Arc<Mutex<HashMap<String, AuthCodeRecord>>>,
-    /// Dynamically-registered OAuth clients (POST /oauth/register).
     pub oauth_clients: Arc<Mutex<HashMap<String, OAuthClientRecord>>>,
-    /// Active refresh tokens keyed by token string.
     pub refresh_tokens: Arc<Mutex<HashMap<String, RefreshTokenRecord>>>,
+    pub access_tokens: Arc<Mutex<HashMap<String, AccessTokenRecord>>>,
     pub rate_limit: Arc<RateLimitStore>,
 }
 
@@ -897,6 +897,17 @@ pub async fn check_auth_token(state: &AppState, provided: &str) -> Result<(), Ap
         return Ok(());
     }
 
+    // In-memory access tokens issued to public OAuth clients (UUID tokens).
+    // Sweep expired entries on access, then check for a match.
+    {
+        let now = chrono_now();
+        let mut tokens = state.access_tokens.lock().unwrap_or_else(|e| e.into_inner());
+        tokens.retain(|_, v| v.expires_at.as_str() >= now.as_str());
+        if tokens.contains_key(provided) {
+            return Ok(());
+        }
+    }
+
     // Prefix-based O(1) lookup: use first 8 chars of the provided token
     // to look up the one candidate record, then verify with argon2.
     let prefix: String = provided.chars().take(8).collect();
@@ -1650,6 +1661,7 @@ mod tests {
             auth_codes: Arc::new(Mutex::new(HashMap::new())),
             oauth_clients: Arc::new(Mutex::new(HashMap::new())),
             refresh_tokens: Arc::new(Mutex::new(HashMap::new())),
+            access_tokens: Arc::new(Mutex::new(HashMap::new())),
             rate_limit: rate_limit.clone(),
         };
         Router::new()
@@ -1692,6 +1704,7 @@ mod tests {
             auth_codes: Arc::new(Mutex::new(HashMap::new())),
             oauth_clients: Arc::new(Mutex::new(HashMap::new())),
             refresh_tokens: Arc::new(Mutex::new(HashMap::new())),
+            access_tokens: Arc::new(Mutex::new(HashMap::new())),
             rate_limit: rate_limit.clone(),
         };
         Router::new()
@@ -1802,6 +1815,7 @@ mod tests {
             auth_codes: Arc::new(Mutex::new(HashMap::new())),
             oauth_clients: Arc::new(Mutex::new(HashMap::new())),
             refresh_tokens: Arc::new(Mutex::new(HashMap::new())),
+            access_tokens: Arc::new(Mutex::new(HashMap::new())),
             rate_limit: rate_limit.clone(),
         };
         let app = Router::new()
@@ -2224,6 +2238,7 @@ mod tests {
             auth_codes: Arc::new(Mutex::new(HashMap::new())),
             oauth_clients: Arc::new(Mutex::new(HashMap::new())),
             refresh_tokens: Arc::new(Mutex::new(HashMap::new())),
+            access_tokens: Arc::new(Mutex::new(HashMap::new())),
             rate_limit: rate_limit.clone(),
         };
         let router = Router::new()
@@ -2359,6 +2374,7 @@ mod tests {
             auth_codes: Arc::new(Mutex::new(HashMap::new())),
             oauth_clients: Arc::new(Mutex::new(HashMap::new())),
             refresh_tokens: Arc::new(Mutex::new(HashMap::new())),
+            access_tokens: Arc::new(Mutex::new(HashMap::new())),
             rate_limit: rate_limit.clone(),
         };
         let router = Router::new()
