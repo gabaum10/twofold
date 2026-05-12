@@ -29,7 +29,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.BUMP_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
       - name: Auto-bump patch version if already published
         run: |
