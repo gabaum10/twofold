@@ -862,13 +862,19 @@ footer small a:hover {
                 el.classList.add('expired');
                 return;
             }
-            var h = Math.floor(diff / 3600000);
+            var days = Math.floor(diff / 86400000);
+            var h = Math.floor((diff % 86400000) / 3600000);
             var m = Math.floor((diff % 3600000) / 60000);
-            var s = Math.floor((diff % 60000) / 1000);
             var text = '';
-            if (h > 0) text += h + 'h ';
-            if (h > 0 || m > 0) text += m + 'm ';
-            text += s + 's';
+            if (days > 0) {
+                text = days + (days === 1 ? ' day' : ' days');
+                if (h > 0) text += ', ' + h + (h === 1 ? ' hour' : ' hours');
+            } else if (h > 0) {
+                text = h + (h === 1 ? ' hour' : ' hours');
+                if (m > 0) text += ', ' + m + (m === 1 ? ' minute' : ' minutes');
+            } else {
+                text = (m > 0 ? m : 1) + (m === 1 ? ' minute' : ' minutes');
+            }
             el.querySelector('.expiry-countdown').textContent = text;
             if (diff < 300000) el.classList.add('expiry-urgent');
         }

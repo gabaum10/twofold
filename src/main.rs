@@ -134,6 +134,8 @@ async fn run_server() {
     );
 
     let app = Router::new()
+        // Health check — no auth, checked by load balancers and uptime monitors.
+        .route("/health", get(handlers::health_check))
         // Documents: POST (create) and GET (list) share the same path.
         // Axum 0.7: combine with method router chaining.
         .route("/api/v1/documents", post(handlers::post_document).get(handlers::list_documents))

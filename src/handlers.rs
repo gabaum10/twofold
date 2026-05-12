@@ -519,6 +519,31 @@ pub async fn list_documents(
     }).into_response())
 }
 
+// ── GET /health ──────────────────────────────────────────────────────────────
+
+/// Health check endpoint. No auth required.
+///
+/// Returns 200 with `{"status":"ok","db":"ok"}` when the database is reachable.
+/// Returns 503 with `{"status":"degraded","db":"error"}` if the db check fails.
+///
+/// The db check executes a trivial `SELECT 1` to verify the connection is live.
+pub async fn health_check(State(state): State<AppState>) -> Response {
+    let db_ok = state.db.ping().is_ok();
+    if db_ok {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "ok", "db": "ok"})),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"status": "degraded", "db": "error"})),
+        )
+            .into_response()
+    }
+}
+
 // ── GET /api/v1/openapi.yaml ─────────────────────────────────────────────────
 
 /// Serve the OpenAPI spec as YAML.

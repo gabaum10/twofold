@@ -127,6 +127,16 @@ impl Db {
         Ok(())
     }
 
+    /// Verify the database connection is alive with a trivial query.
+    ///
+    /// Used by the health endpoint. Returns Ok(()) if the connection responds,
+    /// Err if the connection is broken or the mutex is poisoned.
+    pub fn ping(&self) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute_batch("SELECT 1;")?;
+        Ok(())
+    }
+
     /// Insert a new document into the database.
     ///
     /// Returns Err if slug already exists (UNIQUE constraint violation).
