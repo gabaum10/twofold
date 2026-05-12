@@ -19,10 +19,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::auth::check_auth_token;
-use crate::handlers::{
-    chrono_now, AccessTokenRecord, AppState, OAuthClientRecord,
-    RefreshTokenRecord,
-};
+use crate::db::{AccessTokenRow, AuthCodeRow, OAuthClientRow, RefreshTokenRow};
+use crate::handlers::{chrono_now, AppState};
 use crate::rate_limit::{ReadRateLimit, RegistrationRateLimit};
 
 // ── Well-known metadata handlers ─────────────────────────────────────────────
@@ -125,33 +123,22 @@ pub async fn handle_register(
         let cutoff = chrono::Utc::now() - chrono::Duration::hours(24);
         cutoff.format("%Y-%m-%dT%H:%M:%SZ").to_string()
     };
-    let record = OAuthClientRecord {
-        client_id: client_id.clone(),
-        client_name: client_name.clone(),
-        redirect_uris: redirect_uris.clone(),
-        grant_types: grant_types.clone(),
-        response_types: response_types.clone(),
-        token_endpoint_auth_method: token_endpoint_auth_method.clone(),
-        created_at: now,
-    };
-    {
-        let mut clients = state
-            .oauth_clients
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
 
-        // Sweep registrations older than 24 hours before checking the size cap.
-        // Legitimate clients that need to re-register simply do so; stale entries
-        // from spam or one-off tools are cleaned up automatically.
-        clients.retain(|_, v| v.created_at.as_str() >= cutoff_24h.as_str());
+    // Sweep registrations older than 24 hours before checking the size cap.
+    // Legitimate clients that need to re-register simply do so; stale entries
+    // from spam or one-off tools are cleaned up automatically.
+    if let Err(e) = state.db.delete_expired_oauth_clients(&cutoff_24h) {
+        tracing::warn!(error = %e, "Failed to sweep expired OAuth clients");
+    }
 
-        // Hard cap: refuse new registrations if the map is at or over 1,000 entries.
-        // This prevents memory exhaustion from registration spam that slips past
-        // the rate limiter (e.g., distributed sources).
-        if clients.len() >= 1_000 {
+    // Hard cap: refuse new registrations if there are already 1,000 active entries.
+    // This prevents storage exhaustion from registration spam that slips past
+    // the rate limiter (e.g., distributed sources).
+    match state.db.count_active_oauth_clients(&cutoff_24h) {
+        Ok(count) if count >= 1_000 => {
             tracing::warn!(
                 "OAuth client registration limit reached ({} entries)",
-                clients.len()
+                count
             );
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -162,8 +149,39 @@ pub async fn handle_register(
             )
                 .into_response();
         }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to count OAuth clients");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "server_error",
+                    "error_description": "Database error"
+                })),
+            )
+                .into_response();
+        }
+        _ => {}
+    }
 
-        clients.insert(client_id.clone(), record);
+    let row = OAuthClientRow {
+        client_id: client_id.clone(),
+        client_name: client_name.clone(),
+        redirect_uris: serde_json::to_string(&redirect_uris).unwrap_or_default(),
+        grant_types: serde_json::to_string(&grant_types).unwrap_or_default(),
+        response_types: serde_json::to_string(&response_types).unwrap_or_default(),
+        token_endpoint_auth_method: token_endpoint_auth_method.clone(),
+        created_at: now,
+    };
+    if let Err(e) = state.db.insert_oauth_client(&row) {
+        tracing::error!(error = %e, "Failed to insert OAuth client");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "server_error",
+                "error_description": "Database error"
+            })),
+        )
+            .into_response();
     }
     tracing::info!(client_id = %client_id, client_name = %client_name, "OAuth dynamic client registered");
     let resp = RegisterResponse {
@@ -271,14 +289,12 @@ pub async fn handle_authorize(
 
     // Validate client_id and redirect_uri against registered clients.
     // For unregistered clients (admin-token-backed), still validate redirect_uri format.
-    {
-        let clients = state
-            .oauth_clients
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if let Some(client) = clients.get(&client_id) {
+    match state.db.get_oauth_client(&client_id) {
+        Ok(Some(client)) => {
             // Registered client: redirect_uri must be in the allowed list.
-            if !client.redirect_uris.contains(&redirect_uri) {
+            let uris: Vec<String> =
+                serde_json::from_str(&client.redirect_uris).unwrap_or_default();
+            if !uris.contains(&redirect_uri) {
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(OAuthError {
@@ -288,7 +304,8 @@ pub async fn handle_authorize(
                 )
                     .into_response();
             }
-        } else {
+        }
+        Ok(None) => {
             // Pre-registered / admin-token client: require HTTPS unless localhost.
             if !is_safe_redirect_uri(&redirect_uri) {
                 return (
@@ -302,6 +319,17 @@ pub async fn handle_authorize(
                     .into_response();
             }
         }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to look up OAuth client");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(OAuthError {
+                    error: "server_error",
+                    error_description: "Database error",
+                }),
+            )
+                .into_response();
+        }
     }
 
     let code = {
@@ -310,26 +338,28 @@ pub async fn handle_authorize(
         rand::thread_rng().fill_bytes(&mut bytes);
         hex_encode(&bytes)
     };
-    let now = chrono_now();
     let expires_at = {
         let future = chrono::Utc::now() + chrono::Duration::minutes(5);
         future.format("%Y-%m-%dT%H:%M:%SZ").to_string()
     };
-    {
-        let mut codes = state.auth_codes.lock().unwrap_or_else(|e| e.into_inner());
-        // Sweep expired codes on insert to keep the map bounded.
-        codes.retain(|_, v| v.expires_at.as_str() >= now.as_str());
-        codes.insert(
-            code.clone(),
-            crate::handlers::AuthCodeRecord {
-                client_id: client_id.clone(),
-                redirect_uri: redirect_uri.clone(),
-                expires_at,
-                code_challenge,
-                resource: params.resource.clone(),
-                scope: params.scope.clone(),
-            },
-        );
+    if let Err(e) = state.db.insert_auth_code(&AuthCodeRow {
+        code: code.clone(),
+        client_id: client_id.clone(),
+        redirect_uri: redirect_uri.clone(),
+        expires_at,
+        code_challenge,
+        resource: params.resource.clone(),
+        scope: params.scope.clone(),
+    }) {
+        tracing::error!(error = %e, "Failed to insert auth code");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(OAuthError {
+                error: "server_error",
+                error_description: "Database error",
+            }),
+        )
+            .into_response();
     }
     tracing::info!(client_id = %client_id, scope = ?params.scope, "OAuth authorization_code issued");
     // URL-encode state (arbitrary client data may contain special characters).
@@ -456,14 +486,22 @@ async fn handle_authorization_code(state: AppState, req: TokenRequest) -> Respon
         Some(v) if !v.is_empty() => v.to_string(),
         _ => return invalid_request("code_verifier is required (PKCE mandatory)"),
     };
-    let record = {
-        let mut codes = state.auth_codes.lock().unwrap_or_else(|e| e.into_inner());
-        match codes.remove(&code) {
-            Some(r) => r,
-            None => {
-                tracing::warn!(client_id = %client_id, "OAuth authorization_code not found");
-                return invalid_grant("Authorization code not found or already used");
-            }
+    let record = match state.db.take_auth_code(&code) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            tracing::warn!(client_id = %client_id, "OAuth authorization_code not found");
+            return invalid_grant("Authorization code not found or already used");
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to take auth code");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "server_error",
+                    "error_description": "Database error"
+                })),
+            )
+                .into_response();
         }
     };
     let now = chrono_now();
@@ -499,38 +537,42 @@ async fn handle_authorization_code(state: AppState, req: TokenRequest) -> Respon
         tracing::warn!(client_id = %client_id, "OAuth PKCE verification failed");
         return invalid_grant("code_verifier does not match code_challenge");
     }
-    let is_public_client = {
-        let clients = state
-            .oauth_clients
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        clients
-            .get(&client_id)
-            .map(|c| c.token_endpoint_auth_method == "none")
-            .unwrap_or(false)
+    let is_public_client = match state.db.get_oauth_client(&client_id) {
+        Ok(Some(c)) => c.token_endpoint_auth_method == "none",
+        Ok(None) => false,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to look up OAuth client");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "server_error",
+                    "error_description": "Database error"
+                })),
+            )
+                .into_response();
+        }
     };
     let access_token = if is_public_client {
         let at = new_uuid();
-        // Store the access token in the in-memory map with a 1-hour expiry.
         let at_expires = {
             let future = chrono::Utc::now() + chrono::Duration::hours(1);
             future.format("%Y-%m-%dT%H:%M:%SZ").to_string()
         };
-        {
-            let mut tokens = state
-                .access_tokens
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            // Sweep expired entries on insert.
-            tokens.retain(|_, v| v.expires_at.as_str() >= now.as_str());
-            tokens.insert(
-                at.clone(),
-                AccessTokenRecord {
-                    client_id: client_id.clone(),
-                    scope: record.scope.clone(),
-                    expires_at: at_expires,
-                },
-            );
+        if let Err(e) = state.db.insert_access_token(&AccessTokenRow {
+            token: at.clone(),
+            client_id: client_id.clone(),
+            scope: record.scope.clone(),
+            expires_at: at_expires,
+        }) {
+            tracing::error!(error = %e, "Failed to insert access token");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "server_error",
+                    "error_description": "Database error"
+                })),
+            )
+                .into_response();
         }
         at
     } else {
@@ -557,19 +599,23 @@ async fn handle_authorization_code(state: AppState, req: TokenRequest) -> Respon
             let future = chrono::Utc::now() + chrono::Duration::days(30);
             future.format("%Y-%m-%dT%H:%M:%SZ").to_string()
         };
-        let rt_record = RefreshTokenRecord {
+        if let Err(e) = state.db.insert_refresh_token(&RefreshTokenRow {
+            token: rt.clone(),
             client_id: client_id.clone(),
             access_token: access_token.clone(),
             scope: record.scope.clone(),
             expires_at: rt_expires,
-        };
-        let mut tokens = state
-            .refresh_tokens
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        // Sweep expired refresh tokens on insert.
-        tokens.retain(|_, v| v.expires_at.as_str() >= now.as_str());
-        tokens.insert(rt.clone(), rt_record);
+        }) {
+            tracing::error!(error = %e, "Failed to insert refresh token");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "server_error",
+                    "error_description": "Database error"
+                })),
+            )
+                .into_response();
+        }
         Some(rt)
     } else {
         None
@@ -597,17 +643,22 @@ async fn handle_refresh_token(state: AppState, req: TokenRequest) -> Response {
         Some(id) if !id.is_empty() => id.to_string(),
         _ => return invalid_request("client_id is required"),
     };
-    let record = {
-        let mut tokens = state
-            .refresh_tokens
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        match tokens.remove(&rt_value) {
-            Some(r) => r,
-            None => {
-                tracing::warn!(client_id = %client_id, "OAuth refresh_token not found");
-                return invalid_grant("Refresh token not found or already used");
-            }
+    let record = match state.db.take_refresh_token(&rt_value) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            tracing::warn!(client_id = %client_id, "OAuth refresh_token not found");
+            return invalid_grant("Refresh token not found or already used");
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to take refresh token");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "server_error",
+                    "error_description": "Database error"
+                })),
+            )
+                .into_response();
         }
     };
     let now = chrono_now();
@@ -619,15 +670,20 @@ async fn handle_refresh_token(state: AppState, req: TokenRequest) -> Response {
         tracing::warn!(client_id = %client_id, "OAuth refresh_token client_id mismatch");
         return invalid_grant("client_id does not match refresh token");
     }
-    let is_public_client = {
-        let clients = state
-            .oauth_clients
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        clients
-            .get(&client_id)
-            .map(|c| c.token_endpoint_auth_method == "none")
-            .unwrap_or(false)
+    let is_public_client = match state.db.get_oauth_client(&client_id) {
+        Ok(Some(c)) => c.token_endpoint_auth_method == "none",
+        Ok(None) => false,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to look up OAuth client");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "server_error",
+                    "error_description": "Database error"
+                })),
+            )
+                .into_response();
+        }
     };
     let access_token = if is_public_client {
         let at = new_uuid();
@@ -635,21 +691,21 @@ async fn handle_refresh_token(state: AppState, req: TokenRequest) -> Response {
             let future = chrono::Utc::now() + chrono::Duration::hours(1);
             future.format("%Y-%m-%dT%H:%M:%SZ").to_string()
         };
-        {
-            let mut tokens = state
-                .access_tokens
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            // Sweep expired entries on insert.
-            tokens.retain(|_, v| v.expires_at.as_str() >= now.as_str());
-            tokens.insert(
-                at.clone(),
-                AccessTokenRecord {
-                    client_id: client_id.clone(),
-                    scope: record.scope.clone(),
-                    expires_at: at_expires,
-                },
-            );
+        if let Err(e) = state.db.insert_access_token(&AccessTokenRow {
+            token: at.clone(),
+            client_id: client_id.clone(),
+            scope: record.scope.clone(),
+            expires_at: at_expires,
+        }) {
+            tracing::error!(error = %e, "Failed to insert access token");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "server_error",
+                    "error_description": "Database error"
+                })),
+            )
+                .into_response();
         }
         at
     } else {
@@ -667,22 +723,22 @@ async fn handle_refresh_token(state: AppState, req: TokenRequest) -> Response {
         let future = chrono::Utc::now() + chrono::Duration::days(30);
         future.format("%Y-%m-%dT%H:%M:%SZ").to_string()
     };
-    {
-        let mut tokens = state
-            .refresh_tokens
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        // Sweep expired refresh tokens on insert.
-        tokens.retain(|_, v| v.expires_at.as_str() >= now.as_str());
-        tokens.insert(
-            new_rt.clone(),
-            RefreshTokenRecord {
-                client_id: client_id.clone(),
-                access_token: access_token.clone(),
-                scope: record.scope.clone(),
-                expires_at: new_rt_expires,
-            },
-        );
+    if let Err(e) = state.db.insert_refresh_token(&RefreshTokenRow {
+        token: new_rt.clone(),
+        client_id: client_id.clone(),
+        access_token: access_token.clone(),
+        scope: record.scope.clone(),
+        expires_at: new_rt_expires,
+    }) {
+        tracing::error!(error = %e, "Failed to insert refresh token");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "server_error",
+                "error_description": "Database error"
+            })),
+        )
+            .into_response();
     }
     tracing::info!(client_id = %client_id, "OAuth refresh_token grant issued (rotated)");
     (

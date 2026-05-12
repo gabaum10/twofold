@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use askama::Template;
 use axum::{
@@ -79,60 +78,12 @@ impl From<rusqlite::Error> for AppError {
 
 // ── State ────────────────────────────────────────────────────────────────────
 
-/// In-flight authorization code record for the OAuth Authorization Code flow.
-#[derive(Clone)]
-pub struct AuthCodeRecord {
-    pub client_id: String,
-    pub redirect_uri: String,
-    pub expires_at: String, // ISO 8601 UTC
-    pub code_challenge: String,
-    pub resource: Option<String>,
-    pub scope: Option<String>,
-}
-
-/// In-memory access token record issued via public-client OAuth flows.
-#[derive(Clone)]
-#[allow(dead_code)] // fields stored for future access policy enforcement
-pub struct AccessTokenRecord {
-    pub client_id: String,
-    pub scope: Option<String>,
-    pub expires_at: String, // ISO 8601 UTC
-}
-
-/// Dynamically-registered OAuth client record (POST /oauth/register).
-#[derive(Clone)]
-#[allow(dead_code)] // fields stored for future access policy enforcement
-pub struct OAuthClientRecord {
-    pub client_id: String,
-    pub client_name: String,
-    pub redirect_uris: Vec<String>,
-    pub grant_types: Vec<String>,
-    pub response_types: Vec<String>,
-    pub token_endpoint_auth_method: String,
-    /// RFC 3339 timestamp of registration — used by the 24-hour expiry sweep.
-    pub created_at: String,
-}
-
-/// Active refresh token record.
-#[derive(Clone)]
-#[allow(dead_code)] // fields stored for future access policy enforcement
-pub struct RefreshTokenRecord {
-    pub client_id: String,
-    pub access_token: String,
-    pub scope: Option<String>,
-    pub expires_at: String,
-}
-
 /// Shared application state injected into all handlers via axum State extractor.
 #[derive(Clone)]
 #[allow(dead_code)] // rate_limit accessed via axum Extension layer, not directly on AppState
 pub struct AppState {
     pub db: Db,
     pub config: Arc<ServeConfig>,
-    pub auth_codes: Arc<Mutex<HashMap<String, AuthCodeRecord>>>,
-    pub oauth_clients: Arc<Mutex<HashMap<String, OAuthClientRecord>>>,
-    pub refresh_tokens: Arc<Mutex<HashMap<String, RefreshTokenRecord>>>,
-    pub access_tokens: Arc<Mutex<HashMap<String, AccessTokenRecord>>>,
     pub rate_limit: Arc<RateLimitStore>,
 }
 
@@ -1929,10 +1880,6 @@ mod tests {
         let state = AppState {
             db,
             config: Arc::new(config),
-            auth_codes: Arc::new(Mutex::new(HashMap::new())),
-            oauth_clients: Arc::new(Mutex::new(HashMap::new())),
-            refresh_tokens: Arc::new(Mutex::new(HashMap::new())),
-            access_tokens: Arc::new(Mutex::new(HashMap::new())),
             rate_limit: rate_limit.clone(),
         };
         Router::new()
@@ -1973,10 +1920,6 @@ mod tests {
         let state = AppState {
             db,
             config: Arc::new(config),
-            auth_codes: Arc::new(Mutex::new(HashMap::new())),
-            oauth_clients: Arc::new(Mutex::new(HashMap::new())),
-            refresh_tokens: Arc::new(Mutex::new(HashMap::new())),
-            access_tokens: Arc::new(Mutex::new(HashMap::new())),
             rate_limit: rate_limit.clone(),
         };
         Router::new()
@@ -2088,10 +2031,6 @@ mod tests {
         let state = AppState {
             db,
             config: Arc::new(config),
-            auth_codes: Arc::new(Mutex::new(HashMap::new())),
-            oauth_clients: Arc::new(Mutex::new(HashMap::new())),
-            refresh_tokens: Arc::new(Mutex::new(HashMap::new())),
-            access_tokens: Arc::new(Mutex::new(HashMap::new())),
             rate_limit: rate_limit.clone(),
         };
         let app = Router::new()
@@ -2564,10 +2503,6 @@ mod tests {
         let state = AppState {
             db,
             config: Arc::new(config),
-            auth_codes: Arc::new(Mutex::new(HashMap::new())),
-            oauth_clients: Arc::new(Mutex::new(HashMap::new())),
-            refresh_tokens: Arc::new(Mutex::new(HashMap::new())),
-            access_tokens: Arc::new(Mutex::new(HashMap::new())),
             rate_limit: rate_limit.clone(),
         };
         let router = Router::new()
@@ -2712,10 +2647,6 @@ mod tests {
         let state = AppState {
             db,
             config: Arc::new(config),
-            auth_codes: Arc::new(Mutex::new(HashMap::new())),
-            oauth_clients: Arc::new(Mutex::new(HashMap::new())),
-            refresh_tokens: Arc::new(Mutex::new(HashMap::new())),
-            access_tokens: Arc::new(Mutex::new(HashMap::new())),
             rate_limit: rate_limit.clone(),
         };
         let router = Router::new()
@@ -2961,10 +2892,6 @@ mod tests {
         let state = AppState {
             db: db.clone(),
             config: Arc::new(config),
-            auth_codes: Arc::new(Mutex::new(HashMap::new())),
-            oauth_clients: Arc::new(Mutex::new(HashMap::new())),
-            refresh_tokens: Arc::new(Mutex::new(HashMap::new())),
-            access_tokens: Arc::new(Mutex::new(HashMap::new())),
             rate_limit: rate_limit.clone(),
         };
         (state, db)
@@ -3223,5 +3150,249 @@ mod tests {
         let headers = HeaderMap::new();
         let ip = extract_client_ip(&headers, None);
         assert_eq!(ip, "unknown");
+    }
+
+    // ── Password cookie / unlock tests ────────────────────────────────────────
+
+    /// A fresh cookie produced by make_auth_cookie is considered valid.
+    #[test]
+    fn is_password_authed_valid_cookie() {
+        let secret = "test-secret";
+        let slug = "my-doc";
+        let cookie_value = make_auth_cookie(slug, secret);
+        let cookie_header = format!("twofold_auth_{}={}", slug, cookie_value);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("cookie", cookie_header.parse().unwrap());
+
+        assert!(
+            is_password_authed(&headers, slug, secret),
+            "freshly-minted cookie should pass"
+        );
+    }
+
+    /// A cookie with an expiry timestamp in the past is rejected.
+    #[test]
+    fn is_password_authed_expired_cookie() {
+        use base64::Engine;
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        let secret = "test-secret";
+        let slug = "my-doc";
+
+        // Construct a cookie with an already-expired timestamp.
+        let expiry_str = "2000-01-01T00:00:00Z"; // firmly in the past
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(slug.as_bytes());
+        mac.update(expiry_str.as_bytes());
+        let sig_b64 =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+        let cookie_value = format!("{}:{}", sig_b64, expiry_str);
+
+        let cookie_header = format!("twofold_auth_{}={}", slug, cookie_value);
+        let mut headers = HeaderMap::new();
+        headers.insert("cookie", cookie_header.parse().unwrap());
+
+        assert!(
+            !is_password_authed(&headers, slug, secret),
+            "expired cookie should fail"
+        );
+    }
+
+    /// A cookie with a tampered HMAC signature is rejected.
+    #[test]
+    fn is_password_authed_tampered_cookie() {
+        let secret = "test-secret";
+        let slug = "my-doc";
+
+        // Valid cookie made with the correct secret.
+        let cookie_value = make_auth_cookie(slug, secret);
+
+        // Tamper: flip the first character of the signature.
+        let tampered = {
+            let mut chars: Vec<char> = cookie_value.chars().collect();
+            // The first char is part of the base64 signature.
+            chars[0] = if chars[0] == 'A' { 'B' } else { 'A' };
+            chars.iter().collect::<String>()
+        };
+
+        let cookie_header = format!("twofold_auth_{}={}", slug, tampered);
+        let mut headers = HeaderMap::new();
+        headers.insert("cookie", cookie_header.parse().unwrap());
+
+        assert!(
+            !is_password_authed(&headers, slug, secret),
+            "tampered HMAC should fail"
+        );
+    }
+
+    /// Correct password → 303 redirect with Set-Cookie header.
+    #[tokio::test]
+    async fn post_unlock_happy_path() {
+        let token = "test-token";
+        let password = "correct-horse";
+        let slug = "locked-doc";
+
+        // Build app with a pre-seeded password-protected document.
+        let db = crate::db::Db::open(":memory:").expect("in-memory db");
+        let hash = hash_password(password).expect("hash");
+        let doc = crate::db::DocumentRecord {
+            id: slug.to_string(),
+            slug: slug.to_string(),
+            title: "Locked".to_string(),
+            raw_content: format!("---\npassword: {hash}\n---\n# Secret"),
+            theme: "clean".to_string(),
+            password: Some(hash),
+            description: None,
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            expires_at: None,
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+        };
+        db.insert_document(&doc).expect("insert");
+
+        let config = crate::config::ServeConfig {
+            token: token.to_string(),
+            db_path: ":memory:".to_string(),
+            bind: "127.0.0.1:0".to_string(),
+            base_url: "http://localhost".to_string(),
+            default_theme: "clean".to_string(),
+            max_size: 1_048_576,
+            webhook_url: None,
+            webhook_secret: None,
+            reaper_interval: 3600,
+            rate_limit_read: 1000,
+            rate_limit_write: 1000,
+            rate_limit_window: 60,
+        };
+        let rate_limit = crate::rate_limit::RateLimitStore::new(&config);
+        let state = AppState {
+            db,
+            config: Arc::new(config),
+            rate_limit: rate_limit.clone(),
+        };
+        let app = Router::new()
+            .route("/:slug/unlock", post(crate::handlers::post_unlock))
+            .layer(axum::Extension(rate_limit))
+            .with_state(state);
+
+        let body = format!("password={password}");
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/{slug}/unlock"))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::SEE_OTHER,
+            "correct password should redirect"
+        );
+        let set_cookie = resp
+            .headers()
+            .get("set-cookie")
+            .expect("Set-Cookie header should be present");
+        let cookie_str = set_cookie.to_str().unwrap();
+        assert!(
+            cookie_str.contains(&format!("twofold_auth_{}", slug)),
+            "cookie name should include slug, got: {cookie_str}"
+        );
+    }
+
+    /// Wrong password → 200 with password form and error message.
+    #[tokio::test]
+    async fn post_unlock_wrong_password() {
+        let token = "test-token";
+        let password = "correct-horse";
+        let slug = "locked-doc-2";
+
+        let db = crate::db::Db::open(":memory:").expect("in-memory db");
+        let hash = hash_password(password).expect("hash");
+        let doc = crate::db::DocumentRecord {
+            id: slug.to_string(),
+            slug: slug.to_string(),
+            title: "Locked".to_string(),
+            raw_content: format!("---\npassword: {hash}\n---\n# Secret"),
+            theme: "clean".to_string(),
+            password: Some(hash),
+            description: None,
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            expires_at: None,
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+        };
+        db.insert_document(&doc).expect("insert");
+
+        let config = crate::config::ServeConfig {
+            token: token.to_string(),
+            db_path: ":memory:".to_string(),
+            bind: "127.0.0.1:0".to_string(),
+            base_url: "http://localhost".to_string(),
+            default_theme: "clean".to_string(),
+            max_size: 1_048_576,
+            webhook_url: None,
+            webhook_secret: None,
+            reaper_interval: 3600,
+            rate_limit_read: 1000,
+            rate_limit_write: 1000,
+            rate_limit_window: 60,
+        };
+        let rate_limit = crate::rate_limit::RateLimitStore::new(&config);
+        let state = AppState {
+            db,
+            config: Arc::new(config),
+            rate_limit: rate_limit.clone(),
+        };
+        let app = Router::new()
+            .route("/:slug/unlock", post(crate::handlers::post_unlock))
+            .layer(axum::Extension(rate_limit))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/{slug}/unlock"))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from("password=wrong-password"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        // Wrong password renders the form again, not a redirect.
+        assert_ne!(
+            resp.status(),
+            StatusCode::SEE_OTHER,
+            "wrong password should not redirect"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(
+            text.contains("Incorrect password"),
+            "should show error message, got: {text}"
+        );
+    }
+
+    /// strip_password_from_content removes only the password line, not others.
+    #[test]
+    fn strip_password_preserves_other_frontmatter() {
+        let raw = "---\ntitle: My Doc\npassword: secret123\ntheme: clean\n---\n# Body";
+        let stripped = strip_password_from_content(raw);
+
+        assert!(
+            !stripped.contains("password:"),
+            "password line should be removed"
+        );
+        assert!(
+            stripped.contains("title: My Doc"),
+            "title should be preserved"
+        );
+        assert!(
+            stripped.contains("theme: clean"),
+            "theme should be preserved"
+        );
+        assert!(stripped.contains("# Body"), "body content should be preserved");
+        // The frontmatter fences must still be present.
+        assert!(stripped.starts_with("---"), "opening fence should remain");
     }
 }

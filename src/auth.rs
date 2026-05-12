@@ -96,28 +96,32 @@ pub async fn check_auth_token(state: &AppState, provided: &str) -> Result<Princi
         });
     }
 
-    // ── 2. In-memory OAuth access tokens ────────────────────────────────────
-    // Sweep expired entries on access, then attempt a lookup.
-    {
-        let now = crate::handlers::chrono_now();
-        let mut tokens = state
-            .access_tokens
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        tokens.retain(|_, v| v.expires_at.as_str() >= now.as_str());
-        if let Some(record) = tokens.get(provided) {
-            let client_id = record.client_id.clone();
-            let scope_str = record.scope.clone();
-            let scopes: Vec<String> = scope_str
-                .as_deref()
-                .map(|s| s.split_whitespace().map(|t| t.to_string()).collect())
-                .unwrap_or_default();
-            let display_name = format!("oauth:{client_id}");
-            return Ok(Principal {
-                kind: PrincipalKind::OAuth { client_id },
-                scopes,
-                display_name,
-            });
+    // ── 2. SQLite OAuth access tokens ───────────────────────────────────────
+    // Look up the token; check expiry in-process (avoids a WHERE clause that
+    // requires WAL read, at negligible overhead for one row).
+    match state.db.get_access_token(provided) {
+        Ok(Some(record)) => {
+            let now = crate::handlers::chrono_now();
+            if record.expires_at.as_str() >= now.as_str() {
+                let client_id = record.client_id.clone();
+                let scopes: Vec<String> = record
+                    .scope
+                    .as_deref()
+                    .map(|s| s.split_whitespace().map(|t| t.to_string()).collect())
+                    .unwrap_or_default();
+                let display_name = format!("oauth:{client_id}");
+                return Ok(Principal {
+                    kind: PrincipalKind::OAuth { client_id },
+                    scopes,
+                    display_name,
+                });
+            }
+            // Token exists but is expired — fall through to managed token check.
+        }
+        Ok(None) => {} // not an OAuth token — fall through
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to look up OAuth access token");
+            // Non-fatal: fall through to managed token check.
         }
     }
 

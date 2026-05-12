@@ -2,6 +2,7 @@ mod auth;
 mod cli;
 mod config;
 mod db;
+mod frontmatter;
 mod handlers;
 mod highlight;
 mod mcp;
@@ -106,21 +107,19 @@ async fn run_server() {
     let state = AppState {
         db: db.clone(),
         config: Arc::new(config),
-        auth_codes: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        oauth_clients: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        refresh_tokens: std::sync::Arc::new(
-            std::sync::Mutex::new(std::collections::HashMap::new()),
-        ),
-        access_tokens: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         rate_limit: rate_limit.clone(),
     };
 
-    // Spawn the background reaper task for expired documents.
+    // Spawn the background reaper task for expired documents and OAuth state.
     //
-    // Strategy: soft-delete tombstoning. Expired documents are NOT immediately
-    // deleted — the handler's is_expired() check returns 410 for them. The reaper
-    // only hard-deletes documents that expired MORE than 30 days ago, giving the
-    // 410 page a 30-day window before the tombstone is discarded.
+    // Document strategy: soft-delete tombstoning. Expired documents are NOT
+    // immediately deleted — the handler's is_expired() check returns 410 for
+    // them. The reaper only hard-deletes documents that expired MORE than 30
+    // days ago, giving the 410 page a 30-day window before the tombstone is
+    // discarded.
+    //
+    // OAuth strategy: hard-delete expired auth codes, access tokens, and refresh
+    // tokens immediately — they serve no purpose once expired.
     let reaper_db = db.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(reaper_interval));
@@ -130,19 +129,32 @@ async fn run_server() {
             // SQLite writes are blocking; run off the async executor.
             let db_clone = reaper_db.clone();
             let result = tokio::task::spawn_blocking(move || {
-                db_clone.delete_expired_older_than(&now, 30)
+                let doc_count = db_clone.delete_expired_older_than(&now, 30)?;
+                let auth_code_count = db_clone.delete_expired_auth_codes(&now)?;
+                let at_count = db_clone.delete_expired_access_tokens(&now)?;
+                let rt_count = db_clone.delete_expired_refresh_tokens(&now)?;
+                Ok::<_, rusqlite::Error>((doc_count, auth_code_count, at_count, rt_count))
             })
             .await;
             match result {
-                Ok(Ok(count)) if count > 0 => {
-                    tracing::info!(
-                        count,
-                        "Reaper garbage-collected tombstones older than 30 days"
-                    );
+                Ok(Ok((docs, auth_codes, ats, rts))) => {
+                    if docs > 0 {
+                        tracing::info!(
+                            count = docs,
+                            "Reaper garbage-collected tombstones older than 30 days"
+                        );
+                    }
+                    if auth_codes + ats + rts > 0 {
+                        tracing::debug!(
+                            auth_codes,
+                            access_tokens = ats,
+                            refresh_tokens = rts,
+                            "Reaper swept expired OAuth state"
+                        );
+                    }
                 }
-                Ok(Ok(_)) => {} // nothing old enough to reap
                 Ok(Err(e)) => {
-                    tracing::error!(error = %e, "Reaper failed to garbage-collect expired documents");
+                    tracing::error!(error = %e, "Reaper failed");
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "Reaper task panicked");
@@ -279,13 +291,16 @@ fn run_publish(args: cli::PublishArgs) {
     // Apply frontmatter from CLI flags if any flags were provided.
     // If content already has frontmatter (starts with ---), merge flags in.
     // If no frontmatter and no flags, send as-is.
-    let body = apply_publish_flags(
-        content,
-        args.title,
-        args.slug,
-        args.theme,
-        args.expiry,
-        args.password,
+    let body = frontmatter::apply_frontmatter(
+        &content,
+        frontmatter::FrontmatterFields {
+            title: args.title,
+            slug: args.slug,
+            theme: args.theme,
+            expiry: args.expiry,
+            password: args.password,
+            description: None,
+        },
     );
 
     // POST to the server.
@@ -337,184 +352,6 @@ fn run_publish(args: cli::PublishArgs) {
         eprintln!("Publish failed: HTTP {status}\n{body_text}");
         std::process::exit(1);
     }
-}
-
-/// Apply CLI publish flags to content, injecting or merging frontmatter.
-///
-/// Rules:
-/// - If content has no frontmatter AND flags provided: prepend frontmatter.
-/// - If content has frontmatter AND flags provided: merge (CLI flags win on conflict).
-/// - If no flags: return content unchanged.
-fn apply_publish_flags(
-    content: String,
-    title: Option<String>,
-    slug: Option<String>,
-    theme: Option<String>,
-    expiry: Option<String>,
-    password: Option<String>,
-) -> String {
-    let has_flags = title.is_some()
-        || slug.is_some()
-        || theme.is_some()
-        || expiry.is_some()
-        || password.is_some();
-    if !has_flags {
-        return content;
-    }
-
-    let trimmed = content.trim_start();
-    if trimmed.starts_with("---") {
-        // Content has frontmatter — parse and merge CLI flags.
-        merge_frontmatter_flags(content, title, slug, theme, expiry, password)
-    } else {
-        // No frontmatter — prepend it.
-        let mut fm = String::from("---\n");
-        if let Some(t) = title {
-            fm.push_str(&format!(
-                "title: {}\n",
-                crate::mcp::yaml_escape_value_pub(&t)
-            ));
-        }
-        if let Some(s) = slug {
-            fm.push_str(&format!(
-                "slug: {}\n",
-                crate::mcp::yaml_escape_value_pub(&s)
-            ));
-        }
-        if let Some(th) = theme {
-            fm.push_str(&format!(
-                "theme: {}\n",
-                crate::mcp::yaml_escape_value_pub(&th)
-            ));
-        }
-        if let Some(ex) = expiry {
-            fm.push_str(&format!(
-                "expiry: {}\n",
-                crate::mcp::yaml_escape_value_pub(&ex)
-            ));
-        }
-        if let Some(pw) = password {
-            fm.push_str(&format!(
-                "password: {}\n",
-                crate::mcp::yaml_escape_value_pub(&pw)
-            ));
-        }
-        fm.push_str("---\n");
-        fm.push_str(&content);
-        fm
-    }
-}
-
-/// Merge CLI flags into existing frontmatter. CLI wins on conflict.
-///
-/// Strategy: parse the existing frontmatter block line-by-line. For each
-/// key that a CLI flag would set, replace the existing value if present,
-/// or append if absent. This is a simple line-based approach — correct for
-/// the single-line scalar values twofold uses.
-fn merge_frontmatter_flags(
-    content: String,
-    title: Option<String>,
-    slug: Option<String>,
-    theme: Option<String>,
-    expiry: Option<String>,
-    password: Option<String>,
-) -> String {
-    let lines: Vec<&str> = content.lines().collect();
-
-    // Find the closing --- of the frontmatter block.
-    let mut close_idx = None;
-    for (i, line) in lines.iter().enumerate().skip(1) {
-        if line.trim() == "---" {
-            close_idx = Some(i);
-            break;
-        }
-    }
-
-    let close_idx = match close_idx {
-        Some(i) => i,
-        None => {
-            // No closing fence — treat as no frontmatter, prepend new block.
-            // Fallback: just prepend the flags as a new block.
-            let mut fm = String::from("---\n");
-            if let Some(t) = title {
-                fm.push_str(&format!(
-                    "title: {}\n",
-                    crate::mcp::yaml_escape_value_pub(&t)
-                ));
-            }
-            if let Some(s) = slug {
-                fm.push_str(&format!(
-                    "slug: {}\n",
-                    crate::mcp::yaml_escape_value_pub(&s)
-                ));
-            }
-            if let Some(th) = theme {
-                fm.push_str(&format!(
-                    "theme: {}\n",
-                    crate::mcp::yaml_escape_value_pub(&th)
-                ));
-            }
-            if let Some(ex) = expiry {
-                fm.push_str(&format!(
-                    "expiry: {}\n",
-                    crate::mcp::yaml_escape_value_pub(&ex)
-                ));
-            }
-            if let Some(pw) = password {
-                fm.push_str(&format!(
-                    "password: {}\n",
-                    crate::mcp::yaml_escape_value_pub(&pw)
-                ));
-            }
-            fm.push_str("---\n");
-            fm.push_str(&content);
-            return fm;
-        }
-    };
-
-    // Build a set of keys to override.
-    let overrides: Vec<(&str, &str)> = [
-        title.as_deref().map(|v| ("title", v)),
-        slug.as_deref().map(|v| ("slug", v)),
-        theme.as_deref().map(|v| ("theme", v)),
-        expiry.as_deref().map(|v| ("expiry", v)),
-        password.as_deref().map(|v| ("password", v)),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-
-    let mut fm_lines: Vec<String> = lines[1..close_idx].iter().map(|s| s.to_string()).collect();
-
-    // For each override, check if the key exists in fm_lines and replace; otherwise append.
-    for (key, val) in &overrides {
-        let new_line = format!("{key}: {}", crate::mcp::yaml_escape_value_pub(val));
-        let prefix = format!("{key}:");
-        let found = fm_lines.iter_mut().any(|line| {
-            if line.trim_start().starts_with(&prefix) {
-                *line = new_line.clone();
-                true
-            } else {
-                false
-            }
-        });
-        if !found {
-            fm_lines.push(new_line);
-        }
-    }
-
-    // Reconstruct the document.
-    let mut result = String::from("---\n");
-    for line in &fm_lines {
-        result.push_str(line);
-        result.push('\n');
-    }
-    result.push_str("---\n");
-    // Body: everything after the closing ---
-    if close_idx + 1 < lines.len() {
-        result.push_str(&lines[close_idx + 1..].join("\n"));
-    }
-    result
 }
 
 /// Read content from a file path or stdin (`-`).
