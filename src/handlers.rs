@@ -39,6 +39,7 @@ const SLUG_ALPHABET: [char; 63] = [
 #[derive(Debug)]
 pub enum AppError {
     Unauthorized,
+    Forbidden,
     BadRequest(String),
     NotFound,
     Conflict(String),
@@ -61,6 +62,7 @@ impl IntoResponse for AppError {
             _ => {
                 let (status, msg) = match self {
                     AppError::Unauthorized => (StatusCode::UNAUTHORIZED, "Unauthorized".to_string()),
+                    AppError::Forbidden => (StatusCode::FORBIDDEN, "Forbidden".to_string()),
                     AppError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
                     AppError::NotFound => (StatusCode::NOT_FOUND, "Not found".to_string()),
                     AppError::Conflict(m) => (StatusCode::CONFLICT, m),
@@ -331,7 +333,7 @@ pub async fn post_document(
 ) -> Result<Response, AppError> {
     // Auth FIRST — 401 before 400/413
     let token_name = check_auth(&state, &headers).await?;
-    let peer_addr = connect_info.map(|c| c.0.to_string());
+    let peer_addr = connect_info.map(|c| c.0.ip().to_string());
 
     // Body validation
     if body.is_empty() {
@@ -394,9 +396,11 @@ pub async fn post_document(
         updated_at: now.clone(),
     };
 
-    // Insert (handle slug collision)
-    match state.db.insert_document(&doc) {
-        Ok(()) => {}
+    // Insert (handle slug collision).
+    // On a random-slug collision: retry once with a new slug and carry the final
+    // slug forward so the single audit write below uses the correct value.
+    let final_doc = match state.db.insert_document(&doc) {
+        Ok(()) => doc,
         Err(e) if is_unique_violation(&e) => {
             // Custom slug collision -> 409 Conflict
             if meta.slug.is_some() {
@@ -416,43 +420,21 @@ pub async fn post_document(
                     tracing::error!(error = %e2, "Slug collision retry failed");
                     AppError::Internal("Failed to allocate unique slug".to_string())
                 })?;
-            // Audit entry for retry-path create (final slug after collision).
-            let ip_address = extract_client_ip(&headers, peer_addr.as_deref());
-            let audit_entry = AuditEntry {
-                id: nanoid::nanoid!(10),
-                timestamp: now.clone(),
-                action: "create".to_string(),
-                slug: new_slug.clone(),
-                token_name: token_name.clone(),
-                ip_address,
-            };
-            if let Err(e) = state.db.insert_audit_entry(&audit_entry) {
-                tracing::error!(error = %e, "Failed to write audit entry");
-            }
-            let base = state.config.base_url.trim_end_matches('/');
-            return Ok((StatusCode::CREATED, Json(CreateResponse {
-                url: format!("{base}/{new_slug}"),
-                slug: new_slug.clone(),
-                api_url: format!("{base}/api/v1/documents/{new_slug}"),
-                title: retry_doc.title,
-                description: retry_doc.description,
-                created_at: retry_doc.created_at,
-                expires_at: retry_doc.expires_at,
-            })).into_response());
+            retry_doc
         }
         Err(e) => return Err(AppError::from(e)),
-    }
+    };
 
-    // Response
+    // Response — uses final_doc.slug so collision-retry path gets the correct slug.
     let base = state.config.base_url.trim_end_matches('/');
     let response = CreateResponse {
-        url: format!("{base}/{slug}"),
-        slug: slug.clone(),
-        api_url: format!("{base}/api/v1/documents/{slug}"),
-        title: doc.title.clone(),
-        description: doc.description.clone(),
-        created_at: doc.created_at.clone(),
-        expires_at: doc.expires_at.clone(),
+        url: format!("{base}/{}", final_doc.slug),
+        slug: final_doc.slug.clone(),
+        api_url: format!("{base}/api/v1/documents/{}", final_doc.slug),
+        title: final_doc.title.clone(),
+        description: final_doc.description.clone(),
+        created_at: final_doc.created_at.clone(),
+        expires_at: final_doc.expires_at.clone(),
     };
 
     // Dispatch webhook fire-and-forget AFTER building response.
@@ -464,21 +446,22 @@ pub async fn post_document(
             "document.created",
             now.clone(),
             webhook::WebhookDocument {
-                slug: slug.clone(),
-                title: doc.title.clone(),
+                slug: final_doc.slug.clone(),
+                title: final_doc.title.clone(),
                 url: response.url.clone(),
                 api_url: response.api_url.clone(),
             },
         );
     }
 
-    // Audit entry — fire-and-forget.
+    // Single audit write site — after slug-collision branch resolves, using the
+    // final slug and a fresh timestamp. Fire-and-forget.
     let ip_address = extract_client_ip(&headers, peer_addr.as_deref());
     let audit_entry = AuditEntry {
         id: nanoid::nanoid!(10),
-        timestamp: now,
+        timestamp: chrono_now(),
         action: "create".to_string(),
-        slug: slug.clone(),
+        slug: final_doc.slug.clone(),
         token_name,
         ip_address,
     };
@@ -502,7 +485,7 @@ pub async fn put_document(
 ) -> Result<Response, AppError> {
     // Auth first
     let token_name = check_auth(&state, &headers).await?;
-    let peer_addr = connect_info.map(|c| c.0.to_string());
+    let peer_addr = connect_info.map(|c| c.0.ip().to_string());
 
     // Body validation
     if body.is_empty() {
@@ -624,7 +607,7 @@ pub async fn delete_document(
 ) -> Result<Response, AppError> {
     // Auth first
     let token_name = check_auth(&state, &headers).await?;
-    let peer_addr = connect_info.map(|c| c.0.to_string());
+    let peer_addr = connect_info.map(|c| c.0.ip().to_string());
 
     // Check document exists — capture title/slug for webhook before delete.
     let existing = state.db.get_by_slug(&slug)?
@@ -710,13 +693,18 @@ pub async fn list_documents(
 
 /// List audit log entries with pagination.
 ///
-/// Auth required. Default limit 20, max 100. Newest first.
+/// Admin-only: only the master TWOFOLD_TOKEN can read audit logs.
+/// Managed tokens and OAuth tokens receive 403 Forbidden.
+/// Default limit 20, max 100. Newest first.
 pub async fn list_audit(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(params): Query<AuditQuery>,
 ) -> Result<Response, AppError> {
-    check_auth(&state, &headers).await?;
+    let identity = check_auth(&state, &headers).await?;
+    if identity != "admin" {
+        return Err(AppError::Forbidden);
+    }
 
     let limit = params.limit.unwrap_or(20);
     let offset = params.offset.unwrap_or(0);
@@ -1388,16 +1376,38 @@ pub async fn check_auth_token(state: &AppState, provided: &str) -> Result<String
 /// Extract the client IP address for audit logging.
 ///
 /// Priority: X-Forwarded-For (first hop) > peer socket address > "unknown".
+///
+/// Both paths return bare IPs with no port suffix:
+/// - XFF: the extracted value is validated as a parseable IP; if it doesn't
+///   parse (e.g. contains a port or is malformed), we fall through to the
+///   socket address.
+/// - Socket fallback: the IP component is extracted via `.ip()`, stripping the
+///   port that `SocketAddr::to_string()` would otherwise include.
 pub fn extract_client_ip(headers: &HeaderMap, fallback: Option<&str>) -> String {
     if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
         if let Some(first) = xff.split(',').next() {
-            let ip = first.trim();
-            if !ip.is_empty() {
-                return ip.to_string();
+            let candidate = first.trim();
+            if !candidate.is_empty() {
+                // Validate that the extracted value actually parses as an IP address.
+                // If it doesn't (e.g. it contains a port or is malformed), fall through
+                // to the socket address rather than storing a garbage string.
+                if candidate.parse::<std::net::IpAddr>().is_ok() {
+                    return candidate.to_string();
+                }
             }
         }
     }
-    fallback.unwrap_or("unknown").to_string()
+    // Socket address fallback: strip the port so we store a bare IP.
+    if let Some(addr_str) = fallback {
+        if let Ok(socket_addr) = addr_str.parse::<std::net::SocketAddr>() {
+            return socket_addr.ip().to_string();
+        }
+        // Fallback string wasn't a valid SocketAddr — use it verbatim if non-empty.
+        if !addr_str.is_empty() {
+            return addr_str.to_string();
+        }
+    }
+    "unknown".to_string()
 }
 
 /// Extract the Bearer token from the Authorization header.
@@ -3257,11 +3267,12 @@ mod tests {
     }
 
     /// extract_client_ip falls back to socket addr when no XFF.
+    /// Port is stripped — only the bare IP is returned.
     #[test]
     fn test_extract_client_ip_fallback_to_socket() {
         let headers = HeaderMap::new();
         let ip = extract_client_ip(&headers, Some("1.2.3.4:5678"));
-        assert_eq!(ip, "1.2.3.4:5678", "should use socket addr as fallback");
+        assert_eq!(ip, "1.2.3.4", "should strip port and return bare IP");
     }
 
     /// extract_client_ip returns "unknown" when nothing is available.

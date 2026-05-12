@@ -578,7 +578,13 @@ impl Db {
                     ip_address: row.get(5)?,
                 })
             })?
-            .filter_map(|r| r.ok())
+            .filter_map(|r| match r {
+                Ok(e) => Some(e),
+                Err(e) => {
+                    tracing::warn!("Audit row deserialization failed: {e}");
+                    None
+                }
+            })
             .collect();
 
         Ok((entries, total))
