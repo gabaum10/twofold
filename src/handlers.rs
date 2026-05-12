@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
 
 use askama::Template;
 use axum::{
@@ -76,11 +77,22 @@ impl From<rusqlite::Error> for AppError {
 
 // ── State ────────────────────────────────────────────────────────────────────
 
+/// In-flight authorization code record for the OAuth Authorization Code flow.
+#[derive(Clone)]
+pub struct AuthCodeRecord {
+    pub client_id: String,
+    pub redirect_uri: String,
+    pub expires_at: String, // ISO 8601 UTC
+}
+
 /// Shared application state injected into all handlers via axum State extractor.
 #[derive(Clone)]
 pub struct AppState {
     pub db: Db,
     pub config: Arc<ServeConfig>,
+    /// In-memory store for pending OAuth authorization codes.
+    /// Arc<Mutex<...>> so it is shared across clones of AppState (axum clones per request).
+    pub auth_codes: Arc<Mutex<HashMap<String, AuthCodeRecord>>>,
 }
 
 // ── Templates ────────────────────────────────────────────────────────────────
@@ -1530,7 +1542,7 @@ mod tests {
             webhook_secret: None,
             reaper_interval: 3600,
         });
-        let state = AppState { db, config };
+        let state = AppState { db, config, auth_codes: Arc::new(Mutex::new(HashMap::new())) };
         Router::new()
             .route(
                 "/api/v1/documents",
@@ -1561,7 +1573,7 @@ mod tests {
             webhook_secret: None,
             reaper_interval: 3600,
         });
-        let state = AppState { db, config };
+        let state = AppState { db, config, auth_codes: Arc::new(Mutex::new(HashMap::new())) };
         Router::new()
             .route(
                 "/api/v1/documents",
@@ -1660,7 +1672,7 @@ mod tests {
         };
         db.insert_document(&expired_doc).expect("insert expired doc");
 
-        let state = AppState { db, config };
+        let state = AppState { db, config, auth_codes: Arc::new(Mutex::new(HashMap::new())) };
         let app = Router::new()
             .route(
                 "/api/v1/documents",

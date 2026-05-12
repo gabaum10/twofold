@@ -95,6 +95,7 @@ async fn run_server() {
     let state = AppState {
         db: db.clone(),
         config: Arc::new(config),
+        auth_codes: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
     // Spawn the background reaper task for expired documents.
