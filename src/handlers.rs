@@ -238,6 +238,11 @@ pub struct CreateResponse {
 #[derive(Deserialize)]
 pub struct SlugQuery {
     pub raw: Option<String>,
+    /// Optional password for password-protected documents. When provided and
+    /// valid, bypasses the interactive unlock form and serves content directly.
+    /// Content negotiation still applies: bot UAs / `Accept: application/json`
+    /// get the JSON response; browsers get HTML.
+    pub password: Option<String>,
 }
 
 /// JSON response body for a single document (agent/content-negotiation view).
@@ -844,8 +849,20 @@ pub async fn get_human(
     }
 
     // Password check (if document is protected)
-    if doc.password.is_some() {
-        if !is_password_authed(&headers, &slug, &state.config.token) {
+    if let Some(stored_hash) = &doc.password {
+        // First: query-param unlock — ?password=X works for agents and direct links.
+        let query_pw_valid = if let Some(provided) = params.password.as_deref() {
+            let provided_owned = provided.to_string();
+            let hash_owned = stored_hash.clone();
+            tokio::task::spawn_blocking(move || verify_password(&provided_owned, &hash_owned))
+                .await
+                .map_err(|e| AppError::Internal(format!("Auth task failed: {e}")))?
+        } else {
+            false
+        };
+
+        // Fall back to cookie-based auth (post-form-unlock session).
+        if !query_pw_valid && !is_password_authed(&headers, &slug, &state.config.token) {
             let template = PasswordTemplate { slug: &slug, error: None };
             return Ok(Html(template.render().map_err(|e| {
                 AppError::Internal(format!("Template error: {e}"))
