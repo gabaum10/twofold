@@ -15,11 +15,10 @@ use std::net::SocketAddr;
 
 use crate::{
     config::ServeConfig,
-    db::{AuditEntry, Db, DocumentRecord},
+    db::{Db, DocumentRecord},
     highlight,
-    parser::{extract_frontmatter, extract_title, parse_document, parse_expiry},
+    parser::{extract_frontmatter, parse_document},
     rate_limit::{RateLimitStore, ReadRateLimit, WriteRateLimit},
-    webhook,
 };
 
 /// URL-safe slug alphabet: alphanumeric + hyphen.
@@ -363,6 +362,8 @@ pub async fn post_document(
 // ── PUT /api/v1/documents/:slug ──────────────────────────────────────────────
 
 /// Handle document update.
+///
+/// Thin wrapper: extract → auth → service::update → respond.
 pub async fn put_document(
     State(state): State<AppState>,
     _rl: WriteRateLimit,
@@ -371,124 +372,37 @@ pub async fn put_document(
     connect_info: Option<ConnectInfo<SocketAddr>>,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    // Auth first
     let principal = check_auth(&state, &headers).await?;
     let peer_addr = connect_info.map(|c| c.0.ip().to_string());
-
-    // Body validation
-    if body.is_empty() {
-        return Err(AppError::BadRequest(
-            "Request body must not be empty".to_string(),
-        ));
-    }
+    let client_ip = extract_client_ip(&headers, peer_addr.as_deref());
 
     let raw_content = std::str::from_utf8(&body)
         .map_err(|_| AppError::BadRequest("Request body must be valid UTF-8".to_string()))?
         .to_string();
 
-    // Check document exists and is not expired
-    let existing = state.db.get_by_slug(&slug)?.ok_or(AppError::NotFound)?;
-
-    if is_expired(&existing) {
-        return Err(AppError::Gone);
-    }
-
-    // Parse frontmatter
-    let fm_result = extract_frontmatter(&raw_content).map_err(AppError::BadRequest)?;
-
-    let meta = fm_result.meta.unwrap_or_default();
-    let body_text = &fm_result.body;
-
-    // Title: frontmatter > H1 > slug (slug from URL, NOT frontmatter)
-    let title = meta
-        .title
-        .unwrap_or_else(|| extract_title(body_text, &slug));
-
-    // Theme
-    let theme = meta
-        .theme
-        .unwrap_or_else(|| state.config.default_theme.clone());
-
-    // Expiry: None = keep existing, Some("") = clear, Some(value) = set new
-    let now = chrono_now();
-    let expires_at = match meta.expiry.as_deref() {
-        Some(exp) if !exp.is_empty() => {
-            let seconds = parse_expiry(exp).map_err(AppError::BadRequest)?;
-            Some(add_seconds_to_now(&now, seconds))
-        }
-        Some(_) => None,                     // empty string = clear
-        None => existing.expires_at.clone(), // absent = preserve
-    };
-
-    // Password: None = keep existing, Some("") = clear, Some(value) = set new
-    // argon2 is CPU-heavy; run off the async executor.
-    let password_hash = match meta.password.as_deref() {
-        Some(pw) if !pw.is_empty() => {
-            let pw_owned = pw.to_string();
-            let hash = tokio::task::spawn_blocking(move || hash_password(&pw_owned))
-                .await
-                .map_err(|e| AppError::Internal(format!("Task failed: {e}")))??;
-            Some(hash)
-        }
-        Some(_) => None,                   // empty string = clear
-        None => existing.password.clone(), // absent = preserve
-    };
-
-    let updated_doc = DocumentRecord {
-        id: existing.id,
-        slug: slug.clone(),
-        title: title.clone(),
+    let req = crate::service::UpdateRequest {
         raw_content,
-        theme,
-        password: password_hash,
-        description: meta.description.clone(),
-        created_at: existing.created_at.clone(),
-        expires_at: expires_at.clone(),
-        updated_at: now.clone(),
+        principal,
+        client_ip,
     };
 
-    state.db.update_document(&slug, &updated_doc)?;
+    let result = tokio::task::spawn_blocking({
+        let db = state.db.clone();
+        let config = state.config.clone();
+        move || crate::service::update(&db, &config, &slug, req)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("Task failed: {e}")))??;
 
-    let base = state.config.base_url.trim_end_matches('/');
     let response = CreateResponse {
-        url: format!("{base}/{slug}"),
-        slug: slug.clone(),
-        api_url: format!("{base}/api/v1/documents/{slug}"),
-        title: updated_doc.title.clone(),
-        description: updated_doc.description.clone(),
-        created_at: existing.created_at,
-        expires_at: updated_doc.expires_at.clone(),
+        url: result.url,
+        slug: result.slug,
+        api_url: result.api_url,
+        title: result.title,
+        description: result.description,
+        created_at: result.created_at,
+        expires_at: result.expires_at,
     };
-
-    // Webhook: document.updated
-    if let Some(ref wh_url) = state.config.webhook_url {
-        webhook::dispatch_webhook(
-            wh_url.clone(),
-            state.config.webhook_secret.clone(),
-            "document.updated",
-            now.clone(),
-            webhook::WebhookDocument {
-                slug: slug.clone(),
-                title: updated_doc.title.clone(),
-                url: response.url.clone(),
-                api_url: response.api_url.clone(),
-            },
-        );
-    }
-
-    // Audit entry — fire-and-forget.
-    let ip_address = extract_client_ip(&headers, peer_addr.as_deref());
-    let audit_entry = AuditEntry {
-        id: nanoid::nanoid!(10),
-        timestamp: now,
-        action: "update".to_string(),
-        slug: slug.clone(),
-        token_name: principal.display_name,
-        ip_address,
-    };
-    if let Err(e) = state.db.insert_audit_entry(&audit_entry) {
-        tracing::error!(error = %e, "Failed to write audit entry");
-    }
 
     Ok((StatusCode::OK, Json(response)).into_response())
 }
@@ -496,6 +410,8 @@ pub async fn put_document(
 // ── DELETE /api/v1/documents/:slug ───────────────────────────────────────────
 
 /// Handle document deletion.
+///
+/// Thin wrapper: extract → auth → service::delete → respond.
 pub async fn delete_document(
     State(state): State<AppState>,
     _rl: WriteRateLimit,
@@ -503,52 +419,17 @@ pub async fn delete_document(
     headers: HeaderMap,
     connect_info: Option<ConnectInfo<SocketAddr>>,
 ) -> Result<Response, AppError> {
-    // Auth first
     let principal = check_auth(&state, &headers).await?;
     let peer_addr = connect_info.map(|c| c.0.ip().to_string());
+    let client_ip = extract_client_ip(&headers, peer_addr.as_deref());
 
-    // Check document exists — capture title/slug for webhook before delete.
-    let existing = state.db.get_by_slug(&slug)?.ok_or(AppError::NotFound)?;
-
-    // Expired documents: still delete them (cleanup), return 204
-    // Non-expired: normal delete, return 204.
-    // We delete regardless of expiry status.
-
-    state.db.delete_by_slug(&slug)?;
-
-    let now = chrono_now();
-
-    // Webhook: document.deleted — dispatched after successful delete.
-    // Metadata captured from existing record before deletion.
-    if let Some(ref wh_url) = state.config.webhook_url {
-        let base = state.config.base_url.trim_end_matches('/');
-        webhook::dispatch_webhook(
-            wh_url.clone(),
-            state.config.webhook_secret.clone(),
-            "document.deleted",
-            now.clone(),
-            webhook::WebhookDocument {
-                slug: existing.slug.clone(),
-                title: existing.title.clone(),
-                url: format!("{base}/{}", existing.slug),
-                api_url: format!("{base}/api/v1/documents/{}", existing.slug),
-            },
-        );
-    }
-
-    // Audit entry — fire-and-forget.
-    let ip_address = extract_client_ip(&headers, peer_addr.as_deref());
-    let audit_entry = AuditEntry {
-        id: nanoid::nanoid!(10),
-        timestamp: now,
-        action: "delete".to_string(),
-        slug: slug.clone(),
-        token_name: principal.display_name,
-        ip_address,
-    };
-    if let Err(e) = state.db.insert_audit_entry(&audit_entry) {
-        tracing::error!(error = %e, "Failed to write audit entry");
-    }
+    tokio::task::spawn_blocking({
+        let db = state.db.clone();
+        let config = state.config.clone();
+        move || crate::service::delete(&db, &config, &slug, &principal, &client_ip)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("Task failed: {e}")))??;
 
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -568,16 +449,11 @@ pub async fn list_documents(
 ) -> Result<Response, AppError> {
     let _principal = check_auth(&state, &headers).await?;
 
-    // Default limit 20, max 100. Cap is enforced in db::list_documents.
     let limit = params.limit.unwrap_or(20);
     let offset = params.offset.unwrap_or(0);
 
-    let (documents, total) = state
-        .db
-        .list_documents(limit, offset)
-        .map_err(AppError::from)?;
+    let (documents, total) = crate::service::list(&state.db, limit, offset)?;
 
-    // Report the effective (capped) limit in the response.
     let effective_limit = limit.min(100);
 
     Ok(Json(ListResponse {
@@ -1827,12 +1703,6 @@ fn is_expired(doc: &DocumentRecord) -> bool {
 /// Current UTC time as ISO 8601 string.
 pub fn chrono_now() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
-}
-
-/// Add seconds to a timestamp string and return new ISO 8601 string.
-fn add_seconds_to_now(_now: &str, seconds: u64) -> String {
-    let future = chrono::Utc::now() + chrono::Duration::seconds(seconds as i64);
-    future.format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 /// Check whether a rusqlite error is a UNIQUE constraint violation.

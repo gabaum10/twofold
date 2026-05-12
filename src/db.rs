@@ -1,6 +1,6 @@
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::{Result, params};
+use rusqlite::{params, Result};
 
 /// A stored document record (maps 1:1 to the `documents` table row).
 #[derive(Debug, Clone)]
@@ -10,7 +10,7 @@ pub struct DocumentRecord {
     pub title: String,
     pub raw_content: String,
     pub theme: String,
-    pub password: Option<String>,   // argon2 hash, None = public
+    pub password: Option<String>, // argon2 hash, None = public
     pub description: Option<String>,
     pub created_at: String,         // ISO 8601 UTC
     pub expires_at: Option<String>, // ISO 8601 UTC, None = no expiry
@@ -22,7 +22,7 @@ pub struct DocumentRecord {
 pub struct TokenRecord {
     pub id: String,
     pub name: String,
-    pub hash: String,     // argon2 hash of the token
+    pub hash: String, // argon2 hash of the token
     pub created_at: String,
     pub last_used: Option<String>,
     pub revoked: bool,
@@ -55,9 +55,9 @@ pub struct Db {
 /// Convert an r2d2 pool error into a rusqlite error so callers keep the same
 /// `rusqlite::Result<T>` return type without an API surface change.
 fn pool_err(e: r2d2::Error) -> rusqlite::Error {
-    rusqlite::Error::InvalidPath(
-        std::path::PathBuf::from(format!("connection pool error: {e}")),
-    )
+    rusqlite::Error::InvalidPath(std::path::PathBuf::from(format!(
+        "connection pool error: {e}"
+    )))
 }
 
 impl Db {
@@ -67,12 +67,11 @@ impl Db {
     /// parallel under WAL mode instead of serializing through a single Mutex.
     /// WAL mode and busy_timeout are applied to each connection at open time.
     pub fn open(path: &str) -> Result<Self> {
-        let manager = SqliteConnectionManager::file(path)
-            .with_init(|conn| {
-                conn.execute_batch("PRAGMA journal_mode=WAL;")?;
-                conn.busy_timeout(std::time::Duration::from_secs(5))?;
-                Ok(())
-            });
+        let manager = SqliteConnectionManager::file(path).with_init(|conn| {
+            conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+            conn.busy_timeout(std::time::Duration::from_secs(5))?;
+            Ok(())
+        });
 
         let pool = Pool::builder()
             .max_size(8)
@@ -149,7 +148,7 @@ impl Db {
 
         if !columns.contains(&"theme".to_string()) {
             conn.execute_batch(
-                "ALTER TABLE documents ADD COLUMN theme TEXT NOT NULL DEFAULT 'clean';"
+                "ALTER TABLE documents ADD COLUMN theme TEXT NOT NULL DEFAULT 'clean';",
             )?;
         }
         if !columns.contains(&"password".to_string()) {
@@ -164,7 +163,7 @@ impl Db {
 
         // Create expires_at index (safe now that column is guaranteed to exist)
         conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_documents_expires_at ON documents(expires_at);"
+            "CREATE INDEX IF NOT EXISTS idx_documents_expires_at ON documents(expires_at);",
         )?;
 
         // v0.4: add prefix column to tokens for O(1) auth lookup.
@@ -177,12 +176,10 @@ impl Db {
         drop(token_stmt);
 
         if !token_columns.contains(&"prefix".to_string()) {
-            conn.execute_batch(
-                "ALTER TABLE tokens ADD COLUMN prefix TEXT;"
-            )?;
+            conn.execute_batch("ALTER TABLE tokens ADD COLUMN prefix TEXT;")?;
         }
         conn.execute_batch(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tokens_prefix ON tokens(prefix);"
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tokens_prefix ON tokens(prefix);",
         )?;
 
         // v0.5: add audit_log table for mutation tracking.
@@ -197,7 +194,7 @@ impl Db {
                 ip_address  TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log(timestamp);
-            CREATE INDEX IF NOT EXISTS idx_audit_log_slug ON audit_log(slug);"
+            CREATE INDEX IF NOT EXISTS idx_audit_log_slug ON audit_log(slug);",
         )?;
 
         Ok(())
@@ -261,10 +258,7 @@ impl Db {
     /// Delete a document by slug. Returns true if a row was deleted.
     pub fn delete_by_slug(&self, slug: &str) -> Result<bool> {
         let conn = self.pool.get().map_err(pool_err)?;
-        let rows = conn.execute(
-            "DELETE FROM documents WHERE slug = ?1",
-            params![slug],
-        )?;
+        let rows = conn.execute("DELETE FROM documents WHERE slug = ?1", params![slug])?;
         Ok(rows > 0)
     }
 
@@ -382,7 +376,10 @@ impl Db {
                     prefix: row.get(6)?,
                 })
             })?
-            .filter_map(|r| r.map_err(|e| tracing::warn!("Failed to deserialize token row: {}", e)).ok())
+            .filter_map(|r| {
+                r.map_err(|e| tracing::warn!("Failed to deserialize token row: {}", e))
+                    .ok()
+            })
             .collect();
         Ok(tokens)
     }
@@ -406,7 +403,10 @@ impl Db {
                     prefix: row.get(6)?,
                 })
             })?
-            .filter_map(|r| r.map_err(|e| tracing::warn!("Failed to deserialize token row: {}", e)).ok())
+            .filter_map(|r| {
+                r.map_err(|e| tracing::warn!("Failed to deserialize token row: {}", e))
+                    .ok()
+            })
             .collect();
         Ok(tokens)
     }
@@ -434,9 +434,7 @@ impl Db {
     /// Check if a token name already exists.
     pub fn token_name_exists(&self, name: &str) -> Result<bool> {
         let conn = self.pool.get().map_err(pool_err)?;
-        let mut stmt = conn.prepare(
-            "SELECT COUNT(*) FROM tokens WHERE name = ?1",
-        )?;
+        let mut stmt = conn.prepare("SELECT COUNT(*) FROM tokens WHERE name = ?1")?;
         let count: i64 = stmt.query_row(params![name], |row| row.get(0))?;
         Ok(count > 0)
     }
@@ -563,7 +561,6 @@ impl Db {
 
         Ok((entries, total))
     }
-
 }
 
 /// Document summary for the list endpoint (no raw_content — metadata only).

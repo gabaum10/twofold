@@ -93,10 +93,7 @@ pub fn dispatch_webhook(
         if let Some(ref secret) = webhook_secret {
             match compute_hmac_signature(payload_owned.as_bytes(), secret.as_bytes()) {
                 Ok(sig) => {
-                    request = request.header(
-                        "X-Twofold-Signature",
-                        format!("sha256={sig}"),
-                    );
+                    request = request.header("X-Twofold-Signature", format!("sha256={sig}"));
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "Failed to compute webhook signature — sending unsigned");
@@ -131,8 +128,8 @@ pub fn dispatch_webhook(
 
 /// Compute HMAC-SHA256 of `body` with `key`, return hex-encoded string.
 fn compute_hmac_signature(body: &[u8], key: &[u8]) -> Result<String, String> {
-    let mut mac = Hmac::<Sha256>::new_from_slice(key)
-        .map_err(|e| format!("HMAC key error: {e}"))?;
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(key).map_err(|e| format!("HMAC key error: {e}"))?;
     mac.update(body);
     let result = mac.finalize().into_bytes();
     // Encode each byte as lowercase hex — no external hex dep needed.
