@@ -95,6 +95,7 @@ async fn run_server() {
     let state = AppState {
         db: db.clone(),
         config: Arc::new(config),
+        auth_codes: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
     // Spawn the background reaper task for expired documents.
@@ -138,11 +139,12 @@ async fn run_server() {
     let app = Router::new()
         // Health check — no auth, checked by load balancers and uptime monitors.
         .route("/health", get(handlers::health_check))
-        // Remote MCP endpoint — unauthenticated. TWOFOLD_MCP_TOKEN used internally
-        // for onward calls to the document API.
-        .route("/mcp", post(mcp_http::handle_mcp_post))
-        // OAuth 2.0 client_credentials token endpoint — harmless, kept for potential use.
+        // OAuth 2.0 Authorization Code flow — browser redirect, auto-approve.
+        .route("/authorize", get(oauth::handle_authorize))
+        // OAuth 2.0 token endpoint — client_credentials and authorization_code.
         .route("/oauth/token", post(oauth::handle_oauth_token))
+        // Remote MCP endpoint — bearer token required (token from OAuth flow).
+        .route("/mcp", post(mcp_http::handle_mcp_post))
         // Documents: POST (create) and GET (list) share the same path.
         // Axum 0.7: combine with method router chaining.
         .route("/api/v1/documents", post(handlers::post_document).get(handlers::list_documents))

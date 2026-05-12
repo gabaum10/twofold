@@ -11,25 +11,58 @@
 ///   per the JSON-RPC spec.
 /// - No CORS headers: this endpoint is server-to-server only.
 /// - No SSE: all MCP tools are quick round-trips; streaming is not needed.
-/// - Auth: none. The endpoint is public. TWOFOLD_MCP_TOKEN is used internally
-///   for the handler's onward calls to the document API.
+/// - Auth: bearer token required. Clients obtain a token via the OAuth flow
+///   (GET /authorize → POST /oauth/token). The token is validated against the
+///   same token store used by the document API.
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use serde_json::Value;
 
 use crate::{
-    handlers::AppState,
+    handlers::{check_auth_token, AppState},
     mcp,
 };
 
-/// POST /mcp — remote MCP JSON-RPC endpoint (unauthenticated).
+/// POST /mcp — remote MCP JSON-RPC endpoint (bearer token required).
 pub async fn handle_mcp_post(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
+    // Auth check — bearer token must be present and valid.
+    let provided = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+
+    let token = match provided {
+        Some(t) => t.to_string(),
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                axum::Json(serde_json::json!({
+                    "error": "unauthorized",
+                    "error_description": "Bearer token required"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    if let Err(_) = check_auth_token(&state, &token).await {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(serde_json::json!({
+                "error": "unauthorized",
+                "error_description": "Invalid or expired token"
+            })),
+        )
+            .into_response();
+    }
+
     // Parse the JSON-RPC request.
     let request: mcp::Request = match serde_json::from_slice(&body) {
         Ok(r) => r,
