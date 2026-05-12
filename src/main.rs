@@ -1,3 +1,5 @@
+//! Twofold server entry point. Route table, server setup, reaper task, and CLI dispatch.
+
 mod auth;
 mod cli;
 mod config;

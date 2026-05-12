@@ -1,3 +1,5 @@
+//! Document CRUD business logic. Pure functions over `&Db` + `&ServeConfig`. Shared by HTTP handlers and MCP HTTP transport.
+
 // In-progress scaffolding: not yet wired into handlers or mcp_http.
 #![allow(dead_code)]
 

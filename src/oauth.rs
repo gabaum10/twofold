@@ -1,3 +1,5 @@
+//! OAuth 2.0 Authorization Server. Authorization Code + PKCE, dynamic client registration, refresh token rotation.
+
 /// OAuth 2.0 implementation — full spec for Cowork (claude.ai) remote MCP.
 ///
 /// Routes:

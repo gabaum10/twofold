@@ -1,3 +1,5 @@
+//! YAML frontmatter parsing, merging, and injection. Consolidated from parser.rs, mcp.rs, and main.rs.
+
 /// Frontmatter parsing, merging, and injection — single source of truth.
 ///
 /// Previously scattered across parser.rs (extract_frontmatter),

@@ -1,3 +1,5 @@
+//! Environment variable configuration. `ServeConfig` struct; fails fast if `TWOFOLD_TOKEN` is absent.
+
 /// Configuration loaded from environment variables.
 ///
 /// Contract: `from_env()` fails fast if TWOFOLD_TOKEN is absent.

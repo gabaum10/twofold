@@ -1,3 +1,5 @@
+//! Authentication and authorization. `Principal` type, token validation, bearer extraction.
+
 /// Authentication primitives for twofold.
 ///
 /// This module owns:

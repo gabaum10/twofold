@@ -1,3 +1,5 @@
+//! MCP HTTP transport (`POST /mcp`). Bearer-auth required; dispatches directly to service layer for Cowork/remote use.
+
 /// Remote MCP HTTP transport — `POST /mcp`
 ///
 /// Accepts JSON-RPC messages over HTTP and dispatches tool calls directly to

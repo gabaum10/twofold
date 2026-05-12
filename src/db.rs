@@ -1,3 +1,5 @@
+//! SQLite persistence layer. Document, token, OAuth, and audit log tables. Schema migration via PRAGMA introspection.
+
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{params, Result};

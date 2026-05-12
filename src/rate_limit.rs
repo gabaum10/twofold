@@ -1,3 +1,5 @@
+//! Per-IP read and per-token write rate limiting. Fixed-window counters in DashMap. Axum extractor interface.
+
 /// Rate limiting module for Twofold.
 ///
 /// Architecture: fixed-window counter per key, stored in DashMap for lock-free

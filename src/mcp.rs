@@ -1,3 +1,5 @@
+//! MCP stdio transport. Raw JSON-RPC over stdin/stdout for CLI use (Claude Code, etc.).
+
 /// MCP (Model Context Protocol) server — raw JSON-RPC over stdio.
 ///
 /// Design choice: raw JSON-RPC, no rmcp crate dependency. The MCP handshake

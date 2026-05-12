@@ -1,3 +1,5 @@
+//! HTTP request handlers, `AppState`, `AppError`, password auth flow, theme rendering, audit endpoint.
+
 use std::sync::Arc;
 
 use askama::Template;

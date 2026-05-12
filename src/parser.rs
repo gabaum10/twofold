@@ -1,3 +1,5 @@
+//! Markdown marker parsing (`@agent`/`@end`/`@instructions`), slug validation, expiry parsing. Re-exports frontmatter types.
+
 // Re-export frontmatter types and extraction from the canonical module.
 // handlers.rs and service.rs import these from parser — keep the path stable.
 pub use crate::frontmatter::{extract_frontmatter, FrontmatterResult};

@@ -1,3 +1,5 @@
+//! Fire-and-forget webhook dispatch on document lifecycle events. HMAC-SHA256 signing.
+
 /// Webhook dispatch for document lifecycle events.
 ///
 /// Fire-and-forget: dispatched via tokio::spawn, failure logs at warn level,

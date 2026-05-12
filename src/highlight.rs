@@ -1,3 +1,5 @@
+//! Syntax highlighting via syntect. Lazy-initialized via `OnceLock`; theme-aware light/dark palettes.
+
 /// Syntax highlighting via syntect.
 ///
 /// Loaded once at first use via OnceLock (Rust 1.70+, no lazy_static dep).
