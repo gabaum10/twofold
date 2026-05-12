@@ -1,36 +1,57 @@
-/// OAuth 2.0 Client Credentials grant — `POST /oauth/token`
+/// OAuth 2.0 Authorization Code flow + Client Credentials grant
 ///
-/// Accepts either:
-///   Content-Type: application/x-www-form-urlencoded
-///     grant_type=client_credentials&client_id=<id>&client_secret=<secret>
-///   Content-Type: application/json
-///     {"grant_type": "client_credentials", "client_id": "...", "client_secret": "..."}
+/// Routes:
+///   GET  /authorize          — Authorization Code: validate, issue code, 302 redirect
+///   POST /oauth/token        — Token exchange (authorization_code or client_credentials)
 ///
-/// Validates `client_secret` against the same token store as the document API.
-/// `client_id` is accepted as-is (logged, not validated against a registry).
+/// Authorization Code flow (used by Cowork remote connector):
+///   1. Client opens browser to GET /authorize?response_type=code&client_id=...
+///      &redirect_uri=...&state=...
+///   2. Server auto-approves (no consent screen — trusted server). Generates a
+///      random code, stores it in-memory with a 5-minute expiry, redirects to
+///      redirect_uri?code=CODE&state=STATE.
+///   3. Client exchanges code via POST /oauth/token with grant_type=authorization_code.
+///   4. Server validates code (exists, not expired, client_id matches, redirect_uri
+///      matches), then validates client_secret, and returns an access_token.
 ///
-/// On success returns the standard OAuth token response. `access_token` is
-/// the same value that was passed as `client_secret` — we confirm it is valid
-/// and return it in bearer form so the client can use it on subsequent calls.
+/// Client Credentials flow (existing, unchanged):
+///   POST /oauth/token with grant_type=client_credentials.
+///   Validates client_secret directly and returns it as access_token.
 ///
-/// On failure returns RFC 6749 error response with 401.
+/// On failure returns RFC 6749 error response with 400/401.
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    response::{IntoResponse, Redirect, Response},
     Json,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::handlers::{check_auth_token, AppState};
+use crate::handlers::{check_auth_token, chrono_now, AppState};
 
-// ── Request shape ─────────────────────────────────────────────────────────────
+// chrono re-exported for expiry arithmetic in handle_authorize
+use chrono;
+
+// ── Request shapes ────────────────────────────────────────────────────────────
+
+/// Query parameters for GET /authorize
+#[derive(Debug, Deserialize)]
+pub struct AuthorizeParams {
+    pub response_type: Option<String>,
+    pub client_id: Option<String>,
+    pub redirect_uri: Option<String>,
+    pub state: Option<String>,
+}
 
 #[derive(Debug, Deserialize)]
 struct TokenRequest {
     grant_type: String,
     client_id: Option<String>,
-    client_secret: String,
+    client_secret: Option<String>,
+    /// Authorization code (authorization_code grant only)
+    code: Option<String>,
+    /// Must match what was sent in /authorize (authorization_code grant only)
+    redirect_uri: Option<String>,
 }
 
 // ── Response shapes ───────────────────────────────────────────────────────────
@@ -48,9 +69,113 @@ struct OAuthError {
     error_description: &'static str,
 }
 
-// ── Handler ───────────────────────────────────────────────────────────────────
+// ── Handlers ──────────────────────────────────────────────────────────────────
 
-/// POST /oauth/token
+/// GET /authorize — Authorization Code flow entry point.
+///
+/// Auto-approves without a consent screen (trusted server). Generates a random
+/// authorization code, stores it in the in-memory map with a 5-minute TTL, and
+/// 302-redirects the browser to `redirect_uri?code=CODE&state=STATE`.
+///
+/// Required params: response_type=code, client_id, redirect_uri.
+/// Optional: state (passed through unchanged).
+pub async fn handle_authorize(
+    State(state): State<AppState>,
+    Query(params): Query<AuthorizeParams>,
+) -> Response {
+    // Validate response_type — only "code" is supported.
+    match params.response_type.as_deref() {
+        Some("code") => {}
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(OAuthError {
+                    error: "unsupported_response_type",
+                    error_description: "Only response_type=code is supported",
+                }),
+            )
+                .into_response();
+        }
+    }
+
+    let client_id = match params.client_id {
+        Some(ref id) if !id.is_empty() => id.clone(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(OAuthError {
+                    error: "invalid_request",
+                    error_description: "client_id is required",
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let redirect_uri = match params.redirect_uri {
+        Some(ref uri) if !uri.is_empty() => uri.clone(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(OAuthError {
+                    error: "invalid_request",
+                    error_description: "redirect_uri is required",
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    // Generate a random 32-byte authorization code, hex-encoded (64 chars).
+    let code = {
+        use rand::RngCore;
+        let mut bytes = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        hex_encode(&bytes)
+    };
+
+    // Compute 5-minute expiry.
+    let expires_at = {
+        let future = chrono::Utc::now() + chrono::Duration::minutes(5);
+        future.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+    };
+
+    // Store the code.
+    {
+        let mut codes = state.auth_codes.lock().unwrap();
+        codes.insert(
+            code.clone(),
+            crate::handlers::AuthCodeRecord {
+                client_id: client_id.clone(),
+                redirect_uri: redirect_uri.clone(),
+                expires_at,
+            },
+        );
+    }
+
+    tracing::info!(client_id = %client_id, "OAuth authorization_code issued");
+
+    // Build redirect URL: redirect_uri?code=CODE[&state=STATE]
+    let redirect_url = match params.state.as_deref() {
+        Some(s) if !s.is_empty() => format!(
+            "{}{}code={}&state={}",
+            redirect_uri,
+            if redirect_uri.contains('?') { "&" } else { "?" },
+            code,
+            s,
+        ),
+        _ => format!(
+            "{}{}code={}",
+            redirect_uri,
+            if redirect_uri.contains('?') { "&" } else { "?" },
+            code,
+        ),
+    };
+
+    Redirect::to(&redirect_url).into_response()
+}
+
+/// POST /oauth/token — token exchange for both grant types.
 pub async fn handle_oauth_token(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -79,19 +204,27 @@ pub async fn handle_oauth_token(
         }
     };
 
-    // Only client_credentials grant type is supported.
-    if req.grant_type != "client_credentials" {
-        return unsupported_grant_type();
+    match req.grant_type.as_str() {
+        "client_credentials" => handle_client_credentials(state, req).await,
+        "authorization_code" => handle_authorization_code(state, req).await,
+        _ => unsupported_grant_type(),
     }
+}
 
+/// Handle the client_credentials grant (existing behavior).
+async fn handle_client_credentials(state: AppState, req: TokenRequest) -> Response {
     let client_id = req.client_id.as_deref().unwrap_or("<unset>");
 
-    // Validate the secret against the existing token auth.
-    match check_auth_token(&state, &req.client_secret).await {
+    let secret = match req.client_secret.as_deref() {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return invalid_request(),
+    };
+
+    match check_auth_token(&state, &secret).await {
         Ok(()) => {
             tracing::info!(client_id = %client_id, "OAuth client_credentials grant issued");
             let resp = TokenResponse {
-                access_token: req.client_secret,
+                access_token: secret,
                 token_type: "bearer",
                 expires_in: 3600,
             };
@@ -104,14 +237,88 @@ pub async fn handle_oauth_token(
     }
 }
 
+/// Handle the authorization_code grant.
+///
+/// Validates: code exists, not expired, client_id matches, redirect_uri matches,
+/// then validates client_secret. On success, deletes the code (single-use) and
+/// returns an access_token.
+async fn handle_authorization_code(state: AppState, req: TokenRequest) -> Response {
+    let code = match req.code.as_deref() {
+        Some(c) if !c.is_empty() => c.to_string(),
+        _ => return invalid_request(),
+    };
+    let client_id = match req.client_id.as_deref() {
+        Some(id) if !id.is_empty() => id.to_string(),
+        _ => return invalid_request(),
+    };
+    let redirect_uri = match req.redirect_uri.as_deref() {
+        Some(uri) if !uri.is_empty() => uri.to_string(),
+        _ => return invalid_request(),
+    };
+    let client_secret = match req.client_secret.as_deref() {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return invalid_client(),
+    };
+
+    // Look up and validate the authorization code.
+    let record = {
+        let mut codes = state.auth_codes.lock().unwrap();
+        match codes.remove(&code) {
+            Some(r) => r,
+            None => {
+                tracing::warn!(client_id = %client_id, "OAuth authorization_code not found");
+                return invalid_grant("Authorization code not found or already used");
+            }
+        }
+    };
+
+    // Check expiry.
+    let now = chrono_now();
+    if record.expires_at.as_str() < now.as_str() {
+        tracing::warn!(client_id = %client_id, "OAuth authorization_code expired");
+        return invalid_grant("Authorization code has expired");
+    }
+
+    // Check client_id matches.
+    if record.client_id != client_id {
+        tracing::warn!(client_id = %client_id, "OAuth authorization_code client_id mismatch");
+        return invalid_grant("client_id does not match authorization request");
+    }
+
+    // Check redirect_uri matches.
+    if record.redirect_uri != redirect_uri {
+        tracing::warn!(client_id = %client_id, "OAuth authorization_code redirect_uri mismatch");
+        return invalid_grant("redirect_uri does not match authorization request");
+    }
+
+    // Validate client_secret against the token store.
+    match check_auth_token(&state, &client_secret).await {
+        Ok(()) => {
+            tracing::info!(client_id = %client_id, "OAuth authorization_code grant issued");
+            let resp = TokenResponse {
+                access_token: client_secret,
+                token_type: "bearer",
+                expires_in: 3600,
+            };
+            (StatusCode::OK, Json(resp)).into_response()
+        }
+        Err(_) => {
+            tracing::warn!(client_id = %client_id, "OAuth authorization_code grant denied: invalid client_secret");
+            invalid_client()
+        }
+    }
+}
+
 // ── Parse helpers ─────────────────────────────────────────────────────────────
 
 /// Parse a URL-encoded form body into a TokenRequest.
-/// Returns None if required fields are missing.
+/// Returns None if `grant_type` is missing.
 fn parse_form(body: &str) -> Option<TokenRequest> {
     let mut grant_type = None;
     let mut client_id = None;
     let mut client_secret = None;
+    let mut code = None;
+    let mut redirect_uri = None;
 
     for pair in body.split('&') {
         if let Some((k, v)) = pair.split_once('=') {
@@ -121,6 +328,8 @@ fn parse_form(body: &str) -> Option<TokenRequest> {
                 "grant_type" => grant_type = Some(v),
                 "client_id" => client_id = Some(v),
                 "client_secret" => client_secret = Some(v),
+                "code" => code = Some(v),
+                "redirect_uri" => redirect_uri = Some(v),
                 _ => {}
             }
         }
@@ -129,8 +338,15 @@ fn parse_form(body: &str) -> Option<TokenRequest> {
     Some(TokenRequest {
         grant_type: grant_type?,
         client_id,
-        client_secret: client_secret?,
+        client_secret,
+        code,
+        redirect_uri,
     })
+}
+
+/// Encode bytes as lowercase hex string.
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Minimal percent-decode for form values. Converts + to space and %XX sequences.
@@ -199,7 +415,18 @@ fn unsupported_grant_type() -> Response {
         StatusCode::BAD_REQUEST,
         Json(OAuthError {
             error: "unsupported_grant_type",
-            error_description: "Only client_credentials grant type is supported",
+            error_description: "Only client_credentials and authorization_code grant types are supported",
+        }),
+    )
+        .into_response()
+}
+
+fn invalid_grant(description: &'static str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(OAuthError {
+            error: "invalid_grant",
+            error_description: description,
         }),
     )
         .into_response()

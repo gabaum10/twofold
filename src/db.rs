@@ -26,6 +26,9 @@ pub struct TokenRecord {
     pub created_at: String,
     pub last_used: Option<String>,
     pub revoked: bool,
+    /// First 8 characters of the plaintext token — stored for O(1) lookup.
+    /// NULL for tokens created before v0.4 (legacy tokens).
+    pub prefix: Option<String>,
 }
 
 /// Thread-safe database handle backed by an r2d2 connection pool.
@@ -99,8 +102,10 @@ impl Db {
                 hash       TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 last_used  TEXT,
-                revoked    INTEGER NOT NULL DEFAULT 0
-            );",
+                revoked    INTEGER NOT NULL DEFAULT 0,
+                prefix     TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_tokens_prefix ON tokens(prefix);",
         )?;
         Ok(())
     }
@@ -138,6 +143,24 @@ impl Db {
         // Create expires_at index (safe now that column is guaranteed to exist)
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_documents_expires_at ON documents(expires_at);"
+        )?;
+
+        // v0.4: add prefix column to tokens for O(1) auth lookup.
+        // Check tokens table columns separately.
+        let mut token_stmt = conn.prepare("PRAGMA table_info(tokens)")?;
+        let token_columns: Vec<String> = token_stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(token_stmt);
+
+        if !token_columns.contains(&"prefix".to_string()) {
+            conn.execute_batch(
+                "ALTER TABLE tokens ADD COLUMN prefix TEXT;"
+            )?;
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_tokens_prefix ON tokens(prefix);"
         )?;
 
         Ok(())
@@ -258,8 +281,8 @@ impl Db {
     pub fn insert_token(&self, token: &TokenRecord) -> Result<()> {
         let conn = self.pool.get().map_err(pool_err)?;
         conn.execute(
-            "INSERT INTO tokens (id, name, hash, created_at, last_used, revoked)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO tokens (id, name, hash, created_at, last_used, revoked, prefix)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 token.id,
                 token.name,
@@ -267,16 +290,19 @@ impl Db {
                 token.created_at,
                 token.last_used,
                 token.revoked as i32,
+                token.prefix,
             ],
         )?;
         Ok(())
     }
 
     /// Get all non-revoked token hashes for auth verification.
+    ///
+    /// Used as a fallback for legacy tokens (prefix IS NULL) and in tests.
     pub fn get_active_tokens(&self) -> Result<Vec<TokenRecord>> {
         let conn = self.pool.get().map_err(pool_err)?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, hash, created_at, last_used, revoked
+            "SELECT id, name, hash, created_at, last_used, revoked, prefix
              FROM tokens WHERE revoked = 0",
         )?;
         let tokens = stmt
@@ -288,6 +314,61 @@ impl Db {
                     created_at: row.get(3)?,
                     last_used: row.get(4)?,
                     revoked: row.get::<_, i32>(5)? != 0,
+                    prefix: row.get(6)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(tokens)
+    }
+
+    /// Look up a single active token by its 8-character prefix for O(1) auth.
+    ///
+    /// Returns None if no active token has that prefix, or if the prefix is
+    /// not stored (legacy token path). Callers must still verify the argon2
+    /// hash of the returned record — prefix is a lookup key, not a secret.
+    pub fn get_token_by_prefix(&self, prefix: &str) -> Result<Option<TokenRecord>> {
+        let conn = self.pool.get().map_err(pool_err)?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, hash, created_at, last_used, revoked, prefix
+             FROM tokens WHERE prefix = ?1 AND revoked = 0
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![prefix])?;
+        match rows.next()? {
+            None => Ok(None),
+            Some(row) => Ok(Some(TokenRecord {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                hash: row.get(2)?,
+                created_at: row.get(3)?,
+                last_used: row.get(4)?,
+                revoked: row.get::<_, i32>(5)? != 0,
+                prefix: row.get(6)?,
+            })),
+        }
+    }
+
+    /// Get legacy active tokens — those without a prefix stored.
+    ///
+    /// Used as a fallback in `check_auth` for tokens created before v0.4.
+    /// Returns empty vec on a fresh database (no legacy tokens exist).
+    pub fn get_legacy_active_tokens(&self) -> Result<Vec<TokenRecord>> {
+        let conn = self.pool.get().map_err(pool_err)?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, hash, created_at, last_used, revoked, prefix
+             FROM tokens WHERE revoked = 0 AND prefix IS NULL",
+        )?;
+        let tokens = stmt
+            .query_map([], |row| {
+                Ok(TokenRecord {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    hash: row.get(2)?,
+                    created_at: row.get(3)?,
+                    last_used: row.get(4)?,
+                    revoked: row.get::<_, i32>(5)? != 0,
+                    prefix: row.get(6)?,
                 })
             })?
             .filter_map(|r| r.ok())
@@ -299,7 +380,7 @@ impl Db {
     pub fn list_tokens(&self) -> Result<Vec<TokenRecord>> {
         let conn = self.pool.get().map_err(pool_err)?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, hash, created_at, last_used, revoked
+            "SELECT id, name, hash, created_at, last_used, revoked, prefix
              FROM tokens ORDER BY created_at DESC",
         )?;
         let tokens = stmt
@@ -311,6 +392,7 @@ impl Db {
                     created_at: row.get(3)?,
                     last_used: row.get(4)?,
                     revoked: row.get::<_, i32>(5)? != 0,
+                    prefix: row.get(6)?,
                 })
             })?
             .filter_map(|r| r.ok())
