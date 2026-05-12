@@ -638,49 +638,69 @@ fn token_create(name: &str, db_path: &str) {
         _ => {}
     }
 
-    // Generate a 32-byte random token, base64url-encode it
+    // Generate a 32-byte random token, base64url-encode it.
+    // Retry up to 3 times on prefix collision (prefix uniqueness is enforced
+    // by a UNIQUE index; collisions are astronomically unlikely but possible).
     use rand::RngCore;
     use base64::Engine;
 
-    let mut token_bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut token_bytes);
-    let token_plain = format!(
-        "tf_{}",
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token_bytes)
-    );
-
-    // Hash the token
-    let hash = match handlers::hash_password(&token_plain) {
-        Ok(h) => h,
-        Err(_) => {
-            eprintln!("Failed to hash token");
-            std::process::exit(1);
-        }
-    };
-
     let now = handlers::chrono_now();
-    let id = nanoid::nanoid!(10);
 
-    // Store the first 8 chars of the plaintext token as a lookup prefix.
-    // This enables O(1) indexed lookup in check_auth instead of O(n × argon2).
-    // The prefix is NOT a secret — it merely narrows the candidate to 1 record.
-    // Argon2 verification still runs on that 1 candidate.
-    let prefix = token_plain.chars().take(8).collect::<String>();
+    let token_plain = 'generate: {
+        for attempt in 0..3u8 {
+            let mut token_bytes = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut token_bytes);
+            let plain = format!(
+                "tf_{}",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token_bytes)
+            );
 
-    let record = db::TokenRecord {
-        id,
-        name: name.to_string(),
-        hash,
-        created_at: now,
-        last_used: None,
-        revoked: false,
-        prefix: Some(prefix),
-    };
+            let hash = match handlers::hash_password(&plain) {
+                Ok(h) => h,
+                Err(_) => {
+                    eprintln!("Failed to hash token");
+                    std::process::exit(1);
+                }
+            };
 
-    if let Err(e) = db.insert_token(&record) {
-        eprintln!("Failed to store token: {e}");
+            let id = nanoid::nanoid!(10);
+
+            // Store the first 8 chars of the plaintext token as a lookup prefix.
+            // This enables O(1) indexed lookup in check_auth instead of O(n × argon2).
+            // The prefix is NOT a secret — it merely narrows the candidate to 1 record.
+            // Argon2 verification still runs on that 1 candidate.
+            let prefix = plain.chars().take(8).collect::<String>();
+
+            let record = db::TokenRecord {
+                id,
+                name: name.to_string(),
+                hash,
+                created_at: now.clone(),
+                last_used: None,
+                revoked: false,
+                prefix: Some(prefix),
+            };
+
+            match db.insert_token(&record) {
+                Ok(()) => break 'generate plain,
+                Err(e) if e.to_string().contains("UNIQUE constraint failed: tokens.prefix") => {
+                    if attempt < 2 {
+                        eprintln!("Warning: prefix collision on attempt {}; regenerating.", attempt + 1);
+                        continue;
+                    }
+                    eprintln!("Failed to store token after 3 attempts (prefix collision): {e}");
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("Failed to store token: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        // Unreachable: loop always breaks or exits, but satisfies the compiler.
+        eprintln!("Failed to generate a unique token prefix.");
         std::process::exit(1);
-    }
+    };
 
     // Print the plaintext token ONCE
     println!("{token_plain}");

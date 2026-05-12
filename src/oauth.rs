@@ -140,9 +140,12 @@ pub async fn handle_authorize(
         future.format("%Y-%m-%dT%H:%M:%SZ").to_string()
     };
 
-    // Store the code.
+    // Store the code. Recover from poisoned mutex rather than panicking.
+    // Also sweep expired codes on each insert to keep the map bounded.
     {
-        let mut codes = state.auth_codes.lock().unwrap();
+        let mut codes = state.auth_codes.lock().unwrap_or_else(|e| e.into_inner());
+        let now_str = chrono_now();
+        codes.retain(|_, v| v.expires_at.as_str() >= now_str.as_str());
         codes.insert(
             code.clone(),
             crate::handlers::AuthCodeRecord {
@@ -261,8 +264,11 @@ async fn handle_authorization_code(state: AppState, req: TokenRequest) -> Respon
     };
 
     // Look up and validate the authorization code.
+    // Recover from poisoned mutex and sweep expired entries during lookup.
     let record = {
-        let mut codes = state.auth_codes.lock().unwrap();
+        let mut codes = state.auth_codes.lock().unwrap_or_else(|e| e.into_inner());
+        let now_for_sweep = chrono_now();
+        codes.retain(|_, v| v.expires_at.as_str() >= now_for_sweep.as_str());
         match codes.remove(&code) {
             Some(r) => r,
             None => {

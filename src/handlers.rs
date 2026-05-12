@@ -94,9 +94,6 @@ pub struct AuthCodeRecord {
     pub client_id: String,
     pub redirect_uri: String,
     pub expires_at: String, // ISO 8601 UTC
-    pub code_challenge: String,
-    pub resource: Option<String>,
-    pub scope: Option<String>,
 }
 
 /// Dynamically-registered OAuth client record (POST /oauth/register).
