@@ -239,10 +239,15 @@ pub struct CreateResponse {
 #[derive(Deserialize)]
 pub struct SlugQuery {
     pub raw: Option<String>,
-    /// Optional password for password-protected documents. When provided and
-    /// valid, bypasses the interactive unlock form and serves content directly.
+    /// Primary query-param password unlock for password-protected documents.
+    /// Named `access_token` to avoid security heuristics in some HTTP clients
+    /// (e.g. ChatGPT browsing tool refuses URLs with `?password=`).
+    /// `?password=` is accepted as a backward-compatible fallback.
     /// Content negotiation still applies: bot UAs / `Accept: application/json`
     /// get the JSON response; browsers get HTML.
+    pub access_token: Option<String>,
+    /// Backward-compatible alias for `access_token`. `access_token` takes
+    /// precedence if both are present.
     pub password: Option<String>,
 }
 
@@ -251,11 +256,19 @@ pub struct SlugQuery {
 /// Returned when the caller signals `Accept: application/json` or is a known
 /// AI crawler, so agents can consume the full document (including agent-layer
 /// content) from the same human-facing URL without hitting the API endpoint.
+///
+/// `content` is retained for backward compatibility (full raw markdown, password
+/// stripped from frontmatter).  `human_content` and `agent_content` are parsed
+/// splits: human is everything outside agent-marker blocks; agent is the content
+/// inside them (None when no agent section exists).
 #[derive(Serialize)]
 pub struct DocumentResponse {
     pub slug: String,
     pub title: String,
-    pub content: String,          // full raw markdown (including agent sections)
+    pub content: String,          // full raw markdown, password stripped from frontmatter
+    pub human_content: String,    // content outside <!-- @agent --> blocks
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_content: Option<String>, // content inside <!-- @agent --> blocks
     pub theme: String,
     pub description: Option<String>,
     pub created_at: String,
@@ -749,15 +762,61 @@ fn is_known_bot(headers: &HeaderMap) -> bool {
     KNOWN_BOT_AGENTS.iter().any(|bot| ua.contains(bot))
 }
 
+/// Strip the `password:` line from YAML frontmatter in raw content.
+///
+/// Only removes lines inside the opening `---` ... closing `---` block.
+/// Does not modify content that has no frontmatter or no password field.
+/// Returns a new String; the stored document is never modified.
+fn strip_password_from_content(raw: &str) -> String {
+    let lines: Vec<&str> = raw.lines().collect();
+
+    // Must start with `---` to have frontmatter.
+    if lines.is_empty() || lines[0].trim() != "---" {
+        return raw.to_string();
+    }
+
+    // Find closing `---`.
+    let close_idx = match lines.iter().enumerate().skip(1).find(|(_, l)| l.trim() == "---") {
+        Some((i, _)) => i,
+        None => return raw.to_string(),
+    };
+
+    // Rebuild lines, dropping any `password: ...` line inside the fence.
+    let filtered: Vec<&str> = lines
+        .iter()
+        .enumerate()
+        .filter(|(i, line)| {
+            // Only strip inside the frontmatter block (lines 1..close_idx).
+            if *i >= 1 && *i < close_idx {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with("password:")
+            } else {
+                true
+            }
+        })
+        .map(|(_, line)| *line)
+        .collect();
+
+    filtered.join("\n")
+}
+
 /// Build the `DocumentResponse` JSON reply for agent/content-negotiation paths.
 ///
 /// Reused by both `get_human` (content negotiation) and `get_slug_md` to
 /// avoid duplicating doc-lookup logic.
 fn build_json_agent_response(doc: &crate::db::DocumentRecord) -> Response {
+    // Strip password from the content that goes into the response.
+    let safe_content = strip_password_from_content(&doc.raw_content);
+
+    // Split human vs agent sections using the same parser the browser render uses.
+    let parsed = parse_document(&safe_content, &doc.slug);
+
     let body = DocumentResponse {
         slug: doc.slug.clone(),
         title: doc.title.clone(),
-        content: doc.raw_content.clone(),
+        content: safe_content,
+        human_content: parsed.human,
+        agent_content: parsed.agent,
         theme: doc.theme.clone(),
         description: doc.description.clone(),
         created_at: doc.created_at.clone(),
@@ -851,8 +910,10 @@ pub async fn get_human(
 
     // Password check (if document is protected)
     if let Some(stored_hash) = &doc.password {
-        // First: query-param unlock — ?password=X works for agents and direct links.
-        let query_pw_valid = if let Some(provided) = params.password.as_deref() {
+        // First: query-param unlock — ?access_token=X (or legacy ?password=X) works for agents
+        // and direct links.  access_token takes precedence; password is a backward-compat fallback.
+        let query_provided = params.access_token.as_deref().or(params.password.as_deref());
+        let query_pw_valid = if let Some(provided) = query_provided {
             let provided_owned = provided.to_string();
             let hash_owned = stored_hash.clone();
             tokio::task::spawn_blocking(move || verify_password(&provided_owned, &hash_owned))
@@ -1079,14 +1140,19 @@ pub async fn get_full(
 /// Query parameters for GET /api/v1/documents/:slug (agent view).
 #[derive(Deserialize)]
 pub struct AgentQuery {
+    /// Primary query-param password. Named `access_token` to avoid security
+    /// heuristics in some HTTP clients. `?password=` accepted as fallback.
+    pub access_token: Option<String>,
+    /// Backward-compatible alias for `access_token`.
     pub password: Option<String>,
 }
 
 /// Return the full raw source markdown.
 ///
 /// Password-protected documents require the correct password as a query
-/// parameter (`?password=<value>`). Returns 401 with a JSON error body if
-/// the document is protected and the password is missing or incorrect.
+/// parameter (`?access_token=<value>` or legacy `?password=<value>`).
+/// Returns 401 with a JSON error body if the document is protected and
+/// the password is missing or incorrect.
 pub async fn get_agent(
     State(state): State<AppState>,
     _rl: ReadRateLimit,
@@ -1101,8 +1167,10 @@ pub async fn get_agent(
     }
 
     // Password gate — same argon2 check as the human view.
+    // access_token takes precedence; password is a backward-compat fallback.
     if let Some(stored_hash) = &doc.password {
-        match params.password.as_deref() {
+        let provided = params.access_token.as_deref().or(params.password.as_deref());
+        match provided {
             Some(provided) if verify_password(provided, stored_hash) => {
                 // Correct password — fall through to serve content.
             }

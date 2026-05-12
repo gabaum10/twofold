@@ -114,9 +114,13 @@ fn is_marker(line: &str, tag: &str) -> bool {
 ///
 /// Contract: `human` contains only the lines visible to human readers,
 /// with marker lines removed and agent-only content excluded.
+/// `agent` contains only the lines inside `<!-- @agent -->` ... `<!-- @end -->`
+/// blocks, or `None` if no agent section exists.
 pub struct ParseResult {
     /// Human-visible markdown (markers stripped, agent sections excluded).
     pub human: String,
+    /// Agent-only markdown (content between marker pairs), or None if absent.
+    pub agent: Option<String>,
 }
 
 /// Parse a markdown document, splitting out agent-only sections.
@@ -126,13 +130,14 @@ pub struct ParseResult {
 /// 2. Walk lines, tracking `in_agent_section`
 /// 3. Open marker -> set in_agent_section = true, skip line
 /// 4. Close marker -> set in_agent_section = false, skip line
-/// 5. In agent section -> exclude from human corpus
+/// 5. In agent section -> exclude from human corpus, include in agent corpus
 /// 6. Not in agent section -> include in human corpus
-/// 7. Join human lines with newline
+/// 7. Join corpora with newline; agent is None if the corpus is empty
 ///
 /// Logs a tracing::warn if EOF is reached while in_agent_section is true.
 pub fn parse_document(source: &str, slug: &str) -> ParseResult {
     let mut human_lines: Vec<&str> = Vec::new();
+    let mut agent_lines: Vec<&str> = Vec::new();
     let mut in_agent_section = false;
 
     for line in source.lines() {
@@ -140,7 +145,9 @@ pub fn parse_document(source: &str, slug: &str) -> ParseResult {
             in_agent_section = true;
         } else if in_agent_section && is_marker(line, "@end") {
             in_agent_section = false;
-        } else if !in_agent_section {
+        } else if in_agent_section {
+            agent_lines.push(line);
+        } else {
             human_lines.push(line);
         }
     }
@@ -155,6 +162,11 @@ pub fn parse_document(source: &str, slug: &str) -> ParseResult {
 
     ParseResult {
         human: human_lines.join("\n"),
+        agent: if agent_lines.is_empty() {
+            None
+        } else {
+            Some(agent_lines.join("\n"))
+        },
     }
 }
 
