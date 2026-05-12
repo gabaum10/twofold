@@ -86,7 +86,6 @@ fn tool_result_err(message: String) -> Value {
     })
 }
 
-
 // ── HTTP client ───────────────────────────────────────────────────────────────
 
 /// Build the reqwest client with conservative timeouts.

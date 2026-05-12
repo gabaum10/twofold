@@ -295,8 +295,7 @@ pub async fn handle_authorize(
     match state.db.get_oauth_client(&client_id) {
         Ok(Some(client)) => {
             // Registered client: redirect_uri must be in the allowed list.
-            let uris: Vec<String> =
-                serde_json::from_str(&client.redirect_uris).unwrap_or_default();
+            let uris: Vec<String> = serde_json::from_str(&client.redirect_uris).unwrap_or_default();
             if !uris.contains(&redirect_uri) {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -1085,8 +1084,14 @@ mod tests {
             .body(Body::from(body.to_string()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::CREATED, "register_client: expected 201");
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "register_client: expected 201"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         json["client_id"].as_str().unwrap().to_string()
     }
@@ -1193,10 +1198,15 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
 
         assert_eq!(resp.status(), StatusCode::CREATED);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 
-        assert!(json["client_id"].as_str().is_some(), "response must include client_id");
+        assert!(
+            json["client_id"].as_str().is_some(),
+            "response must include client_id"
+        );
         assert_eq!(json["client_name"].as_str().unwrap(), "my-client");
         assert_eq!(
             json["redirect_uris"][0].as_str().unwrap(),
@@ -1222,7 +1232,9 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
 
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"].as_str().unwrap(), "invalid_client_metadata");
     }
@@ -1288,7 +1300,9 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
 
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"].as_str().unwrap(), "invalid_request");
     }
@@ -1312,7 +1326,9 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
 
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"].as_str().unwrap(), "invalid_request");
     }
@@ -1334,7 +1350,9 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
 
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"].as_str().unwrap(), "invalid_request");
     }
@@ -1367,7 +1385,10 @@ mod tests {
             .to_str()
             .unwrap();
         let code = extract_query_param(location, "code");
-        assert!(code.is_some(), "Location must contain code param: {location}");
+        assert!(
+            code.is_some(),
+            "Location must contain code param: {location}"
+        );
         assert!(!code.unwrap().is_empty());
     }
 
@@ -1385,10 +1406,15 @@ mod tests {
         let resp = exchange_code(app, &client_id, &code, redirect_uri, verifier, None).await;
 
         assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 
-        assert!(json["access_token"].as_str().is_some(), "must have access_token");
+        assert!(
+            json["access_token"].as_str().is_some(),
+            "must have access_token"
+        );
         assert_eq!(json["token_type"].as_str().unwrap(), "bearer");
         assert!(json["expires_in"].as_u64().unwrap() > 0);
     }
@@ -1407,7 +1433,9 @@ mod tests {
             exchange_code(app, &client_id, &code, redirect_uri, "wrong-verifier", None).await;
 
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"].as_str().unwrap(), "invalid_grant");
     }
@@ -1479,7 +1507,9 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
 
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"].as_str().unwrap(), "invalid_grant");
     }
@@ -1497,12 +1527,18 @@ mod tests {
         // First exchange — must succeed.
         let resp1 =
             exchange_code(app.clone(), &client_id, &code, redirect_uri, verifier, None).await;
-        assert_eq!(resp1.status(), StatusCode::OK, "first exchange must succeed");
+        assert_eq!(
+            resp1.status(),
+            StatusCode::OK,
+            "first exchange must succeed"
+        );
 
         // Second exchange with the same code — must fail.
         let resp2 = exchange_code(app, &client_id, &code, redirect_uri, verifier, None).await;
         assert_eq!(resp2.status(), StatusCode::BAD_REQUEST);
-        let bytes = axum::body::to_bytes(resp2.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp2.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"].as_str().unwrap(), "invalid_grant");
     }
@@ -1529,7 +1565,9 @@ mod tests {
         let resp =
             exchange_code(app.clone(), &client_id, &code, redirect_uri, verifier, None).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let token_resp: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 
         let refresh_token = token_resp["refresh_token"]
@@ -1537,9 +1575,8 @@ mod tests {
             .expect("must have refresh_token when scope includes offline_access");
 
         // Use the refresh token.
-        let params = format!(
-            "grant_type=refresh_token&client_id={client_id}&refresh_token={refresh_token}"
-        );
+        let params =
+            format!("grant_type=refresh_token&client_id={client_id}&refresh_token={refresh_token}");
         let req = Request::builder()
             .method("POST")
             .uri("/oauth/token")
@@ -1549,7 +1586,9 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let rotated: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 
         assert!(rotated["access_token"].as_str().is_some());
@@ -1609,9 +1648,8 @@ mod tests {
             .layer(axum::Extension(rate_limit))
             .with_state(state);
 
-        let params = format!(
-            "grant_type=refresh_token&client_id={client_id}&refresh_token={stale_rt}"
-        );
+        let params =
+            format!("grant_type=refresh_token&client_id={client_id}&refresh_token={stale_rt}");
         let req = Request::builder()
             .method("POST")
             .uri("/oauth/token")
@@ -1621,7 +1659,9 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
 
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"].as_str().unwrap(), "invalid_grant");
     }
@@ -1646,7 +1686,9 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(json["access_token"].as_str().is_some());
         assert_eq!(json["token_type"].as_str().unwrap(), "bearer");
@@ -1667,7 +1709,9 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
 
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"].as_str().unwrap(), "invalid_client");
     }
@@ -1694,12 +1738,17 @@ mod tests {
         let resp = exchange_code(app, &client_id, &code, redirect_uri, verifier, None).await;
 
         assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let scope = json["scope"]
             .as_str()
             .expect("scope must be present in token response");
-        assert!(scope.contains("mcp:tools"), "scope must round-trip: got {scope}");
+        assert!(
+            scope.contains("mcp:tools"),
+            "scope must round-trip: got {scope}"
+        );
     }
 
     /// resource mismatch between /authorize and /oauth/token — returns invalid_grant.
@@ -1736,7 +1785,9 @@ mod tests {
         .await;
 
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"].as_str().unwrap(), "invalid_grant");
     }

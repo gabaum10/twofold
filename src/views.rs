@@ -19,7 +19,7 @@ use crate::{
     handlers::{AppError, AppState},
     helpers::{is_expired, is_password_authed, make_auth_cookie, verify_password},
     parser::{extract_frontmatter, parse_document},
-    rate_limit::{ReadRateLimit},
+    rate_limit::ReadRateLimit,
 };
 
 // ── Templates ─────────────────────────────────────────────────────────────────
@@ -1770,7 +1770,10 @@ mod tests {
             stripped.contains("theme: clean"),
             "theme should be preserved"
         );
-        assert!(stripped.contains("# Body"), "body content should be preserved");
+        assert!(
+            stripped.contains("# Body"),
+            "body content should be preserved"
+        );
         assert!(stripped.starts_with("---"), "opening fence should remain");
     }
 

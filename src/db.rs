@@ -744,8 +744,7 @@ impl Db {
     /// Used to enforce the 1,000-client hard cap before inserting.
     pub fn count_active_oauth_clients(&self, cutoff: &str) -> Result<i64> {
         let conn = self.pool.get().map_err(pool_err)?;
-        let mut stmt =
-            conn.prepare("SELECT COUNT(*) FROM oauth_clients WHERE created_at >= ?1")?;
+        let mut stmt = conn.prepare("SELECT COUNT(*) FROM oauth_clients WHERE created_at >= ?1")?;
         let count: i64 = stmt.query_row(params![cutoff], |row| row.get(0))?;
         Ok(count)
     }
@@ -753,8 +752,10 @@ impl Db {
     /// Delete OAuth clients registered before `cutoff` (ISO 8601 string).
     pub fn delete_expired_oauth_clients(&self, cutoff: &str) -> Result<usize> {
         let conn = self.pool.get().map_err(pool_err)?;
-        let rows =
-            conn.execute("DELETE FROM oauth_clients WHERE created_at < ?1", params![cutoff])?;
+        let rows = conn.execute(
+            "DELETE FROM oauth_clients WHERE created_at < ?1",
+            params![cutoff],
+        )?;
         Ok(rows)
     }
 
@@ -807,7 +808,10 @@ impl Db {
             }
         };
         if row.is_some() {
-            tx.execute("DELETE FROM oauth_auth_codes WHERE code = ?1", params![code])?;
+            tx.execute(
+                "DELETE FROM oauth_auth_codes WHERE code = ?1",
+                params![code],
+            )?;
         }
         tx.commit()?;
         Ok(row)
@@ -1050,7 +1054,10 @@ mod tests {
 
         // Revoking again returns false (already revoked, no rows updated).
         let revoked_again = db.revoke_token("my-token").expect("revoke again");
-        assert!(!revoked_again, "revoking an already-revoked token returns false");
+        assert!(
+            !revoked_again,
+            "revoking an already-revoked token returns false"
+        );
 
         // List — token is still present but marked revoked.
         let tokens_after = db.list_tokens().expect("list after revoke");

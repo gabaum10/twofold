@@ -24,10 +24,10 @@ use crate::{
 
 /// URL-safe slug alphabet (mirrors handlers.rs — kept in sync).
 const SLUG_ALPHABET: [char; 63] = [
-    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h',
-    'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
-    'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R',
-    'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', '-',
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i',
+    'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', 'A', 'B',
+    'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U',
+    'V', 'W', 'X', 'Y', 'Z', '-',
 ];
 
 // ── Request / Result types ────────────────────────────────────────────────────
@@ -90,9 +90,7 @@ pub fn publish(
         .title
         .unwrap_or_else(|| extract_title(body_text, &slug));
 
-    let theme = meta
-        .theme
-        .unwrap_or_else(|| config.default_theme.clone());
+    let theme = meta.theme.unwrap_or_else(|| config.default_theme.clone());
 
     let now = crate::helpers::chrono_now();
 
@@ -219,13 +217,9 @@ pub fn update(
     let meta = fm_result.meta.unwrap_or_default();
     let body_text = &fm_result.body;
 
-    let title = meta
-        .title
-        .unwrap_or_else(|| extract_title(body_text, slug));
+    let title = meta.title.unwrap_or_else(|| extract_title(body_text, slug));
 
-    let theme = meta
-        .theme
-        .unwrap_or_else(|| config.default_theme.clone());
+    let theme = meta.theme.unwrap_or_else(|| config.default_theme.clone());
 
     let now = crate::helpers::chrono_now();
 
@@ -374,11 +368,7 @@ pub fn get(db: &Db, slug: &str) -> Result<DocumentRecord, AppError> {
 /// List documents with pagination.
 ///
 /// Limit is capped at 100 server-side by the db layer.
-pub fn list(
-    db: &Db,
-    limit: u32,
-    offset: u32,
-) -> Result<(Vec<DocumentSummary>, u64), AppError> {
+pub fn list(db: &Db, limit: u32, offset: u32) -> Result<(Vec<DocumentSummary>, u64), AppError> {
     db.list_documents(limit, offset).map_err(AppError::from)
 }
 

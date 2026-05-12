@@ -420,7 +420,10 @@ pub async fn serve_favicon() -> impl IntoResponse {
 ///
 /// Kept as a thin shim so the call-sites inside this module don't need
 /// to be updated to a full module path.
-async fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<crate::auth::Principal, AppError> {
+async fn check_auth(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<crate::auth::Principal, AppError> {
     crate::auth::check_auth(state, headers).await
 }
 
@@ -684,8 +687,14 @@ mod tests {
             .await
             .unwrap();
         let raw = std::str::from_utf8(&body_bytes).unwrap();
-        assert!(raw.contains("Updated content."), "content should reflect PUT body");
-        assert!(!raw.contains("Original content."), "old content should be gone");
+        assert!(
+            raw.contains("Updated content."),
+            "content should reflect PUT body"
+        );
+        assert!(
+            !raw.contains("Original content."),
+            "old content should be gone"
+        );
     }
 
     #[tokio::test]
@@ -766,7 +775,10 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["slug"].as_str().unwrap(), slug);
-        assert!(json.get("created_at").is_some(), "response should include created_at");
+        assert!(
+            json.get("created_at").is_some(),
+            "response should include created_at"
+        );
     }
 
     #[tokio::test]
@@ -1021,10 +1033,22 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(json.get("entries").is_some(), "response must have 'entries' field");
-        assert!(json.get("total").is_some(), "response must have 'total' field");
-        assert!(json.get("limit").is_some(), "response must have 'limit' field");
-        assert!(json.get("offset").is_some(), "response must have 'offset' field");
+        assert!(
+            json.get("entries").is_some(),
+            "response must have 'entries' field"
+        );
+        assert!(
+            json.get("total").is_some(),
+            "response must have 'total' field"
+        );
+        assert!(
+            json.get("limit").is_some(),
+            "response must have 'limit' field"
+        );
+        assert!(
+            json.get("offset").is_some(),
+            "response must have 'offset' field"
+        );
         assert_eq!(json["total"].as_u64().unwrap(), 0);
         assert!(json["entries"].as_array().unwrap().is_empty());
     }

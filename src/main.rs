@@ -174,8 +174,7 @@ async fn run_server() {
     // mid-window again and would otherwise accumulate indefinitely.
     let eviction_store = rate_limit.clone();
     tokio::spawn(async move {
-        let mut interval =
-            tokio::time::interval(std::time::Duration::from_secs(5 * 60));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5 * 60));
         loop {
             interval.tick().await;
             eviction_store.evict_expired();

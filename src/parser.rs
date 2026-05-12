@@ -2,9 +2,9 @@
 
 // Re-export frontmatter types and extraction from the canonical module.
 // handlers.rs and service.rs import these from parser — keep the path stable.
-pub use crate::frontmatter::{extract_frontmatter, FrontmatterResult};
 #[allow(unused_imports)]
-pub use crate::frontmatter::Frontmatter; // re-exported for callers that may reference parser::Frontmatter
+pub use crate::frontmatter::Frontmatter;
+pub use crate::frontmatter::{extract_frontmatter, FrontmatterResult}; // re-exported for callers that may reference parser::Frontmatter
 
 // ── Marker Parsing ───────────────────────────────────────────────────────────
 // No-regex approach from the raccoon assembly. Whitespace tolerance via trim.

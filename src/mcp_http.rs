@@ -164,11 +164,7 @@ async fn call_tool(
 
 // ── Tool implementations ──────────────────────────────────────────────────────
 
-async fn tool_publish(
-    state: &AppState,
-    principal: crate::auth::Principal,
-    args: &Value,
-) -> Value {
+async fn tool_publish(state: &AppState, principal: crate::auth::Principal, args: &Value) -> Value {
     let content = match args.get("content").and_then(|v| v.as_str()) {
         Some(c) => c,
         None => return tool_result_err("Missing required argument: content".to_string()),
@@ -220,11 +216,7 @@ async fn tool_publish(
     }
 }
 
-async fn tool_update(
-    state: &AppState,
-    principal: crate::auth::Principal,
-    args: &Value,
-) -> Value {
+async fn tool_update(state: &AppState, principal: crate::auth::Principal, args: &Value) -> Value {
     let slug = match args.get("slug").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => return tool_result_err("Missing required argument: slug".to_string()),
@@ -243,7 +235,14 @@ async fn tool_update(
     let agent_content = args.get("agent_content").and_then(|v| v.as_str());
 
     let body = match build_publish_body(
-        content, title, None, password, expiry, theme, description, agent_content,
+        content,
+        title,
+        None,
+        password,
+        expiry,
+        theme,
+        description,
+        agent_content,
     ) {
         Ok(b) => b,
         Err(e) => return tool_result_err(e),
@@ -280,11 +279,7 @@ async fn tool_update(
     }
 }
 
-async fn tool_delete(
-    state: &AppState,
-    principal: crate::auth::Principal,
-    args: &Value,
-) -> Value {
+async fn tool_delete(state: &AppState, principal: crate::auth::Principal, args: &Value) -> Value {
     let slug = match args.get("slug").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => return tool_result_err("Missing required argument: slug".to_string()),
@@ -308,8 +303,7 @@ fn tool_get(state: &AppState, args: &Value) -> Value {
     match service::get(&state.db, slug) {
         Ok(doc) => {
             // Strip password from the content in the response.
-            let safe_content =
-                crate::handlers::strip_password_from_content_pub(&doc.raw_content);
+            let safe_content = crate::handlers::strip_password_from_content_pub(&doc.raw_content);
             // Return the full raw source as markdown text (same as the HTTP
             // API's GET /api/v1/documents/:slug endpoint).
             tool_result_ok(safe_content)
@@ -325,10 +319,7 @@ fn tool_get(state: &AppState, args: &Value) -> Value {
 }
 
 fn tool_list(state: &AppState, args: &Value) -> Value {
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(20) as u32;
+    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as u32;
 
     match service::list(&state.db, limit, 0) {
         Ok((documents, total)) => {

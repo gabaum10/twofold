@@ -423,7 +423,9 @@ mod tests {
 
     #[test]
     fn marker_directive_detected() {
-        assert!(contains_marker_directive("some text\n<!-- @agent -->\nmore"));
+        assert!(contains_marker_directive(
+            "some text\n<!-- @agent -->\nmore"
+        ));
         assert!(contains_marker_directive("<!-- @end -->"));
     }
 
@@ -434,6 +436,8 @@ mod tests {
 
     #[test]
     fn marker_directive_absent() {
-        assert!(!contains_marker_directive("# Plain markdown\n\nNo markers."));
+        assert!(!contains_marker_directive(
+            "# Plain markdown\n\nNo markers."
+        ));
     }
 }

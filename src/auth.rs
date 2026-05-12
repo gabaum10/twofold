@@ -138,10 +138,11 @@ pub async fn check_auth_token(state: &AppState, provided: &str) -> Result<Princi
     if let Some(token_record) = candidate {
         let provided_owned = provided.to_string();
         let hash_owned = token_record.hash.clone();
-        let verified =
-            tokio::task::spawn_blocking(move || crate::helpers::verify_password(&provided_owned, &hash_owned))
-                .await
-                .map_err(|e| AppError::Internal(format!("Auth task failed: {e}")))?;
+        let verified = tokio::task::spawn_blocking(move || {
+            crate::helpers::verify_password(&provided_owned, &hash_owned)
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("Auth task failed: {e}")))?;
 
         if verified {
             let now = crate::helpers::chrono_now();

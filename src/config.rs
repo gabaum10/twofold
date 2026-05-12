@@ -55,9 +55,8 @@ impl ServeConfig {
 
         let base_url = std::env::var("TWOFOLD_BASE_URL")
             .unwrap_or_else(|_| "http://localhost:3000".to_string());
-        url::Url::parse(&base_url).map_err(|e| {
-            format!("TWOFOLD_BASE_URL is not a valid URL (got '{base_url}'): {e}")
-        })?;
+        url::Url::parse(&base_url)
+            .map_err(|e| format!("TWOFOLD_BASE_URL is not a valid URL (got '{base_url}'): {e}"))?;
 
         let max_size = match std::env::var("TWOFOLD_MAX_SIZE") {
             Ok(s) => s
