@@ -2129,7 +2129,7 @@ mod tests {
             webhook_secret: None,
             reaper_interval: 3600,
         });
-        let state = AppState { db, config };
+        let state = AppState { db, config, auth_codes: Arc::new(Mutex::new(HashMap::new())) };
         let router = Router::new()
             .route(
                 "/api/v1/documents",
@@ -2253,7 +2253,7 @@ mod tests {
             webhook_secret: None,
             reaper_interval: 3600,
         });
-        let state = AppState { db, config };
+        let state = AppState { db, config, auth_codes: Arc::new(Mutex::new(HashMap::new())) };
         let router = Router::new()
             .route(
                 "/api/v1/documents",
