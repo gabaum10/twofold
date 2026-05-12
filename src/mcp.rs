@@ -203,13 +203,17 @@ fn handle_tools_list(id: Value) -> Response {
         "tools": [
             {
                 "name": "twofold_publish",
-                "description": "Publish a markdown document to twofold. Returns the URL and slug.",
+                "description": "Publish a markdown document to twofold. Returns the URL and slug. Supports dual-layer rendering: human-readable content in the browser view, agent-only content accessible via the API endpoint.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "content": {
                             "type": "string",
-                            "description": "Markdown content to publish."
+                            "description": "Markdown content visible to humans in the browser view."
+                        },
+                        "agent_content": {
+                            "type": "string",
+                            "description": "Optional markdown content only visible via the API endpoint (/api/v1/documents/{slug}). Invisible in the human-readable browser view. Use for technical specs, API details, structured data meant for AI agents consuming the document."
                         },
                         "title": {
                             "type": "string",
@@ -281,7 +285,7 @@ fn handle_tools_list(id: Value) -> Response {
             },
             {
                 "name": "twofold_update",
-                "description": "Update an existing document. Returns 404 if the slug does not exist. Use twofold_publish to create new documents.",
+                "description": "Update an existing document. Returns 404 if the slug does not exist. Use twofold_publish to create new documents. Supports dual-layer rendering: human-readable content in the browser view, agent-only content accessible via the API endpoint.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -291,7 +295,11 @@ fn handle_tools_list(id: Value) -> Response {
                         },
                         "content": {
                             "type": "string",
-                            "description": "New markdown content for the document."
+                            "description": "Markdown content visible to humans in the browser view."
+                        },
+                        "agent_content": {
+                            "type": "string",
+                            "description": "Optional markdown content only visible via the API endpoint (/api/v1/documents/{slug}). Invisible in the human-readable browser view. Use for technical specs, API details, structured data meant for AI agents consuming the document."
                         },
                         "title": {
                             "type": "string",
@@ -376,12 +384,13 @@ fn tool_publish(
     let expiry = args.get("expiry").and_then(|v| v.as_str());
     let theme = args.get("theme").and_then(|v| v.as_str());
     let description = args.get("description").and_then(|v| v.as_str());
+    let agent_content = args.get("agent_content").and_then(|v| v.as_str());
 
     // Determine whether to inject frontmatter.
     // If content already starts with `---`, the caller controls frontmatter.
     let has_fm_args = title.is_some() || slug.is_some() || password.is_some()
         || expiry.is_some() || theme.is_some() || description.is_some();
-    let body = if !content.trim_start().starts_with("---") && has_fm_args {
+    let mut body = if !content.trim_start().starts_with("---") && has_fm_args {
         // Build frontmatter block. YAML-escape values to handle special chars.
         let mut fm = String::from("---\n");
         if let Some(t) = title {
@@ -408,6 +417,14 @@ fn tool_publish(
     } else {
         content.to_string()
     };
+
+    // Append agent-only block if provided. Invisible in the browser view;
+    // accessible via the raw API endpoint.
+    if let Some(ac) = agent_content {
+        body.push_str("\n\n<!-- @agent -->\n\n");
+        body.push_str(ac);
+        body.push_str("\n\n<!-- @end -->\n");
+    }
 
     let url = format!("{server_url}/api/v1/documents");
 
@@ -581,12 +598,13 @@ fn tool_update(
     let password = args.get("password").and_then(|v| v.as_str());
     let expiry = args.get("expiry").and_then(|v| v.as_str());
     let theme = args.get("theme").and_then(|v| v.as_str());
+    let agent_content = args.get("agent_content").and_then(|v| v.as_str());
 
     // Inject frontmatter for provided fields if content has none.
     // If content already starts with `---`, caller controls frontmatter.
     let has_fm_args = title.is_some() || description.is_some() || password.is_some()
         || expiry.is_some() || theme.is_some();
-    let body = if !content.trim_start().starts_with("---") && has_fm_args {
+    let mut body = if !content.trim_start().starts_with("---") && has_fm_args {
         let mut fm = String::from("---\n");
         if let Some(t) = title {
             fm.push_str(&format!("title: {}\n", yaml_escape_value(t)));
@@ -609,6 +627,14 @@ fn tool_update(
     } else {
         content.to_string()
     };
+
+    // Append agent-only block if provided. Invisible in the browser view;
+    // accessible via the raw API endpoint.
+    if let Some(ac) = agent_content {
+        body.push_str("\n\n<!-- @agent -->\n\n");
+        body.push_str(ac);
+        body.push_str("\n\n<!-- @end -->\n");
+    }
 
     let url = format!("{server_url}/api/v1/documents/{slug}");
 
