@@ -416,7 +416,7 @@ async fn handle_client_credentials(state: AppState, req: TokenRequest) -> Respon
         _ => return invalid_request("client_secret is required for client_credentials grant"),
     };
     match check_auth_token(&state, &secret).await {
-        Ok(()) => {
+        Ok(_) => {
             tracing::info!(client_id = %client_id, "OAuth client_credentials grant issued");
             (
                 StatusCode::OK,
@@ -540,7 +540,7 @@ async fn handle_authorization_code(state: AppState, req: TokenRequest) -> Respon
             _ => return invalid_client(),
         };
         match check_auth_token(&state, &client_secret).await {
-            Ok(()) => client_secret,
+            Ok(_) => client_secret,
             Err(_) => {
                 tracing::warn!(client_id = %client_id, "OAuth authorization_code denied: invalid secret");
                 return invalid_client();
@@ -659,7 +659,7 @@ async fn handle_refresh_token(state: AppState, req: TokenRequest) -> Response {
             _ => return invalid_client(),
         };
         match check_auth_token(&state, &client_secret).await {
-            Ok(()) => client_secret,
+            Ok(_) => client_secret,
             Err(_) => return invalid_client(),
         }
     };

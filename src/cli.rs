@@ -42,12 +42,32 @@ pub enum Commands {
     /// Manage API tokens.
     Token(TokenArgs),
 
+    /// View recent audit log entries.
+    Audit(AuditArgs),
+
     /// Start the MCP server (stdio JSON-RPC).
     ///
     /// Reads:
     ///   TWOFOLD_MCP_SERVER  Server URL (default: http://localhost:3000)
     ///   TWOFOLD_MCP_TOKEN   Bearer token (falls back to TWOFOLD_TOKEN)
     Mcp,
+}
+
+/// Arguments for the `audit` subcommand.
+#[derive(clap::Args, Debug)]
+pub struct AuditArgs {
+    /// Server base URL.
+    #[arg(long, default_value = "http://localhost:3000")]
+    pub server: String,
+
+    /// Bearer token for authentication.
+    /// Defaults to the TWOFOLD_TOKEN environment variable.
+    #[arg(long)]
+    pub token: Option<String>,
+
+    /// Maximum number of entries to show.
+    #[arg(long, default_value = "20")]
+    pub limit: u32,
 }
 
 /// Arguments for the `publish` subcommand.
