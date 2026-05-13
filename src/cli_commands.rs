@@ -4,6 +4,7 @@
 //! `cli.rs` owns only the Clap struct definitions.
 
 use crate::{cli, db, frontmatter, helpers};
+use rand::RngCore;
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
@@ -498,6 +499,133 @@ fn token_revoke(name: &str, db_path: &str) {
         Ok(true) => println!("Token '{name}' revoked."),
         Ok(false) => {
             eprintln!("Error: Token '{name}' not found or already revoked.");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Database error: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+// ── `twofold client {create|list|revoke}` ────────────────────────────────────
+
+pub fn run_client(args: cli::ClientArgs) {
+    match args.action {
+        cli::ClientAction::Create {
+            name,
+            redirect_uri,
+            db,
+        } => client_create(&name, &redirect_uri, &resolve_db_path(db)),
+        cli::ClientAction::List { db } => client_list(&resolve_db_path(db)),
+        cli::ClientAction::Revoke { client_id, db } => {
+            client_revoke(&client_id, &resolve_db_path(db))
+        }
+    }
+}
+
+fn client_create(name: &str, redirect_uri: &str, db_path: &str) {
+    let database = match db::Db::open(db_path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Failed to open database '{db_path}': {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // Generate client_id (UUID v4) and client_secret (64-char hex = 32 random bytes).
+    let client_id = {
+        let mut bytes = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        format!(
+            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            bytes[0], bytes[1], bytes[2], bytes[3],
+            bytes[4], bytes[5],
+            bytes[6], bytes[7],
+            bytes[8], bytes[9],
+            bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        )
+    };
+
+    let client_secret = {
+        let mut bytes = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    };
+
+    let now = helpers::chrono_now();
+    let row = db::OAuthClientRow {
+        client_id: client_id.clone(),
+        client_name: name.to_string(),
+        redirect_uris: serde_json::json!([redirect_uri]).to_string(),
+        grant_types: serde_json::json!(["authorization_code"]).to_string(),
+        response_types: serde_json::json!(["code"]).to_string(),
+        token_endpoint_auth_method: "client_secret_post".to_string(),
+        created_at: now,
+        provisioned: true,
+        client_secret: Some(client_secret.clone()),
+    };
+
+    match database.insert_oauth_client(&row) {
+        Ok(()) => {
+            println!("client_id:     {client_id}");
+            println!("client_secret: {client_secret}");
+            println!();
+            println!("Store the client_secret now — it will not be shown again.");
+        }
+        Err(e) => {
+            eprintln!("Failed to create client: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn client_list(db_path: &str) {
+    let database = match db::Db::open(db_path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Failed to open database '{db_path}': {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let clients = match database.list_provisioned_clients() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to list clients: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    if clients.is_empty() {
+        println!("No provisioned clients.");
+        return;
+    }
+
+    println!("{:<38} {:<24} {:<21}", "CLIENT_ID", "NAME", "CREATED");
+    println!("{}", "-".repeat(85));
+
+    for client in clients {
+        let created = &client.created_at[..std::cmp::min(16, client.created_at.len())];
+        println!("{:<38} {:<24} {}", client.client_id, client.client_name, created);
+    }
+}
+
+fn client_revoke(client_id: &str, db_path: &str) {
+    let database = match db::Db::open(db_path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Failed to open database '{db_path}': {e}");
+            std::process::exit(1);
+        }
+    };
+
+    match database.revoke_provisioned_client(client_id) {
+        Ok(true) => println!("Client '{client_id}' revoked."),
+        Ok(false) => {
+            eprintln!("Error: Client '{client_id}' not found.");
             std::process::exit(1);
         }
         Err(e) => {

@@ -21,6 +21,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::auth::check_auth_token;
+use crate::config::RegistrationMode;
 use crate::db::{AccessTokenRow, AuthCodeRow, OAuthClientRow, RefreshTokenRow};
 use crate::handlers::AppState;
 use crate::helpers::chrono_now;
@@ -47,21 +48,26 @@ pub async fn handle_protected_resource_metadata(
 }
 
 /// GET /.well-known/oauth-authorization-server — RFC 8414 AS metadata.
+///
+/// When registration mode is Closed, `registration_endpoint` is omitted from the
+/// metadata so clients know not to attempt dynamic registration.
 pub async fn handle_authorization_server_metadata(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     let base = base_url(&state);
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "issuer": base,
         "authorization_endpoint": format!("{base}/authorize"),
         "token_endpoint": format!("{base}/oauth/token"),
-        "registration_endpoint": format!("{base}/oauth/register"),
         "response_types_supported": ["code"],
         "code_challenge_methods_supported": ["S256"],
         "scopes_supported": ["mcp:tools", "offline_access"],
         "token_endpoint_auth_methods_supported": ["none", "client_secret_post"],
         "grant_types_supported": ["authorization_code", "client_credentials", "refresh_token"]
     });
+    if state.config.registration_mode == RegistrationMode::Open {
+        body["registration_endpoint"] = serde_json::json!(format!("{base}/oauth/register"));
+    }
     (
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -96,6 +102,18 @@ pub async fn handle_register(
     _rl: RegistrationRateLimit,
     Json(req): Json<RegisterRequest>,
 ) -> Response {
+    // Gate: if registration is closed, reject all dynamic registration attempts.
+    if state.config.registration_mode == RegistrationMode::Closed {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "registration_disabled",
+                "error_description": "Dynamic client registration is disabled. Use a pre-configured client_id."
+            })),
+        )
+            .into_response();
+    }
+
     let client_name = req
         .client_name
         .unwrap_or_else(|| "unnamed-client".to_string());
@@ -185,6 +203,8 @@ pub async fn handle_register(
         response_types: serde_json::to_string(&response_types).unwrap_or_default(),
         token_endpoint_auth_method: token_endpoint_auth_method.clone(),
         created_at: now,
+        provisioned: false,
+        client_secret: None,
     };
     let db_clone = state.db.clone();
     if let Err(e) = tokio::task::spawn_blocking(move || db_clone.insert_oauth_client(&row))
@@ -608,13 +628,17 @@ async fn handle_authorization_code(state: AppState, req: TokenRequest) -> Respon
     }
     let db_client = state.db.clone();
     let client_id_for_lookup = client_id.clone();
-    let is_public_client = match tokio::task::spawn_blocking(move || {
+    // Look up the client to determine auth method: provisioned confidential clients
+    // have a client_secret in the DB and must authenticate with it. Public clients
+    // (token_endpoint_auth_method=none, no DB secret) go through the standard UUID
+    // access token path. The Ok(Ok(None)) fallback preserves the existing public
+    // client behaviour for dynamically-registered clients not in the DB.
+    let client_row = match tokio::task::spawn_blocking(move || {
         db_client.get_oauth_client(&client_id_for_lookup)
     })
     .await
     {
-        Ok(Ok(Some(c))) => c.token_endpoint_auth_method == "none" || req.client_secret.is_none(),
-        Ok(Ok(None)) => req.client_secret.is_none(),
+        Ok(Ok(result)) => result,
         Ok(Err(e)) => {
             tracing::error!(error = %e, "Failed to look up OAuth client");
             return (
@@ -638,7 +662,115 @@ async fn handle_authorization_code(state: AppState, req: TokenRequest) -> Respon
                 .into_response();
         }
     };
-    let access_token = if is_public_client {
+
+    // Determine if this is a confidential client (has a stored secret).
+    // If so, validate the provided secret against the stored one.
+    // Otherwise fall through to the public client UUID token path.
+    let access_token = if let Some(ref c) = client_row {
+        if let Some(ref stored_secret) = c.client_secret {
+            // Confidential client: require matching client_secret.
+            let provided = match req.client_secret.as_deref() {
+                Some(s) if !s.is_empty() => s,
+                _ => {
+                    tracing::warn!(client_id = %client_id, "OAuth authorization_code denied: client_secret missing for confidential client");
+                    return invalid_client();
+                }
+            };
+            if !constant_time_str_eq(provided, stored_secret) {
+                tracing::warn!(client_id = %client_id, "OAuth authorization_code denied: wrong client_secret");
+                return invalid_client();
+            }
+            // Confidential client authenticated — issue a UUID access token.
+            let at = new_uuid();
+            let at_expires = {
+                let future = chrono::Utc::now() + chrono::Duration::hours(1);
+                future.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+            };
+            let at_row = AccessTokenRow {
+                token: at.clone(),
+                client_id: client_id.clone(),
+                scope: record.scope.clone(),
+                expires_at: at_expires,
+            };
+            let db_at = state.db.clone();
+            if let Err(e) =
+                tokio::task::spawn_blocking(move || db_at.insert_access_token(&at_row))
+                    .await
+                    .unwrap_or_else(|e| {
+                        Err(rusqlite::Error::InvalidPath(std::path::PathBuf::from(
+                            format!("task panicked: {e}"),
+                        )))
+                    })
+            {
+                tracing::error!(error = %e, "Failed to insert access token");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "server_error",
+                        "error_description": "Database error"
+                    })),
+                )
+                    .into_response();
+            }
+            at
+        } else {
+            // Registered client with no stored secret — treat as public.
+            // token_endpoint_auth_method == "none" OR legacy registered client.
+            let is_public = c.token_endpoint_auth_method == "none" || req.client_secret.is_none();
+            if is_public {
+                let at = new_uuid();
+                let at_expires = {
+                    let future = chrono::Utc::now() + chrono::Duration::hours(1);
+                    future.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+                };
+                let at_row = AccessTokenRow {
+                    token: at.clone(),
+                    client_id: client_id.clone(),
+                    scope: record.scope.clone(),
+                    expires_at: at_expires,
+                };
+                let db_at = state.db.clone();
+                if let Err(e) =
+                    tokio::task::spawn_blocking(move || db_at.insert_access_token(&at_row))
+                        .await
+                        .unwrap_or_else(|e| {
+                            Err(rusqlite::Error::InvalidPath(std::path::PathBuf::from(
+                                format!("task panicked: {e}"),
+                            )))
+                        })
+                {
+                    tracing::error!(error = %e, "Failed to insert access token");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": "server_error",
+                            "error_description": "Database error"
+                        })),
+                    )
+                        .into_response();
+                }
+                at
+            } else {
+                // client_secret_post: validate against admin token (legacy path).
+                let client_secret = match req.client_secret.as_deref() {
+                    Some(s) if !s.is_empty() => s.to_string(),
+                    _ => {
+                        tracing::warn!(client_id = %client_id, "OAuth authorization_code denied: client_secret missing or empty");
+                        return invalid_client();
+                    }
+                };
+                match check_auth_token(&state, &client_secret).await {
+                    Ok(_) => client_secret,
+                    Err(_) => {
+                        tracing::warn!(client_id = %client_id, "OAuth authorization_code denied: invalid secret");
+                        return invalid_client();
+                    }
+                }
+            }
+        }
+    } else {
+        // Client not in DB (Ok(Ok(None))) — public client fallback. Preserves
+        // existing behaviour for Cowork when using pre-registered client_id.
         let at = new_uuid();
         let at_expires = {
             let future = chrono::Utc::now() + chrono::Duration::hours(1);
@@ -670,21 +802,6 @@ async fn handle_authorization_code(state: AppState, req: TokenRequest) -> Respon
                 .into_response();
         }
         at
-    } else {
-        let client_secret = match req.client_secret.as_deref() {
-            Some(s) if !s.is_empty() => s.to_string(),
-            _ => {
-                tracing::warn!(client_id = %client_id, "OAuth authorization_code denied: client_secret missing or empty");
-                return invalid_client();
-            }
-        };
-        match check_auth_token(&state, &client_secret).await {
-            Ok(_) => client_secret,
-            Err(_) => {
-                tracing::warn!(client_id = %client_id, "OAuth authorization_code denied: invalid secret");
-                return invalid_client();
-            }
-        }
     };
     let wants_offline = record
         .scope
@@ -796,12 +913,11 @@ async fn handle_refresh_token(state: AppState, req: TokenRequest) -> Response {
     }
     let db_client_rt = state.db.clone();
     let client_id_for_rt = client_id.clone();
-    let is_public_client =
+    let client_row_rt =
         match tokio::task::spawn_blocking(move || db_client_rt.get_oauth_client(&client_id_for_rt))
             .await
         {
-            Ok(Ok(Some(c))) => c.token_endpoint_auth_method == "none" || req.client_secret.is_none(),
-            Ok(Ok(None)) => req.client_secret.is_none(),
+            Ok(Ok(result)) => result,
             Ok(Err(e)) => {
                 tracing::error!(error = %e, "Failed to look up OAuth client");
                 return (
@@ -825,7 +941,100 @@ async fn handle_refresh_token(state: AppState, req: TokenRequest) -> Response {
                     .into_response();
             }
         };
-    let access_token = if is_public_client {
+    let access_token = if let Some(ref c) = client_row_rt {
+        if let Some(ref stored_secret) = c.client_secret {
+            // Confidential client: require matching client_secret.
+            let provided = match req.client_secret.as_deref() {
+                Some(s) if !s.is_empty() => s,
+                _ => {
+                    tracing::warn!(client_id = %client_id, "OAuth refresh_token denied: client_secret missing for confidential client");
+                    return invalid_client();
+                }
+            };
+            if !constant_time_str_eq(provided, stored_secret) {
+                tracing::warn!(client_id = %client_id, "OAuth refresh_token denied: wrong client_secret");
+                return invalid_client();
+            }
+            let at = new_uuid();
+            let at_expires = {
+                let future = chrono::Utc::now() + chrono::Duration::hours(1);
+                future.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+            };
+            let at_row_rt = AccessTokenRow {
+                token: at.clone(),
+                client_id: client_id.clone(),
+                scope: record.scope.clone(),
+                expires_at: at_expires,
+            };
+            let db_at_rt = state.db.clone();
+            if let Err(e) =
+                tokio::task::spawn_blocking(move || db_at_rt.insert_access_token(&at_row_rt))
+                    .await
+                    .unwrap_or_else(|e| {
+                        Err(rusqlite::Error::InvalidPath(std::path::PathBuf::from(
+                            format!("task panicked: {e}"),
+                        )))
+                    })
+            {
+                tracing::error!(error = %e, "Failed to insert access token");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "server_error",
+                        "error_description": "Database error"
+                    })),
+                )
+                    .into_response();
+            }
+            at
+        } else {
+            let is_public = c.token_endpoint_auth_method == "none" || req.client_secret.is_none();
+            if is_public {
+                let at = new_uuid();
+                let at_expires = {
+                    let future = chrono::Utc::now() + chrono::Duration::hours(1);
+                    future.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+                };
+                let at_row_rt = AccessTokenRow {
+                    token: at.clone(),
+                    client_id: client_id.clone(),
+                    scope: record.scope.clone(),
+                    expires_at: at_expires,
+                };
+                let db_at_rt = state.db.clone();
+                if let Err(e) =
+                    tokio::task::spawn_blocking(move || db_at_rt.insert_access_token(&at_row_rt))
+                        .await
+                        .unwrap_or_else(|e| {
+                            Err(rusqlite::Error::InvalidPath(std::path::PathBuf::from(
+                                format!("task panicked: {e}"),
+                            )))
+                        })
+                {
+                    tracing::error!(error = %e, "Failed to insert access token");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": "server_error",
+                            "error_description": "Database error"
+                        })),
+                    )
+                        .into_response();
+                }
+                at
+            } else {
+                let client_secret = match req.client_secret.as_deref() {
+                    Some(s) if !s.is_empty() => s.to_string(),
+                    _ => return invalid_client(),
+                };
+                match check_auth_token(&state, &client_secret).await {
+                    Ok(_) => client_secret,
+                    Err(_) => return invalid_client(),
+                }
+            }
+        }
+    } else {
+        // Client not in DB — public client fallback.
         let at = new_uuid();
         let at_expires = {
             let future = chrono::Utc::now() + chrono::Duration::hours(1);
@@ -858,15 +1067,6 @@ async fn handle_refresh_token(state: AppState, req: TokenRequest) -> Response {
                 .into_response();
         }
         at
-    } else {
-        let client_secret = match req.client_secret.as_deref() {
-            Some(s) if !s.is_empty() => s.to_string(),
-            _ => return invalid_client(),
-        };
-        match check_auth_token(&state, &client_secret).await {
-            Ok(_) => client_secret,
-            Err(_) => return invalid_client(),
-        }
     };
     let new_rt = new_uuid();
     let new_rt_expires = {
@@ -1238,6 +1438,7 @@ mod tests {
             rate_limit_write: 10_000,
             rate_limit_window: 60,
             registration_limit: 5,
+            registration_mode: crate::config::RegistrationMode::Open,
         };
         let rate_limit = crate::rate_limit::RateLimitStore::new(&config);
         let state = crate::handlers::AppState {
@@ -1659,6 +1860,7 @@ mod tests {
             rate_limit_write: 10_000,
             rate_limit_window: 60,
             registration_limit: 5,
+            registration_mode: crate::config::RegistrationMode::Open,
         };
         let rate_limit = crate::rate_limit::RateLimitStore::new(&config);
 
@@ -1817,6 +2019,7 @@ mod tests {
             rate_limit_write: 10_000,
             rate_limit_window: 60,
             registration_limit: 5,
+            registration_mode: crate::config::RegistrationMode::Open,
         };
         let rate_limit = crate::rate_limit::RateLimitStore::new(&config);
 
@@ -1975,6 +2178,7 @@ mod tests {
             rate_limit_write: 10_000,
             rate_limit_window: 60,
             registration_limit: 5,
+            registration_mode: crate::config::RegistrationMode::Open,
         };
         let rate_limit = crate::rate_limit::RateLimitStore::new(&config);
         let state = crate::handlers::AppState {
@@ -2130,6 +2334,7 @@ mod tests {
             rate_limit_write: 10_000,
             rate_limit_window: 60,
             registration_limit: 5,
+            registration_mode: crate::config::RegistrationMode::Open,
         };
         let rate_limit = crate::rate_limit::RateLimitStore::new(&config);
         let state = crate::handlers::AppState {
@@ -2218,5 +2423,372 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"].as_str().unwrap(), "invalid_grant");
+    }
+
+    // ── Closed registration mode ──────────────────────────────────────────────
+
+    /// Build an OAuth router with TWOFOLD_REGISTRATION_MODE=closed.
+    fn oauth_app_closed(token: &str) -> (Router, crate::db::Db) {
+        let db = crate::db::Db::open(":memory:").expect("in-memory db");
+        let config = crate::config::ServeConfig {
+            token: token.to_string(),
+            db_path: ":memory:".to_string(),
+            bind: "127.0.0.1:0".to_string(),
+            base_url: "http://localhost".to_string(),
+            default_theme: "clean".to_string(),
+            max_size: 1_048_576,
+            webhook_url: None,
+            webhook_secret: None,
+            reaper_interval: 3600,
+            rate_limit_read: 10_000,
+            rate_limit_write: 10_000,
+            rate_limit_window: 60,
+            registration_limit: 5,
+            registration_mode: crate::config::RegistrationMode::Closed,
+        };
+        let rate_limit = crate::rate_limit::RateLimitStore::new(&config);
+        let state = crate::handlers::AppState {
+            db: db.clone(),
+            config: Arc::new(config),
+            rate_limit: rate_limit.clone(),
+        };
+        let router = Router::new()
+            .route(
+                "/.well-known/oauth-authorization-server",
+                get(crate::oauth::handle_authorization_server_metadata),
+            )
+            .route("/oauth/register", post(crate::oauth::handle_register))
+            .route("/authorize", get(crate::oauth::handle_authorize))
+            .route("/oauth/token", post(crate::oauth::handle_oauth_token))
+            .layer(axum::Extension(rate_limit))
+            .with_state(state);
+        (router, db)
+    }
+
+    /// POST /oauth/register when mode is Closed returns 403 registration_disabled.
+    #[tokio::test]
+    async fn register_disabled_in_closed_mode() {
+        let (app, _db) = oauth_app_closed("admin-token");
+        let body = serde_json::json!({
+            "client_name": "my-client",
+            "redirect_uris": ["https://example.com/cb"],
+            "token_endpoint_auth_method": "none"
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/oauth/register")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            json["error"].as_str().unwrap(),
+            "registration_disabled",
+            "closed mode must return registration_disabled"
+        );
+    }
+
+    /// POST /oauth/register when mode is Open works (existing behaviour preserved).
+    #[tokio::test]
+    async fn register_allowed_in_open_mode() {
+        let app = oauth_app("admin-token");
+        let body = serde_json::json!({
+            "client_name": "my-client",
+            "redirect_uris": ["https://example.com/cb"],
+            "token_endpoint_auth_method": "none"
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/oauth/register")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    /// Metadata omits registration_endpoint when mode is Closed.
+    #[tokio::test]
+    async fn metadata_omits_registration_endpoint_in_closed_mode() {
+        let (app, _db) = oauth_app_closed("admin-token");
+        let req = Request::builder()
+            .method("GET")
+            .uri("/.well-known/oauth-authorization-server")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            json["registration_endpoint"].is_null(),
+            "registration_endpoint must be absent in closed mode, got: {json}"
+        );
+    }
+
+    /// Metadata includes registration_endpoint when mode is Open.
+    #[tokio::test]
+    async fn metadata_includes_registration_endpoint_in_open_mode() {
+        let db = crate::db::Db::open(":memory:").expect("in-memory db");
+        let config = crate::config::ServeConfig {
+            token: "tok".to_string(),
+            db_path: ":memory:".to_string(),
+            bind: "127.0.0.1:0".to_string(),
+            base_url: "http://localhost".to_string(),
+            default_theme: "clean".to_string(),
+            max_size: 1_048_576,
+            webhook_url: None,
+            webhook_secret: None,
+            reaper_interval: 3600,
+            rate_limit_read: 10_000,
+            rate_limit_write: 10_000,
+            rate_limit_window: 60,
+            registration_limit: 5,
+            registration_mode: crate::config::RegistrationMode::Open,
+        };
+        let rate_limit = crate::rate_limit::RateLimitStore::new(&config);
+        let state = crate::handlers::AppState {
+            db,
+            config: Arc::new(config),
+            rate_limit: rate_limit.clone(),
+        };
+        let app = Router::new()
+            .route(
+                "/.well-known/oauth-authorization-server",
+                get(crate::oauth::handle_authorization_server_metadata),
+            )
+            .layer(axum::Extension(rate_limit))
+            .with_state(state);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/.well-known/oauth-authorization-server")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            json["registration_endpoint"].as_str().is_some(),
+            "registration_endpoint must be present in open mode, got: {json}"
+        );
+    }
+
+    // ── Confidential client (stored client_secret) auth tests ─────────────────
+
+    /// Helper: seed a provisioned confidential client into a Db.
+    fn seed_provisioned_client(
+        db: &crate::db::Db,
+        client_id: &str,
+        redirect_uri: &str,
+        secret: &str,
+    ) {
+        db.insert_oauth_client(&crate::db::OAuthClientRow {
+            client_id: client_id.to_string(),
+            client_name: "test-confidential".to_string(),
+            redirect_uris: serde_json::json!([redirect_uri]).to_string(),
+            grant_types: serde_json::json!(["authorization_code"]).to_string(),
+            response_types: serde_json::json!(["code"]).to_string(),
+            token_endpoint_auth_method: "client_secret_post".to_string(),
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            provisioned: true,
+            client_secret: Some(secret.to_string()),
+        })
+        .expect("seed provisioned client");
+    }
+
+    /// Build an app that has a provisioned confidential client pre-seeded.
+    fn oauth_app_with_confidential_client(
+        token: &str,
+        client_id: &str,
+        redirect_uri: &str,
+        secret: &str,
+    ) -> Router {
+        let db = crate::db::Db::open(":memory:").expect("in-memory db");
+        seed_provisioned_client(&db, client_id, redirect_uri, secret);
+        let config = crate::config::ServeConfig {
+            token: token.to_string(),
+            db_path: ":memory:".to_string(),
+            bind: "127.0.0.1:0".to_string(),
+            base_url: "http://localhost".to_string(),
+            default_theme: "clean".to_string(),
+            max_size: 1_048_576,
+            webhook_url: None,
+            webhook_secret: None,
+            reaper_interval: 3600,
+            rate_limit_read: 10_000,
+            rate_limit_write: 10_000,
+            rate_limit_window: 60,
+            registration_limit: 5,
+            registration_mode: crate::config::RegistrationMode::Closed,
+        };
+        let rate_limit = crate::rate_limit::RateLimitStore::new(&config);
+        let state = crate::handlers::AppState {
+            db,
+            config: Arc::new(config),
+            rate_limit: rate_limit.clone(),
+        };
+        Router::new()
+            .route("/oauth/register", post(crate::oauth::handle_register))
+            .route("/authorize", get(crate::oauth::handle_authorize))
+            .route("/oauth/token", post(crate::oauth::handle_oauth_token))
+            .layer(axum::Extension(rate_limit))
+            .with_state(state)
+    }
+
+    /// Token exchange succeeds with correct client_secret for a confidential client.
+    #[tokio::test]
+    async fn token_exchange_confidential_client_correct_secret() {
+        let client_id = "conf-client-correct";
+        let redirect_uri = "https://claude.ai/api/mcp/auth_callback";
+        let secret = "super-secret-64-char-hex-value-0000000000000000000000000000000000";
+        let app = oauth_app_with_confidential_client("admin", client_id, redirect_uri, secret);
+        let verifier = "confidential-client-test-verifier-long-enough-here";
+
+        let code = authorize(
+            app.clone(),
+            client_id,
+            redirect_uri,
+            verifier,
+            Some("mcp:tools"),
+            None,
+        )
+        .await;
+
+        // Exchange with correct secret.
+        let params = format!(
+            "grant_type=authorization_code&client_id={client_id}&code={code}&redirect_uri={redirect_uri}&code_verifier={verifier}&client_secret={secret}"
+        );
+        let req = Request::builder()
+            .method("POST")
+            .uri("/oauth/token")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(params))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK, "correct secret must succeed");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            json["access_token"].as_str().is_some(),
+            "must have access_token"
+        );
+    }
+
+    /// Token exchange fails with wrong client_secret for a confidential client.
+    #[tokio::test]
+    async fn token_exchange_confidential_client_wrong_secret() {
+        let client_id = "conf-client-wrong";
+        let redirect_uri = "https://claude.ai/api/mcp/auth_callback";
+        let secret = "real-secret-value-0000000000000000000000000000000000000000000000";
+        let app = oauth_app_with_confidential_client("admin", client_id, redirect_uri, secret);
+        let verifier = "confidential-client-wrong-verifier-long-enough";
+
+        let code = authorize(
+            app.clone(),
+            client_id,
+            redirect_uri,
+            verifier,
+            Some("mcp:tools"),
+            None,
+        )
+        .await;
+
+        let params = format!(
+            "grant_type=authorization_code&client_id={client_id}&code={code}&redirect_uri={redirect_uri}&code_verifier={verifier}&client_secret=wrong-secret"
+        );
+        let req = Request::builder()
+            .method("POST")
+            .uri("/oauth/token")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(params))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "wrong secret must return 401"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"].as_str().unwrap(), "invalid_client");
+    }
+
+    /// Token exchange fails when client_secret is missing for a confidential client.
+    #[tokio::test]
+    async fn token_exchange_confidential_client_missing_secret() {
+        let client_id = "conf-client-missing";
+        let redirect_uri = "https://claude.ai/api/mcp/auth_callback";
+        let secret = "stored-secret-00000000000000000000000000000000000000000000000000";
+        let app = oauth_app_with_confidential_client("admin", client_id, redirect_uri, secret);
+        let verifier = "confidential-client-missing-verifier-long-enough-h";
+
+        let code = authorize(
+            app.clone(),
+            client_id,
+            redirect_uri,
+            verifier,
+            Some("mcp:tools"),
+            None,
+        )
+        .await;
+
+        // No client_secret provided.
+        let params = format!(
+            "grant_type=authorization_code&client_id={client_id}&code={code}&redirect_uri={redirect_uri}&code_verifier={verifier}"
+        );
+        let req = Request::builder()
+            .method("POST")
+            .uri("/oauth/token")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(params))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "missing secret for confidential client must return 401"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"].as_str().unwrap(), "invalid_client");
+    }
+
+    /// Token exchange succeeds without a secret for a public client (no secret in DB).
+    #[tokio::test]
+    async fn token_exchange_public_client_no_secret_succeeds() {
+        // Dynamically registered public client — no client_secret in DB.
+        let app = oauth_app("admin-token");
+        let redirect_uri = "https://example.com/cb";
+        let verifier = "public-client-no-secret-verifier-long-enough-here";
+
+        let client_id = register_client(app.clone(), &[redirect_uri]).await;
+        let code = authorize(app.clone(), &client_id, redirect_uri, verifier, None, None).await;
+        let resp = exchange_code(app, &client_id, &code, redirect_uri, verifier, None).await;
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "public client without stored secret must succeed without secret"
+        );
     }
 }

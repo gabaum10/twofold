@@ -1,5 +1,16 @@
 //! Environment variable configuration. `ServeConfig` struct; fails fast if `TWOFOLD_TOKEN` is absent.
 
+/// Controls whether new OAuth clients can register dynamically.
+///
+/// - `Open` (default): RFC 7591 dynamic registration is allowed. Any client can register.
+/// - `Closed`: Dynamic registration is disabled. Only pre-provisioned clients (created via
+///   `twofold client create`) can connect. The `/oauth/register` endpoint returns 403.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RegistrationMode {
+    Open,
+    Closed,
+}
+
 /// Configuration loaded from environment variables.
 ///
 /// Contract: `from_env()` fails fast if TWOFOLD_TOKEN is absent.
@@ -32,6 +43,8 @@ pub struct ServeConfig {
     pub rate_limit_window: u64,
     /// Max OAuth registrations per IP per window (TWOFOLD_REGISTRATION_LIMIT — default: 5)
     pub registration_limit: u32,
+    /// Whether dynamic client registration is allowed (TWOFOLD_REGISTRATION_MODE — default: open)
+    pub registration_mode: RegistrationMode,
 }
 
 impl ServeConfig {
@@ -127,6 +140,15 @@ impl ServeConfig {
             Err(_) => 5,
         };
 
+        let registration_mode = match std::env::var("TWOFOLD_REGISTRATION_MODE")
+            .unwrap_or_default()
+            .to_lowercase()
+            .as_str()
+        {
+            "closed" => RegistrationMode::Closed,
+            _ => RegistrationMode::Open,
+        };
+
         Ok(ServeConfig {
             token,
             bind,
@@ -141,6 +163,7 @@ impl ServeConfig {
             rate_limit_write,
             rate_limit_window,
             registration_limit,
+            registration_mode,
         })
     }
 }
@@ -175,6 +198,7 @@ mod tests {
             "TWOFOLD_RATE_LIMIT_WRITE",
             "TWOFOLD_RATE_LIMIT_WINDOW",
             "TWOFOLD_REGISTRATION_LIMIT",
+            "TWOFOLD_REGISTRATION_MODE",
         ] {
             std::env::remove_var(key);
         }
@@ -220,6 +244,7 @@ mod tests {
         assert_eq!(cfg.rate_limit_write, 30);
         assert_eq!(cfg.rate_limit_window, 60);
         assert_eq!(cfg.registration_limit, 5);
+        assert_eq!(cfg.registration_mode, RegistrationMode::Open);
     }
 
     /// An invalid TWOFOLD_WEBHOOK_URL fails at startup with a descriptive error.
@@ -305,6 +330,37 @@ mod tests {
         assert_eq!(
             cfg.registration_limit, 10,
             "TWOFOLD_REGISTRATION_LIMIT should be 10"
+        );
+    }
+
+    /// TWOFOLD_REGISTRATION_MODE=closed sets RegistrationMode::Closed.
+    #[test]
+    fn from_env_registration_mode_closed() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_twofold_env();
+        std::env::set_var("TWOFOLD_TOKEN", "tok");
+        std::env::set_var("TWOFOLD_REGISTRATION_MODE", "closed");
+
+        let cfg = ServeConfig::from_env().expect("should parse");
+        assert_eq!(
+            cfg.registration_mode,
+            RegistrationMode::Closed,
+            "TWOFOLD_REGISTRATION_MODE=closed should set Closed"
+        );
+    }
+
+    /// Unset TWOFOLD_REGISTRATION_MODE defaults to Open.
+    #[test]
+    fn from_env_registration_mode_default_open() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_twofold_env();
+        std::env::set_var("TWOFOLD_TOKEN", "tok");
+
+        let cfg = ServeConfig::from_env().expect("should parse");
+        assert_eq!(
+            cfg.registration_mode,
+            RegistrationMode::Open,
+            "unset TWOFOLD_REGISTRATION_MODE should default to Open"
         );
     }
 

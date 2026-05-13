@@ -143,7 +143,9 @@ impl Db {
                 grant_types                 TEXT NOT NULL,
                 response_types              TEXT NOT NULL,
                 token_endpoint_auth_method  TEXT NOT NULL,
-                created_at                  TEXT NOT NULL
+                created_at                  TEXT NOT NULL,
+                provisioned                 INTEGER NOT NULL DEFAULT 0,
+                client_secret               TEXT
             );
 
             CREATE TABLE IF NOT EXISTS oauth_auth_codes (
@@ -283,6 +285,26 @@ impl Db {
             );
             CREATE INDEX IF NOT EXISTS idx_oauth_refresh_tokens_expires_at ON oauth_refresh_tokens(expires_at);",
         )?;
+
+        // v0.5-closed-reg: add provisioned and client_secret columns to oauth_clients.
+        // provisioned=1 marks clients created via `twofold client create` — they survive
+        // the reaper and require client_secret validation.
+        // client_secret stores the plaintext secret for confidential clients (nullable).
+        let mut client_stmt = conn.prepare("PRAGMA table_info(oauth_clients)")?;
+        let client_columns: Vec<String> = client_stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(client_stmt);
+
+        if !client_columns.contains(&"provisioned".to_string()) {
+            conn.execute_batch(
+                "ALTER TABLE oauth_clients ADD COLUMN provisioned INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+        if !client_columns.contains(&"client_secret".to_string()) {
+            conn.execute_batch("ALTER TABLE oauth_clients ADD COLUMN client_secret TEXT;")?;
+        }
 
         Ok(())
     }
@@ -665,6 +687,11 @@ pub struct OAuthClientRow {
     pub response_types: String,
     pub token_endpoint_auth_method: String,
     pub created_at: String,
+    /// True if this client was pre-provisioned via `twofold client create`.
+    /// Provisioned clients are exempt from the reaper and require client_secret auth.
+    pub provisioned: bool,
+    /// Plaintext client_secret for confidential (provisioned) clients. None for public clients.
+    pub client_secret: Option<String>,
 }
 
 /// Authorization code (oauth_auth_codes table).
@@ -701,14 +728,14 @@ pub struct RefreshTokenRow {
 // ── OAuth client operations ───────────────────────────────────────────────────
 
 impl Db {
-    /// Insert a dynamically-registered OAuth client.
+    /// Insert a dynamically-registered or provisioned OAuth client.
     pub fn insert_oauth_client(&self, row: &OAuthClientRow) -> Result<()> {
         let conn = self.pool.get().map_err(pool_err)?;
         conn.execute(
             "INSERT INTO oauth_clients
              (client_id, client_name, redirect_uris, grant_types, response_types,
-              token_endpoint_auth_method, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+              token_endpoint_auth_method, created_at, provisioned, client_secret)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 row.client_id,
                 row.client_name,
@@ -717,6 +744,8 @@ impl Db {
                 row.response_types,
                 row.token_endpoint_auth_method,
                 row.created_at,
+                row.provisioned as i32,
+                row.client_secret,
             ],
         )?;
         Ok(())
@@ -727,7 +756,7 @@ impl Db {
         let conn = self.pool.get().map_err(pool_err)?;
         let mut stmt = conn.prepare(
             "SELECT client_id, client_name, redirect_uris, grant_types, response_types,
-                    token_endpoint_auth_method, created_at
+                    token_endpoint_auth_method, created_at, provisioned, client_secret
              FROM oauth_clients WHERE client_id = ?1",
         )?;
         let mut rows = stmt.query(params![client_id])?;
@@ -741,6 +770,8 @@ impl Db {
                 response_types: row.get(4)?,
                 token_endpoint_auth_method: row.get(5)?,
                 created_at: row.get(6)?,
+                provisioned: row.get::<_, i32>(7)? != 0,
+                client_secret: row.get(8)?,
             })),
         }
     }
@@ -756,13 +787,76 @@ impl Db {
     }
 
     /// Delete OAuth clients registered before `cutoff` (ISO 8601 string).
+    ///
+    /// Provisioned clients (`provisioned = 1`) are always exempt — they survive indefinitely
+    /// until explicitly revoked via `twofold client revoke`.
     pub fn delete_expired_oauth_clients(&self, cutoff: &str) -> Result<usize> {
         let conn = self.pool.get().map_err(pool_err)?;
         let rows = conn.execute(
-            "DELETE FROM oauth_clients WHERE created_at < ?1",
+            "DELETE FROM oauth_clients WHERE created_at < ?1 AND provisioned = 0",
             params![cutoff],
         )?;
         Ok(rows)
+    }
+
+    // ── Provisioned client management ─────────────────────────────────────────
+
+    /// List all provisioned clients (created via `twofold client create`).
+    pub fn list_provisioned_clients(&self) -> Result<Vec<OAuthClientRow>> {
+        let conn = self.pool.get().map_err(pool_err)?;
+        let mut stmt = conn.prepare(
+            "SELECT client_id, client_name, redirect_uris, grant_types, response_types,
+                    token_endpoint_auth_method, created_at, provisioned, client_secret
+             FROM oauth_clients WHERE provisioned = 1
+             ORDER BY created_at DESC",
+        )?;
+        let clients = stmt
+            .query_map([], |row| {
+                Ok(OAuthClientRow {
+                    client_id: row.get(0)?,
+                    client_name: row.get(1)?,
+                    redirect_uris: row.get(2)?,
+                    grant_types: row.get(3)?,
+                    response_types: row.get(4)?,
+                    token_endpoint_auth_method: row.get(5)?,
+                    created_at: row.get(6)?,
+                    provisioned: row.get::<_, i32>(7)? != 0,
+                    client_secret: row.get(8)?,
+                })
+            })?
+            .filter_map(|r| {
+                r.map_err(|e| tracing::warn!("Failed to deserialize oauth_client row: {}", e))
+                    .ok()
+            })
+            .collect();
+        Ok(clients)
+    }
+
+    /// Delete a provisioned client and all its associated tokens by client_id.
+    ///
+    /// Returns true if the client existed and was deleted, false if not found.
+    pub fn revoke_provisioned_client(&self, client_id: &str) -> Result<bool> {
+        let conn = self.pool.get().map_err(pool_err)?;
+        let tx = conn.unchecked_transaction()?;
+        // Cascade: remove all tokens associated with this client.
+        tx.execute(
+            "DELETE FROM oauth_access_tokens WHERE client_id = ?1",
+            params![client_id],
+        )?;
+        tx.execute(
+            "DELETE FROM oauth_refresh_tokens WHERE client_id = ?1",
+            params![client_id],
+        )?;
+        tx.execute(
+            "DELETE FROM oauth_auth_codes WHERE client_id = ?1",
+            params![client_id],
+        )?;
+        let rows = tx.execute(
+            "DELETE FROM oauth_clients WHERE client_id = ?1 AND provisioned = 1",
+            params![client_id],
+        )?;
+        tx.commit()?;
+        Ok(rows > 0)
     }
 
     // ── Auth code operations ──────────────────────────────────────────────────
@@ -1179,6 +1273,8 @@ mod tests {
             response_types: "[]".to_string(),
             token_endpoint_auth_method: "none".to_string(),
             created_at: "2020-01-01T00:00:00Z".to_string(), // before cutoff
+            provisioned: false,
+            client_secret: None,
         })
         .expect("insert old client");
         db.insert_oauth_client(&OAuthClientRow {
@@ -1189,6 +1285,8 @@ mod tests {
             response_types: "[]".to_string(),
             token_endpoint_auth_method: "none".to_string(),
             created_at: "2099-01-01T00:00:00Z".to_string(), // after cutoff
+            provisioned: false,
+            client_secret: None,
         })
         .expect("insert new client");
 
@@ -1202,6 +1300,151 @@ mod tests {
 
         let new = db.get_oauth_client("new-client").expect("lookup ok");
         assert!(new.is_some(), "new client must survive reaper");
+    }
+
+    /// Provisioned clients survive the reaper even if registered before the cutoff.
+    #[test]
+    fn reaper_spares_provisioned_clients() {
+        let db = open_test_db();
+        let cutoff = "2025-06-01T00:00:00Z";
+
+        // Provisioned client registered long before the cutoff.
+        db.insert_oauth_client(&OAuthClientRow {
+            client_id: "prov-client".to_string(),
+            client_name: "provisioned".to_string(),
+            redirect_uris: r#"["https://claude.ai/api/mcp/auth_callback"]"#.to_string(),
+            grant_types: r#"["authorization_code"]"#.to_string(),
+            response_types: r#"["code"]"#.to_string(),
+            token_endpoint_auth_method: "client_secret_post".to_string(),
+            created_at: "2020-01-01T00:00:00Z".to_string(), // before cutoff
+            provisioned: true,
+            client_secret: Some("secret".to_string()),
+        })
+        .expect("insert provisioned client");
+
+        // Non-provisioned client also before the cutoff — should be reaped.
+        db.insert_oauth_client(&OAuthClientRow {
+            client_id: "dynamic-client".to_string(),
+            client_name: "dynamic".to_string(),
+            redirect_uris: "[]".to_string(),
+            grant_types: "[]".to_string(),
+            response_types: "[]".to_string(),
+            token_endpoint_auth_method: "none".to_string(),
+            created_at: "2020-01-01T00:00:00Z".to_string(), // before cutoff
+            provisioned: false,
+            client_secret: None,
+        })
+        .expect("insert dynamic client");
+
+        let deleted = db
+            .delete_expired_oauth_clients(cutoff)
+            .expect("reaper should succeed");
+        assert_eq!(
+            deleted, 1,
+            "reaper should delete exactly 1 (the non-provisioned client)"
+        );
+
+        let prov = db.get_oauth_client("prov-client").expect("lookup ok");
+        assert!(
+            prov.is_some(),
+            "provisioned client must survive reaper regardless of age"
+        );
+
+        let dyn_client = db.get_oauth_client("dynamic-client").expect("lookup ok");
+        assert!(
+            dyn_client.is_none(),
+            "non-provisioned old client must be reaped"
+        );
+    }
+
+    /// list_provisioned_clients returns only provisioned clients.
+    #[test]
+    fn list_provisioned_clients_only_provisioned() {
+        let db = open_test_db();
+
+        db.insert_oauth_client(&OAuthClientRow {
+            client_id: "prov-1".to_string(),
+            client_name: "Provisioned One".to_string(),
+            redirect_uris: r#"["https://claude.ai/api/mcp/auth_callback"]"#.to_string(),
+            grant_types: r#"["authorization_code"]"#.to_string(),
+            response_types: r#"["code"]"#.to_string(),
+            token_endpoint_auth_method: "client_secret_post".to_string(),
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            provisioned: true,
+            client_secret: Some("secret-1".to_string()),
+        })
+        .expect("insert prov-1");
+
+        db.insert_oauth_client(&OAuthClientRow {
+            client_id: "dyn-1".to_string(),
+            client_name: "Dynamic One".to_string(),
+            redirect_uris: r#"["https://example.com/cb"]"#.to_string(),
+            grant_types: r#"["authorization_code"]"#.to_string(),
+            response_types: r#"["code"]"#.to_string(),
+            token_endpoint_auth_method: "none".to_string(),
+            created_at: "2025-01-02T00:00:00Z".to_string(),
+            provisioned: false,
+            client_secret: None,
+        })
+        .expect("insert dyn-1");
+
+        let provisioned = db
+            .list_provisioned_clients()
+            .expect("list should succeed");
+        assert_eq!(provisioned.len(), 1);
+        assert_eq!(provisioned[0].client_id, "prov-1");
+        assert!(provisioned[0].provisioned);
+    }
+
+    /// revoke_provisioned_client deletes client and its tokens.
+    #[test]
+    fn revoke_provisioned_client_cascades() {
+        let db = open_test_db();
+
+        db.insert_oauth_client(&OAuthClientRow {
+            client_id: "prov-revoke".to_string(),
+            client_name: "ToRevoke".to_string(),
+            redirect_uris: r#"["https://claude.ai/api/mcp/auth_callback"]"#.to_string(),
+            grant_types: r#"["authorization_code"]"#.to_string(),
+            response_types: r#"["code"]"#.to_string(),
+            token_endpoint_auth_method: "client_secret_post".to_string(),
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            provisioned: true,
+            client_secret: Some("supersecret".to_string()),
+        })
+        .expect("insert client");
+
+        // Seed an access token for this client.
+        db.insert_access_token(&AccessTokenRow {
+            token: "at-for-revoke".to_string(),
+            client_id: "prov-revoke".to_string(),
+            scope: Some("mcp:tools".to_string()),
+            expires_at: "2099-01-01T00:00:00Z".to_string(),
+        })
+        .expect("seed access token");
+
+        let revoked = db
+            .revoke_provisioned_client("prov-revoke")
+            .expect("revoke should succeed");
+        assert!(revoked, "revoke should return true");
+
+        // Client is gone.
+        let client = db.get_oauth_client("prov-revoke").expect("lookup ok");
+        assert!(client.is_none(), "client must be deleted after revoke");
+
+        // Access token is also gone.
+        let at = db.get_access_token("at-for-revoke").expect("lookup ok");
+        assert!(at.is_none(), "access token must be deleted after client revoke");
+    }
+
+    /// revoke_provisioned_client returns false for a non-existent client.
+    #[test]
+    fn revoke_provisioned_client_not_found() {
+        let db = open_test_db();
+        let result = db
+            .revoke_provisioned_client("does-not-exist")
+            .expect("should not error");
+        assert!(!result, "should return false for non-existent client");
     }
 
     /// delete_expired_older_than removes documents whose expiry is before the window,
