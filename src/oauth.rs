@@ -800,7 +800,9 @@ async fn handle_refresh_token(state: AppState, req: TokenRequest) -> Response {
         match tokio::task::spawn_blocking(move || db_client_rt.get_oauth_client(&client_id_for_rt))
             .await
         {
-            Ok(Ok(Some(c))) => c.token_endpoint_auth_method == "none" || req.client_secret.is_none(),
+            Ok(Ok(Some(c))) => {
+                c.token_endpoint_auth_method == "none" || req.client_secret.is_none()
+            }
             Ok(Ok(None)) => req.client_secret.is_none(),
             Ok(Err(e)) => {
                 tracing::error!(error = %e, "Failed to look up OAuth client");
