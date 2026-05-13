@@ -1388,9 +1388,7 @@ mod tests {
         })
         .expect("insert dyn-1");
 
-        let provisioned = db
-            .list_provisioned_clients()
-            .expect("list should succeed");
+        let provisioned = db.list_provisioned_clients().expect("list should succeed");
         assert_eq!(provisioned.len(), 1);
         assert_eq!(provisioned[0].client_id, "prov-1");
         assert!(provisioned[0].provisioned);
@@ -1434,7 +1432,10 @@ mod tests {
 
         // Access token is also gone.
         let at = db.get_access_token("at-for-revoke").expect("lookup ok");
-        assert!(at.is_none(), "access token must be deleted after client revoke");
+        assert!(
+            at.is_none(),
+            "access token must be deleted after client revoke"
+        );
     }
 
     /// revoke_provisioned_client returns false for a non-existent client.

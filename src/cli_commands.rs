@@ -609,7 +609,10 @@ fn client_list(db_path: &str) {
 
     for client in clients {
         let created = &client.created_at[..std::cmp::min(16, client.created_at.len())];
-        println!("{:<38} {:<24} {}", client.client_id, client.client_name, created);
+        println!(
+            "{:<38} {:<24} {}",
+            client.client_id, client.client_name, created
+        );
     }
 }
 
