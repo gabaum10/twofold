@@ -1,0 +1,8 @@
+#!/bin/sh
+# Pre-commit hook: enforce cargo fmt
+if ! cargo fmt -- --check 2>/dev/null; then
+    echo ""
+    echo "cargo fmt check failed. Run 'cargo fmt' and re-stage."
+    echo ""
+    exit 1
+fi

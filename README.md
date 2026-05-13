@@ -537,6 +537,20 @@ Agents that parse HTML can find the full document without knowing the API URL st
 
 **Not content negotiation.** Cloudflare and Vercel convert the same content between formats (HTML vs markdown vs plain text). Twofold serves *different content* to different consumers. The author writes both layers. The service routes them.
 
+## Development
+
+**Pre-commit hook:** This repo enforces `cargo fmt` before every commit. After cloning, run:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+If you skip this step, the hook won't run and unformatted commits will be possible locally -- but CI will catch them. To format your code before committing:
+
+```bash
+cargo fmt
+```
+
 ## License
 
 MIT
