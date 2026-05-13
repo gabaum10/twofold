@@ -517,6 +517,14 @@ async fn handle_client_credentials(state: AppState, req: TokenRequest) -> Respon
 }
 
 async fn handle_authorization_code(state: AppState, req: TokenRequest) -> Response {
+    tracing::info!(
+        grant_type = %req.grant_type,
+        client_id = ?req.client_id,
+        has_code = req.code.is_some(),
+        has_client_secret = req.client_secret.is_some(),
+        has_code_verifier = req.code_verifier.is_some(),
+        "OAuth token exchange request received"
+    );
     let code = match req.code.as_deref() {
         Some(c) if !c.is_empty() => c.to_string(),
         _ => return invalid_request("code is required"),
@@ -605,8 +613,8 @@ async fn handle_authorization_code(state: AppState, req: TokenRequest) -> Respon
     })
     .await
     {
-        Ok(Ok(Some(c))) => c.token_endpoint_auth_method == "none",
-        Ok(Ok(None)) => false,
+        Ok(Ok(Some(c))) => c.token_endpoint_auth_method == "none" || req.client_secret.is_none(),
+        Ok(Ok(None)) => req.client_secret.is_none(),
         Ok(Err(e)) => {
             tracing::error!(error = %e, "Failed to look up OAuth client");
             return (
@@ -665,7 +673,10 @@ async fn handle_authorization_code(state: AppState, req: TokenRequest) -> Respon
     } else {
         let client_secret = match req.client_secret.as_deref() {
             Some(s) if !s.is_empty() => s.to_string(),
-            _ => return invalid_client(),
+            _ => {
+                tracing::warn!(client_id = %client_id, "OAuth authorization_code denied: client_secret missing or empty");
+                return invalid_client();
+            }
         };
         match check_auth_token(&state, &client_secret).await {
             Ok(_) => client_secret,
@@ -789,8 +800,8 @@ async fn handle_refresh_token(state: AppState, req: TokenRequest) -> Response {
         match tokio::task::spawn_blocking(move || db_client_rt.get_oauth_client(&client_id_for_rt))
             .await
         {
-            Ok(Ok(Some(c))) => c.token_endpoint_auth_method == "none",
-            Ok(Ok(None)) => false,
+            Ok(Ok(Some(c))) => c.token_endpoint_auth_method == "none" || req.client_secret.is_none(),
+            Ok(Ok(None)) => req.client_secret.is_none(),
             Ok(Err(e)) => {
                 tracing::error!(error = %e, "Failed to look up OAuth client");
                 return (
