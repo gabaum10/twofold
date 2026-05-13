@@ -104,6 +104,8 @@ cargo build --release
 - **Agent discovery** -- `<link rel="alternate" type="text/markdown">` in every HTML page
 - **OpenAPI spec** -- served live at `/api/v1/openapi.yaml` and `/api/v1/openapi.json`
 - **Token management** -- create/list/revoke API tokens via CLI
+- **Closed registration** -- `TWOFOLD_REGISTRATION_MODE=closed` disables dynamic OAuth registration; only pre-provisioned clients can connect
+- **Client management** -- `twofold client create/list/revoke` for provisioning confidential OAuth clients with enforced `client_secret`
 - **Single binary** -- no runtime dependencies, SQLite embedded
 
 ## API
@@ -204,6 +206,62 @@ curl -X POST http://localhost:3000/oauth/register \
 5. Refresh: `POST /oauth/token` with `grant_type=refresh_token&refresh_token=...` — old token is revoked, new pair issued
 
 PKCE is mandatory. Requests without `code_challenge` are rejected. Refresh tokens rotate on every use.
+
+## Closed Registration Mode
+
+By default, Twofold allows any MCP client to register itself dynamically. Set `TWOFOLD_REGISTRATION_MODE=closed` to lock this down so only pre-provisioned clients can connect.
+
+```bash
+export TWOFOLD_REGISTRATION_MODE=closed
+twofold serve
+```
+
+**What changes in closed mode:**
+
+- `POST /oauth/register` returns `403 Forbidden` — dynamic registration is disabled
+- `GET /.well-known/oauth-authorization-server` omits the `registration_endpoint` field — compliant clients will not attempt to register
+- Unknown `client_id` values are rejected at `/authorize` and `/oauth/token`
+- Only clients provisioned via `twofold client create` can initiate the OAuth flow
+
+**Open mode (default):** When `TWOFOLD_REGISTRATION_MODE` is unset or set to `open`, dynamic registration is available and any MCP client can connect via PKCE without pre-provisioning. This is the original behavior.
+
+## Client Management CLI
+
+The `twofold client` subcommand manages pre-provisioned OAuth clients. Use this when running in closed registration mode or when you need confidential clients with a `client_secret`.
+
+```bash
+# Create a confidential client — client_secret is shown once
+twofold client create --name "Cowork" --redirect-uri "https://claude.ai/api/mcp/auth_callback"
+
+# Output:
+# client_id:     abc123...
+# client_secret: xyz789...  (shown once — store it now)
+
+# List all provisioned clients
+twofold client list
+
+# Revoke a client and all its tokens
+twofold client revoke <client_id>
+```
+
+**Confidential clients** store a hashed `client_secret` and require it at token exchange (`client_secret` in the POST body). Provisioned clients are exempt from the 24-hour reaper that removes unused dynamically registered clients.
+
+## Connecting from Claude.ai / Cowork
+
+To connect Claude.ai's remote MCP feature to a closed-registration Twofold instance:
+
+1. Set `TWOFOLD_REGISTRATION_MODE=closed` in your server environment and restart.
+2. Provision a client:
+   ```bash
+   twofold client create --name "Cowork" --redirect-uri "https://claude.ai/api/mcp/auth_callback"
+   ```
+   Copy the `client_id` and `client_secret` from the output — the secret is only shown once.
+3. In Claude.ai: go to **Settings → Integrations → Add custom integration**.
+   - MCP Server URL: `https://your-instance/mcp`
+   - Under **Advanced Settings**: enter the `client_id` and `client_secret` from step 2.
+4. Claude.ai will initiate the OAuth flow using your pre-provisioned credentials instead of attempting dynamic registration.
+
+For open-mode instances (default), skip steps 1–2. Claude.ai will register itself automatically.
 
 ## Content Negotiation
 
@@ -440,6 +498,7 @@ All config is via environment variables. No config files.
 | `TWOFOLD_REGISTRATION_LIMIT` | `5` | Max OAuth registrations per IP per window |
 | `TWOFOLD_MCP_SERVER` | `http://localhost:3000` | Target server for MCP stdio client |
 | `TWOFOLD_MCP_TOKEN` | -- | Token for MCP stdio client (falls back to `TWOFOLD_TOKEN`) |
+| `TWOFOLD_REGISTRATION_MODE` | `open` | Set to `closed` to disable dynamic client registration |
 
 ## CLI
 
@@ -455,6 +514,9 @@ twofold token list                                         # List tokens
 twofold token revoke --name "deploy-bot"                   # Revoke token
 twofold mcp                                                # Start MCP server (stdio)
 twofold audit --server URL --token T                       # Retrieve audit log (admin only)
+twofold client create --name "name" --redirect-uri URI     # Create a confidential client (shows secret once)
+twofold client list                                        # List all provisioned clients
+twofold client revoke <client_id>                          # Revoke a client and all its tokens
 ```
 
 ## Agent Discovery

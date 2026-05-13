@@ -353,7 +353,19 @@ pub async fn handle_authorize(
             }
         }
         Ok(Ok(None)) => {
-            // Pre-registered / admin-token client: require HTTPS unless localhost.
+            // Unknown client_id. In Closed mode, all clients must be provisioned — reject.
+            if state.config.registration_mode == RegistrationMode::Closed {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(OAuthError {
+                        error: "invalid_client",
+                        error_description:
+                            "Unknown client_id. Dynamic registration is disabled.",
+                    }),
+                )
+                    .into_response();
+            }
+            // Open mode: pre-registered / admin-token client — require HTTPS unless localhost.
             if !is_safe_redirect_uri(&redirect_uri) {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -769,8 +781,14 @@ async fn handle_authorization_code(state: AppState, req: TokenRequest) -> Respon
             }
         }
     } else {
-        // Client not in DB (Ok(Ok(None))) — public client fallback. Preserves
-        // existing behaviour for Cowork when using pre-registered client_id.
+        // Client not in DB (Ok(Ok(None))). In Closed mode, all clients must be
+        // provisioned — reject. In Open mode, fall through to public client path.
+        if state.config.registration_mode == RegistrationMode::Closed {
+            tracing::warn!(client_id = %client_id, "OAuth token exchange denied: unknown client_id in closed mode");
+            return invalid_client();
+        }
+        // Open mode: public client fallback. Preserves existing behaviour for
+        // Cowork when using pre-registered client_id.
         let at = new_uuid();
         let at_expires = {
             let future = chrono::Utc::now() + chrono::Duration::hours(1);
@@ -1034,7 +1052,13 @@ async fn handle_refresh_token(state: AppState, req: TokenRequest) -> Response {
             }
         }
     } else {
-        // Client not in DB — public client fallback.
+        // Client not in DB. In Closed mode, all clients must be provisioned — reject.
+        // In Open mode, fall through to public client fallback.
+        if state.config.registration_mode == RegistrationMode::Closed {
+            tracing::warn!(client_id = %client_id, "OAuth refresh_token denied: unknown client_id in closed mode");
+            return invalid_client();
+        }
+        // Open mode: public client fallback.
         let at = new_uuid();
         let at_expires = {
             let future = chrono::Utc::now() + chrono::Duration::hours(1);
@@ -2790,5 +2814,488 @@ mod tests {
             StatusCode::OK,
             "public client without stored secret must succeed without secret"
         );
+    }
+
+    // ── Closed mode: unknown client_id rejection ──────────────────────────────
+
+    /// Helper: seed a provisioned public client (no client_secret) into a Db.
+    fn seed_provisioned_public_client(db: &crate::db::Db, client_id: &str, redirect_uri: &str) {
+        db.insert_oauth_client(&crate::db::OAuthClientRow {
+            client_id: client_id.to_string(),
+            client_name: "test-public-provisioned".to_string(),
+            redirect_uris: serde_json::json!([redirect_uri]).to_string(),
+            grant_types: serde_json::json!(["authorization_code"]).to_string(),
+            response_types: serde_json::json!(["code"]).to_string(),
+            token_endpoint_auth_method: "none".to_string(),
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            provisioned: true,
+            client_secret: None,
+        })
+        .expect("seed provisioned public client");
+    }
+
+    /// Build a closed-mode app with a pre-seeded provisioned public client; returns (Router, Db).
+    fn oauth_app_closed_with_public_client(
+        token: &str,
+        client_id: &str,
+        redirect_uri: &str,
+    ) -> (Router, crate::db::Db) {
+        let db = crate::db::Db::open(":memory:").expect("in-memory db");
+        seed_provisioned_public_client(&db, client_id, redirect_uri);
+        let config = crate::config::ServeConfig {
+            token: token.to_string(),
+            db_path: ":memory:".to_string(),
+            bind: "127.0.0.1:0".to_string(),
+            base_url: "http://localhost".to_string(),
+            default_theme: "clean".to_string(),
+            max_size: 1_048_576,
+            webhook_url: None,
+            webhook_secret: None,
+            reaper_interval: 3600,
+            rate_limit_read: 10_000,
+            rate_limit_write: 10_000,
+            rate_limit_window: 60,
+            registration_limit: 5,
+            registration_mode: crate::config::RegistrationMode::Closed,
+        };
+        let rate_limit = crate::rate_limit::RateLimitStore::new(&config);
+        let state = crate::handlers::AppState {
+            db: db.clone(),
+            config: Arc::new(config),
+            rate_limit: rate_limit.clone(),
+        };
+        let router = Router::new()
+            .route("/oauth/register", post(crate::oauth::handle_register))
+            .route("/authorize", get(crate::oauth::handle_authorize))
+            .route("/oauth/token", post(crate::oauth::handle_oauth_token))
+            .layer(axum::Extension(rate_limit))
+            .with_state(state);
+        (router, db)
+    }
+
+    /// In closed mode, /authorize with an unknown client_id returns invalid_client.
+    #[tokio::test]
+    async fn closed_mode_authorize_unknown_client_rejected() {
+        let (app, _db) = oauth_app_closed("admin-token");
+        let verifier = "closed-mode-unknown-client-verifier-long-enough";
+        let challenge = pkce_challenge(verifier);
+        let redirect_uri = "https://example.com/cb";
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!(
+                "/authorize?response_type=code&client_id=fabricated-client-id\
+                 &redirect_uri={redirect_uri}\
+                 &code_challenge={challenge}&code_challenge_method=S256"
+            ))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "closed mode must reject unknown client_id at /authorize"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            json["error"].as_str().unwrap(),
+            "invalid_client",
+            "must return invalid_client error"
+        );
+    }
+
+    /// In closed mode, token exchange with an unknown client_id returns invalid_client.
+    ///
+    /// Scenario: an auth code exists in the DB (e.g., inserted by a provisioned client
+    /// that was subsequently deleted) but the client_id is no longer registered. The token
+    /// handler must reject with invalid_client rather than falling through to the public
+    /// client path.
+    #[tokio::test]
+    async fn closed_mode_token_exchange_unknown_client_rejected() {
+        let client_id = "closed-token-unknown";
+        let redirect_uri = "https://example.com/cb";
+        let verifier = "closed-token-exchange-verifier-long-enough-here-0";
+        let challenge = pkce_challenge(verifier);
+
+        // Build a closed-mode app. Seed an auth code directly for a client_id that
+        // is NOT registered in the DB — this is the "someone bypassed /authorize" scenario.
+        let (app, db) = oauth_app_closed("admin-token");
+
+        db.insert_auth_code(&crate::db::AuthCodeRow {
+            code: "fabricated-auth-code-0000000000000000000000000000000000000000000000".to_string(),
+            client_id: client_id.to_string(),
+            redirect_uri: redirect_uri.to_string(),
+            expires_at: "2099-01-01T00:00:00Z".to_string(),
+            code_challenge: challenge,
+            resource: None,
+            scope: None,
+        })
+        .expect("seed auth code");
+
+        let params = format!(
+            "grant_type=authorization_code&client_id={client_id}\
+             &code=fabricated-auth-code-0000000000000000000000000000000000000000000000\
+             &redirect_uri={redirect_uri}&code_verifier={verifier}"
+        );
+        let req = Request::builder()
+            .method("POST")
+            .uri("/oauth/token")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(params))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "closed mode must reject token exchange for unknown client_id"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"].as_str().unwrap(), "invalid_client");
+    }
+
+    /// In closed mode, a provisioned public client can still authorize and exchange tokens.
+    #[tokio::test]
+    async fn closed_mode_provisioned_public_client_works() {
+        let client_id = "closed-provisioned-public";
+        let redirect_uri = "https://example.com/cb";
+        let verifier = "closed-provisioned-public-verifier-long-enough-h";
+        let (app, _db) =
+            oauth_app_closed_with_public_client("admin-token", client_id, redirect_uri);
+
+        let code = authorize(
+            app.clone(),
+            client_id,
+            redirect_uri,
+            verifier,
+            None,
+            None,
+        )
+        .await;
+        let params = format!(
+            "grant_type=authorization_code&client_id={client_id}&code={code}\
+             &redirect_uri={redirect_uri}&code_verifier={verifier}"
+        );
+        let req = Request::builder()
+            .method("POST")
+            .uri("/oauth/token")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(params))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "provisioned public client must still work in closed mode"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            json["access_token"].as_str().is_some(),
+            "must receive access_token"
+        );
+    }
+
+    /// In closed mode, a provisioned confidential client can still authorize and exchange tokens.
+    #[tokio::test]
+    async fn closed_mode_provisioned_confidential_client_works() {
+        let client_id = "closed-provisioned-conf";
+        let redirect_uri = "https://claude.ai/api/mcp/auth_callback";
+        let secret = "closed-mode-conf-secret-0000000000000000000000000000000000000000000";
+        let verifier = "closed-mode-confidential-client-verifier-long-enough";
+        let app =
+            oauth_app_with_confidential_client("admin-token", client_id, redirect_uri, secret);
+
+        let code = authorize(
+            app.clone(),
+            client_id,
+            redirect_uri,
+            verifier,
+            Some("mcp:tools"),
+            None,
+        )
+        .await;
+
+        let params = format!(
+            "grant_type=authorization_code&client_id={client_id}&code={code}\
+             &redirect_uri={redirect_uri}&code_verifier={verifier}&client_secret={secret}"
+        );
+        let req = Request::builder()
+            .method("POST")
+            .uri("/oauth/token")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(params))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "provisioned confidential client must still work in closed mode"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            json["access_token"].as_str().is_some(),
+            "must receive access_token"
+        );
+    }
+
+    /// In open mode, unknown client_ids still fall through (backward compat preserved).
+    #[tokio::test]
+    async fn open_mode_unknown_client_fallthrough_preserved() {
+        let app = oauth_app("admin-token");
+        let verifier = "open-mode-fallthrough-verifier-long-enough-here";
+        let redirect_uri = "https://example.com/cb";
+
+        // Fabricate a client_id not in the DB. In open mode this should succeed.
+        let code = authorize(
+            app.clone(),
+            "open-fabricated-client",
+            redirect_uri,
+            verifier,
+            None,
+            None,
+        )
+        .await;
+        let resp =
+            exchange_code(app, "open-fabricated-client", &code, redirect_uri, verifier, None)
+                .await;
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "open mode must still allow unknown client fallthrough"
+        );
+    }
+
+    /// Revoked provisioned client cannot re-authorize in closed mode.
+    #[tokio::test]
+    async fn closed_mode_revoked_client_rejected_at_authorize() {
+        let client_id = "closed-revoked-client";
+        let redirect_uri = "https://example.com/cb";
+        let verifier = "closed-revoked-client-verifier-long-enough-here";
+        let (app, db) =
+            oauth_app_closed_with_public_client("admin-token", client_id, redirect_uri);
+
+        // Confirm it works before revocation.
+        let _code = authorize(
+            app.clone(),
+            client_id,
+            redirect_uri,
+            verifier,
+            None,
+            None,
+        )
+        .await;
+
+        // Revoke.
+        db.revoke_provisioned_client(client_id)
+            .expect("revoke client");
+
+        // Now /authorize should reject.
+        let challenge = pkce_challenge(verifier);
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!(
+                "/authorize?response_type=code&client_id={client_id}\
+                 &redirect_uri={redirect_uri}\
+                 &code_challenge={challenge}&code_challenge_method=S256"
+            ))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "revoked client must be rejected at /authorize in closed mode"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"].as_str().unwrap(), "invalid_client");
+    }
+
+    // ── Confidential client refresh_token flow (F5) ───────────────────────────
+
+    /// Helper: perform a full authorize + token exchange for a confidential client
+    /// with offline_access scope; returns the refresh_token string.
+    async fn get_refresh_token_for_confidential_client(
+        app: Router,
+        client_id: &str,
+        redirect_uri: &str,
+        verifier: &str,
+        secret: &str,
+    ) -> String {
+        let code = authorize(
+            app.clone(),
+            client_id,
+            redirect_uri,
+            verifier,
+            Some("mcp:tools offline_access"),
+            None,
+        )
+        .await;
+        let params = format!(
+            "grant_type=authorization_code&client_id={client_id}&code={code}\
+             &redirect_uri={redirect_uri}&code_verifier={verifier}&client_secret={secret}"
+        );
+        let req = Request::builder()
+            .method("POST")
+            .uri("/oauth/token")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(params))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "initial token exchange failed");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        json["refresh_token"]
+            .as_str()
+            .expect("no refresh_token in response")
+            .to_string()
+    }
+
+    /// Confidential client refresh_token succeeds with the correct client_secret.
+    #[tokio::test]
+    async fn refresh_token_confidential_client_correct_secret() {
+        let client_id = "conf-rt-correct";
+        let redirect_uri = "https://claude.ai/api/mcp/auth_callback";
+        let secret = "rt-correct-secret-0000000000000000000000000000000000000000000000";
+        let verifier = "rt-correct-secret-verifier-long-enough-here-00000";
+        let app =
+            oauth_app_with_confidential_client("admin-token", client_id, redirect_uri, secret);
+
+        let refresh_token =
+            get_refresh_token_for_confidential_client(
+                app.clone(), client_id, redirect_uri, verifier, secret,
+            )
+            .await;
+
+        let params = format!(
+            "grant_type=refresh_token&client_id={client_id}\
+             &refresh_token={refresh_token}&client_secret={secret}"
+        );
+        let req = Request::builder()
+            .method("POST")
+            .uri("/oauth/token")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(params))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "refresh with correct secret must succeed"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            json["access_token"].as_str().is_some(),
+            "must receive new access_token"
+        );
+        assert!(
+            json["refresh_token"].as_str().is_some(),
+            "must receive new refresh_token (rotation)"
+        );
+    }
+
+    /// Confidential client refresh_token fails with the wrong client_secret.
+    #[tokio::test]
+    async fn refresh_token_confidential_client_wrong_secret() {
+        let client_id = "conf-rt-wrong";
+        let redirect_uri = "https://claude.ai/api/mcp/auth_callback";
+        let secret = "rt-real-secret-000000000000000000000000000000000000000000000000";
+        let verifier = "rt-wrong-secret-verifier-long-enough-here-000000000";
+        let app =
+            oauth_app_with_confidential_client("admin-token", client_id, redirect_uri, secret);
+
+        let refresh_token =
+            get_refresh_token_for_confidential_client(
+                app.clone(), client_id, redirect_uri, verifier, secret,
+            )
+            .await;
+
+        let params = format!(
+            "grant_type=refresh_token&client_id={client_id}\
+             &refresh_token={refresh_token}&client_secret=totally-wrong-secret"
+        );
+        let req = Request::builder()
+            .method("POST")
+            .uri("/oauth/token")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(params))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "refresh with wrong secret must return 401"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"].as_str().unwrap(), "invalid_client");
+    }
+
+    /// Confidential client refresh_token fails when the secret is missing entirely.
+    #[tokio::test]
+    async fn refresh_token_confidential_client_missing_secret() {
+        let client_id = "conf-rt-missing";
+        let redirect_uri = "https://claude.ai/api/mcp/auth_callback";
+        let secret = "rt-missing-secret-00000000000000000000000000000000000000000000000";
+        let verifier = "rt-missing-secret-verifier-long-enough-here-00000000";
+        let app =
+            oauth_app_with_confidential_client("admin-token", client_id, redirect_uri, secret);
+
+        let refresh_token =
+            get_refresh_token_for_confidential_client(
+                app.clone(), client_id, redirect_uri, verifier, secret,
+            )
+            .await;
+
+        // No client_secret in the refresh request.
+        let params = format!(
+            "grant_type=refresh_token&client_id={client_id}&refresh_token={refresh_token}"
+        );
+        let req = Request::builder()
+            .method("POST")
+            .uri("/oauth/token")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(params))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "refresh with missing secret for confidential client must return 401"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"].as_str().unwrap(), "invalid_client");
     }
 }
