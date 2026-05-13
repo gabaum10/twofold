@@ -47,6 +47,9 @@ pub enum Commands {
     /// View recent audit log entries.
     Audit(AuditArgs),
 
+    /// Manage pre-provisioned OAuth clients (for closed registration mode).
+    Client(ClientArgs),
+
     /// Start the MCP server (stdio JSON-RPC).
     ///
     /// Reads:
@@ -139,6 +142,52 @@ pub struct DeleteArgs {
     /// Defaults to the TWOFOLD_TOKEN environment variable.
     #[arg(long)]
     pub token: Option<String>,
+}
+
+/// Arguments for the `client` subcommand.
+#[derive(clap::Args, Debug)]
+pub struct ClientArgs {
+    #[command(subcommand)]
+    pub action: ClientAction,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ClientAction {
+    /// Create a pre-provisioned confidential OAuth client.
+    ///
+    /// Generates a client_id and client_secret. The secret is shown ONCE at creation time.
+    /// Use with TWOFOLD_REGISTRATION_MODE=closed to restrict access to pre-configured clients.
+    Create {
+        /// Human-readable name for the client.
+        #[arg(long)]
+        name: String,
+
+        /// Redirect URI for the client (e.g. https://claude.ai/api/mcp/auth_callback).
+        #[arg(long)]
+        redirect_uri: String,
+
+        /// Path to the SQLite database.
+        /// Defaults to TWOFOLD_DB_PATH or ./twofold.db.
+        #[arg(long)]
+        db: Option<String>,
+    },
+
+    /// List all pre-provisioned clients.
+    List {
+        /// Path to the SQLite database.
+        #[arg(long)]
+        db: Option<String>,
+    },
+
+    /// Revoke a pre-provisioned client and all its tokens.
+    Revoke {
+        /// The client_id to revoke.
+        client_id: String,
+
+        /// Path to the SQLite database.
+        #[arg(long)]
+        db: Option<String>,
+    },
 }
 
 /// Arguments for the `token` subcommand.

@@ -396,6 +396,7 @@ mod tests {
             rate_limit_write: 1000,
             rate_limit_window: 60,
             registration_limit: 5,
+            registration_mode: crate::config::RegistrationMode::Open,
         };
         let rate_limit = crate::rate_limit::RateLimitStore::new(&config);
         let state = AppState {
@@ -433,6 +434,7 @@ mod tests {
             rate_limit_write: 1000,
             rate_limit_window: 60,
             registration_limit: 5,
+            registration_mode: crate::config::RegistrationMode::Open,
         }
     }
 
@@ -522,6 +524,7 @@ mod tests {
             rate_limit_write: 10000,
             rate_limit_window: 60,
             registration_limit: 5,
+            registration_mode: crate::config::RegistrationMode::Open,
         };
         let rate_limit = crate::rate_limit::RateLimitStore::new(&config);
         let state = AppState {
@@ -861,6 +864,7 @@ mod tests {
             rate_limit_write: 10000,
             rate_limit_window: 60,
             registration_limit: 5,
+            registration_mode: crate::config::RegistrationMode::Open,
         };
         let rate_limit = crate::rate_limit::RateLimitStore::new(&config);
         let state = AppState {

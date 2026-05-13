@@ -71,6 +71,9 @@ fn main() {
 
         // Audit log — synchronous HTTP call.
         Commands::Audit(args) => cli_commands::run_audit(args),
+
+        // OAuth client management — direct database access, no server needed.
+        Commands::Client(args) => cli_commands::run_client(args),
     }
 }
 
