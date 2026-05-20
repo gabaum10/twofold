@@ -18,7 +18,10 @@ use crate::{
     db::{AuditEntry, Db, DocumentRecord, DocumentSummary},
     handlers::AppError,
     helpers::hash_password,
-    parser::{extract_frontmatter, extract_title, parse_expiry, validate_slug},
+    parser::{
+        compose_document, extract_frontmatter, extract_title, parse_document, parse_expiry,
+        validate_slug,
+    },
     webhook,
 };
 
@@ -231,12 +234,60 @@ pub async fn update(
     }
 
     let fm_result = extract_frontmatter(&req.raw_content).map_err(AppError::BadRequest)?;
+    let has_frontmatter = fm_result.meta.is_some();
     let meta = fm_result.meta.unwrap_or_default();
     let body_text = &fm_result.body;
 
-    let title = meta.title.unwrap_or_else(|| extract_title(body_text, slug));
+    // Merge with existing for fields absent from the incoming payload.
+    // Re-parses existing.raw_content so agent-block preservation is symmetric
+    // with the new payload.
+    let existing_fm = extract_frontmatter(&existing.raw_content).map_err(AppError::BadRequest)?;
+    let existing_body = &existing_fm.body;
+    let existing_parsed = parse_document(existing_body, slug);
+    let incoming_parsed = parse_document(body_text, slug);
 
-    let theme = meta.theme.unwrap_or_else(|| config.default_theme.clone());
+    // Three-way agent merge:
+    //   None        => preserve existing (the bug fix)
+    //   Some("")    => intentional clear
+    //   Some(x)     => use incoming
+    //
+    // Agent content is trimmed before storage to prevent blank-line accumulation
+    // on round-trips: parse_document captures blank lines adjacent to markers as
+    // part of the agent content, so composing without trimming would prepend and
+    // append extra blank lines each update cycle.
+    let final_agent: Option<String> = match incoming_parsed.agent.as_deref() {
+        None => existing_parsed
+            .agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        Some(s) if s.trim().is_empty() => None,
+        Some(s) => Some(s.trim().to_string()),
+    };
+
+    // Recompose body (sans frontmatter) with merged agent layer.
+    let merged_body = compose_document(&incoming_parsed.human, final_agent.as_deref());
+
+    // Recover the leading frontmatter portion of req.raw_content byte-exactly,
+    // so user's original YAML formatting is preserved.
+    let frontmatter_prefix = if has_frontmatter {
+        frontmatter_prefix_of(&req.raw_content)
+    } else {
+        ""
+    };
+    let raw_to_store = format!("{frontmatter_prefix}{merged_body}");
+
+    let title = meta.title.unwrap_or_else(|| {
+        let t = extract_title(body_text, slug);
+        if t == slug {
+            existing.title.clone()
+        } else {
+            t
+        }
+    });
+
+    let theme = meta.theme.unwrap_or_else(|| existing.theme.clone());
 
     let now = crate::helpers::chrono_now();
 
@@ -259,10 +310,10 @@ pub async fn update(
         id: existing.id.clone(),
         slug: slug.to_string(),
         title: title.clone(),
-        raw_content: req.raw_content,
+        raw_content: raw_to_store,
         theme,
         password: password_hash,
-        description: meta.description.clone(),
+        description: meta.description.clone().or(existing.description.clone()),
         created_at: existing.created_at.clone(),
         expires_at: expires_at.clone(),
         updated_at: now.clone(),
@@ -436,4 +487,292 @@ pub async fn list(
 fn add_seconds_to_now(seconds: u64) -> String {
     let future = chrono::Utc::now() + chrono::Duration::seconds(seconds as i64);
     future.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::{Principal, PrincipalKind};
+    use crate::config::ServeConfig;
+    use crate::db::Db;
+
+    /// Minimal `ServeConfig` for tests — no webhook, no auth required in service layer.
+    fn test_config() -> ServeConfig {
+        ServeConfig {
+            token: "test-token".to_string(),
+            bind: "127.0.0.1:3000".to_string(),
+            db_path: ":memory:".to_string(),
+            base_url: "http://localhost:3000".to_string(),
+            max_size: 1_048_576,
+            reaper_interval: 60,
+            default_theme: "clean".to_string(),
+            webhook_url: None,
+            webhook_secret: None,
+            rate_limit_read: 60,
+            rate_limit_write: 30,
+            rate_limit_window: 60,
+            registration_limit: 5,
+            registration_mode: crate::config::RegistrationMode::Open,
+        }
+    }
+
+    fn test_principal() -> Principal {
+        Principal {
+            kind: PrincipalKind::Admin,
+            scopes: vec![],
+            display_name: "test".to_string(),
+        }
+    }
+
+    /// Publish a document and return its slug.
+    async fn do_publish(db: &Db, config: &ServeConfig, body: &str) -> String {
+        let req = PublishRequest {
+            raw_content: body.to_string(),
+            principal: test_principal(),
+            client_ip: "127.0.0.1".to_string(),
+        };
+        publish(db, config, req)
+            .await
+            .expect("publish should succeed")
+            .slug
+    }
+
+    /// Update a document by slug.
+    async fn do_update(db: &Db, config: &ServeConfig, slug: &str, body: &str) {
+        let req = UpdateRequest {
+            raw_content: body.to_string(),
+            principal: test_principal(),
+            client_ip: "127.0.0.1".to_string(),
+        };
+        update(db, config, slug, req)
+            .await
+            .expect("update should succeed");
+    }
+
+    // ── Agent preservation tests ──────────────────────────────────────────────
+
+    /// Core bug fix: updating with a body that has no agent block must preserve
+    /// the existing agent layer.
+    #[tokio::test]
+    async fn update_preserves_agent_when_absent() {
+        let db = Db::open(":memory:").expect("in-memory db");
+        let config = test_config();
+
+        let initial = "# Doc\n\nHuman content.\n\n<!-- @agent -->\n\nold agent\n\n<!-- @end -->\n";
+        let slug = do_publish(&db, &config, initial).await;
+
+        // Update with body that has no agent block.
+        do_update(&db, &config, &slug, "# Doc\n\nUpdated human content.").await;
+
+        let doc = get(&db, &slug).await.expect("doc should exist");
+        let fm_result = crate::parser::extract_frontmatter(&doc.raw_content).unwrap();
+        let parsed = crate::parser::parse_document(&fm_result.body, &slug);
+
+        // parse_document captures blank lines adjacent to markers as part of the
+        // agent content; trim before asserting.
+        assert_eq!(
+            parsed.agent.as_deref().map(str::trim),
+            Some("old agent"),
+            "agent layer must be preserved when incoming body has no marker block"
+        );
+    }
+
+    /// Explicit clear: an empty agent block (only whitespace inside) should clear
+    /// the agent layer.
+    #[tokio::test]
+    async fn update_clears_agent_when_empty_block() {
+        let db = Db::open(":memory:").expect("in-memory db");
+        let config = test_config();
+
+        let initial = "# Doc\n\n<!-- @agent -->\n\nold agent\n\n<!-- @end -->\n";
+        let slug = do_publish(&db, &config, initial).await;
+
+        // Update with an empty agent block.
+        let clear_body = "# Doc\n\nHuman content.\n\n<!-- @agent -->\n\n   \n\n<!-- @end -->\n";
+        do_update(&db, &config, &slug, clear_body).await;
+
+        let doc = get(&db, &slug).await.expect("doc should exist");
+        let fm_result = crate::parser::extract_frontmatter(&doc.raw_content).unwrap();
+        let parsed = crate::parser::parse_document(&fm_result.body, &slug);
+
+        assert!(
+            parsed.agent.is_none(),
+            "agent layer must be cleared when incoming body has empty marker block"
+        );
+    }
+
+    /// No regression: when the incoming body has a real agent block, it replaces
+    /// the existing one.
+    #[tokio::test]
+    async fn update_replaces_agent_when_present() {
+        let db = Db::open(":memory:").expect("in-memory db");
+        let config = test_config();
+
+        let initial = "# Doc\n\n<!-- @agent -->\n\nold agent\n\n<!-- @end -->\n";
+        let slug = do_publish(&db, &config, initial).await;
+
+        let new_body = "# Doc\n\nHuman.\n\n<!-- @agent -->\n\nnew agent\n\n<!-- @end -->\n";
+        do_update(&db, &config, &slug, new_body).await;
+
+        let doc = get(&db, &slug).await.expect("doc should exist");
+        let fm_result = crate::parser::extract_frontmatter(&doc.raw_content).unwrap();
+        let parsed = crate::parser::parse_document(&fm_result.body, &slug);
+
+        // parse_document captures blank lines adjacent to markers; trim before asserting.
+        assert_eq!(
+            parsed.agent.as_deref().map(str::trim),
+            Some("new agent"),
+            "agent layer must be replaced when incoming body has a non-empty marker block"
+        );
+    }
+
+    // ── Description preservation tests ───────────────────────────────────────
+
+    /// Updating without a description in frontmatter must preserve the existing description.
+    #[tokio::test]
+    async fn update_preserves_description_when_absent() {
+        let db = Db::open(":memory:").expect("in-memory db");
+        let config = test_config();
+
+        let initial = "---\ndescription: foo\n---\n# Doc\n\nContent.";
+        let slug = do_publish(&db, &config, initial).await;
+
+        // Update with frontmatter missing description.
+        do_update(&db, &config, &slug, "# Doc\n\nUpdated content.").await;
+
+        let doc = get(&db, &slug).await.expect("doc should exist");
+        assert_eq!(
+            doc.description.as_deref(),
+            Some("foo"),
+            "description must be preserved when incoming frontmatter omits it"
+        );
+    }
+
+    // ── Title preservation tests ──────────────────────────────────────────────
+
+    /// Updating with a body that has no H1 and no title in frontmatter must
+    /// preserve the existing title (not overwrite it with the slug).
+    #[tokio::test]
+    async fn update_preserves_title_when_no_h1_and_no_fm_title() {
+        let db = Db::open(":memory:").expect("in-memory db");
+        let config = test_config();
+
+        // Publish with a custom title in frontmatter.
+        let initial = "---\ntitle: Cool Title\n---\n\nContent without H1.";
+        let slug = do_publish(&db, &config, initial).await;
+
+        // Verify it was stored.
+        let doc = get(&db, &slug).await.unwrap();
+        assert_eq!(doc.title, "Cool Title");
+
+        // Update with body that has no H1 and no title in frontmatter.
+        do_update(&db, &config, &slug, "Updated content without H1.").await;
+
+        let doc = get(&db, &slug).await.expect("doc should exist");
+        assert_eq!(
+            doc.title, "Cool Title",
+            "title must be preserved when no H1 in body and no title in frontmatter"
+        );
+    }
+
+    // ── Theme preservation tests ──────────────────────────────────────────────
+
+    /// Updating without a theme in frontmatter must preserve the existing theme,
+    /// not fall back to the config default.
+    #[tokio::test]
+    async fn update_preserves_theme_when_absent() {
+        let db = Db::open(":memory:").expect("in-memory db");
+        let config = test_config(); // default_theme is "clean"
+
+        let initial = "---\ntheme: dark\n---\n# Doc\n\nContent.";
+        let slug = do_publish(&db, &config, initial).await;
+
+        // Update with frontmatter missing theme.
+        do_update(&db, &config, &slug, "# Doc\n\nUpdated content.").await;
+
+        let doc = get(&db, &slug).await.expect("doc should exist");
+        assert_eq!(
+            doc.theme, "dark",
+            "theme must be preserved when incoming frontmatter omits it"
+        );
+    }
+
+    // ── No-regression tests ───────────────────────────────────────────────────
+
+    /// A body with an H1 must update the title (existing title overridden).
+    #[tokio::test]
+    async fn update_overrides_title_when_new_h1() {
+        let db = Db::open(":memory:").expect("in-memory db");
+        let config = test_config();
+
+        let initial = "---\ntitle: Old\n---\n# Old\n\nContent.";
+        let slug = do_publish(&db, &config, initial).await;
+
+        do_update(&db, &config, &slug, "# New\n\nContent.").await;
+
+        let doc = get(&db, &slug).await.expect("doc should exist");
+        assert_eq!(
+            doc.title, "New",
+            "title must be updated when incoming body has an H1"
+        );
+    }
+
+    /// A frontmatter `theme` field must override the existing theme.
+    #[tokio::test]
+    async fn update_overrides_theme_when_in_fm() {
+        let db = Db::open(":memory:").expect("in-memory db");
+        let config = test_config();
+
+        let initial = "---\ntheme: clean\n---\n# Doc\n\nContent.";
+        let slug = do_publish(&db, &config, initial).await;
+
+        do_update(
+            &db,
+            &config,
+            &slug,
+            "---\ntheme: dark\n---\n# Doc\n\nContent.",
+        )
+        .await;
+
+        let doc = get(&db, &slug).await.expect("doc should exist");
+        assert_eq!(
+            doc.theme, "dark",
+            "theme must be updated when incoming frontmatter includes a theme"
+        );
+    }
+}
+
+/// Extract the frontmatter prefix from a raw document string byte-exactly.
+///
+/// Returns the slice of `raw` from the start through the closing `---` fence line
+/// (including its trailing newline if present). Returns `""` if no valid frontmatter
+/// block is found.
+///
+/// This preserves the user's original YAML formatting and line endings without
+/// re-serializing through serde_yml.
+fn frontmatter_prefix_of(raw: &str) -> &str {
+    // Must start with a `---` fence.
+    if !raw.starts_with("---") {
+        return "";
+    }
+    let mut fence_count = 0usize;
+    let mut pos = 0usize;
+    for line in raw.split('\n') {
+        let end = pos + line.len();
+        if line.trim() == "---" {
+            fence_count += 1;
+            if fence_count == 2 {
+                // Include the closing `---` and the following newline if present.
+                let after = end + 1; // +1 for the '\n' we split on
+                if after <= raw.len() {
+                    return &raw[..after];
+                }
+                return &raw[..end];
+            }
+        }
+        pos = end + 1; // +1 for the '\n'
+    }
+    ""
 }

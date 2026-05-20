@@ -83,6 +83,27 @@ pub fn parse_document(source: &str, slug: &str) -> ParseResult {
     }
 }
 
+/// Compose a markdown document from a human portion and an optional agent portion.
+///
+/// Inverse of [`parse_document`]. When `agent` is `Some`, an `<!-- @agent -->` block
+/// is appended after the human text using the same marker format that `mcp.rs` and
+/// `mcp_http.rs` already emit. When `agent` is `None`, only the human portion is
+/// returned.
+///
+/// The human portion may include frontmatter and any markdown — `compose_document`
+/// does not parse it. Trailing whitespace on the human portion is trimmed before
+/// the marker block is appended so callers do not have to manage spacing.
+pub fn compose_document(human: &str, agent: Option<&str>) -> String {
+    match agent {
+        None => human.to_string(),
+        Some(a) => format!(
+            "{}\n\n<!-- @agent -->\n\n{}\n\n<!-- @end -->\n",
+            human.trim_end(),
+            a
+        ),
+    }
+}
+
 /// Extract the title from the first H1 heading in the source.
 ///
 /// Searches line-by-line for `^# <content>` (first match wins).
@@ -340,5 +361,52 @@ mod tests {
         assert!(validate_slug("mcp").is_err());
         assert!(validate_slug("icon.png").is_err());
         assert!(validate_slug(".well-known").is_err());
+    }
+
+    // compose_document tests
+
+    #[test]
+    fn compose_human_only_no_agent() {
+        let result = compose_document("Hello world.", None);
+        assert_eq!(result, "Hello world.");
+    }
+
+    #[test]
+    fn compose_human_and_agent_produces_marker_block() {
+        let result = compose_document("Human part.", Some("Agent part."));
+        assert_eq!(
+            result,
+            "Human part.\n\n<!-- @agent -->\n\nAgent part.\n\n<!-- @end -->\n"
+        );
+    }
+
+    #[test]
+    fn compose_trims_trailing_whitespace_before_marker() {
+        let result = compose_document("Human part.\n\n\n", Some("Agent part."));
+        assert_eq!(
+            result,
+            "Human part.\n\n<!-- @agent -->\n\nAgent part.\n\n<!-- @end -->\n"
+        );
+    }
+
+    #[test]
+    fn compose_empty_human_with_agent() {
+        let result = compose_document("", Some("Agent content."));
+        assert_eq!(
+            result,
+            "\n\n<!-- @agent -->\n\nAgent content.\n\n<!-- @end -->\n"
+        );
+    }
+
+    #[test]
+    fn compose_round_trip_with_parse() {
+        let human = "# Hello\n\nHuman content.";
+        let agent = "Agent detail.";
+        let composed = compose_document(human, Some(agent));
+        let parsed = parse_document(&composed, "test-slug");
+        assert_eq!(parsed.human.trim_end(), human.trim_end());
+        // parse_document captures blank lines adjacent to markers as part of
+        // the agent content; trim both sides for the round-trip assertion.
+        assert_eq!(parsed.agent.as_deref().map(str::trim), Some(agent.trim()));
     }
 }
