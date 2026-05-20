@@ -1,6 +1,6 @@
 [package]
 name = "twofold"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 license = "MIT"
 description = "One document, two views. Markdown share service for humans and agents."
