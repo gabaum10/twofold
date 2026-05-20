@@ -742,6 +742,396 @@ mod tests {
             "theme must be updated when incoming frontmatter includes a theme"
         );
     }
+
+    // ── Adversarial / pressure-test cases ────────────────────────────────────
+
+    /// BUG (Warning): If a user writes an H1 whose text happens to equal the slug
+    /// string, the title-preservation guard fires incorrectly, using existing.title
+    /// instead of the H1 content. The fix is to change extract_title to return
+    /// Option<String> (None when no H1) so the slug-fallback is unambiguous.
+    ///
+    /// Scenario: existing title = "Old Custom Title", user PUTs body with H1 "# my-slug"
+    /// where "my-slug" equals the actual slug. Expected: title = "my-slug" (from H1).
+    /// Actual: title = "Old Custom Title" (existing title preserved, H1 ignored).
+    #[tokio::test]
+    async fn adversarial_h1_text_equal_to_slug_bypasses_title_update() {
+        let db = Db::open(":memory:").expect("in-memory db");
+        let config = test_config();
+
+        // Publish with a custom slug so we know its value, and set a distinct title.
+        let initial = "---\nslug: test-slug-x\ntitle: Old Custom Title\n---\n\nContent without H1.";
+        let slug = do_publish(&db, &config, initial).await;
+        assert_eq!(slug, "test-slug-x");
+
+        // Verify stored title is "Old Custom Title".
+        let doc = get(&db, &slug).await.unwrap();
+        assert_eq!(doc.title, "Old Custom Title");
+
+        // Update with an H1 whose text equals the slug: "# test-slug-x"
+        // Expected: title should update to "test-slug-x" (the H1 content)
+        // Actual (bug): extract_title returns "test-slug-x", t == slug is true,
+        //               so existing.title ("Old Custom Title") is used instead.
+        do_update(&db, &config, &slug, "# test-slug-x\n\nNew content.").await;
+
+        let doc = get(&db, &slug).await.expect("doc should exist");
+        // This assertion demonstrates the bug: the H1 should win, but existing title wins.
+        assert_eq!(
+            doc.title, "test-slug-x",
+            "BUG: H1 text == slug should update title from H1, not fall back to existing.title"
+        );
+    }
+
+    /// Round-trip stability: three successive identical PUTs should converge to
+    /// the same stored content and produce idempotent results.
+    #[tokio::test]
+    async fn adversarial_round_trip_three_puts_idempotent() {
+        let db = Db::open(":memory:").expect("in-memory db");
+        let config = test_config();
+
+        let initial =
+            "---\ntheme: dark\ndescription: test desc\n---\n# My Doc\n\nHuman content.\n\n<!-- @agent -->\n\nagent stuff\n\n<!-- @end -->\n";
+        let slug = do_publish(&db, &config, initial).await;
+
+        // PUT #1 with body containing no agent block (agent should be preserved)
+        let update_body =
+            "---\ntheme: dark\ndescription: test desc\n---\n# My Doc\n\nHuman content.";
+        do_update(&db, &config, &slug, update_body).await;
+        let doc1 = get(&db, &slug).await.unwrap();
+
+        // PUT #2 with the same body
+        do_update(&db, &config, &slug, update_body).await;
+        let doc2 = get(&db, &slug).await.unwrap();
+
+        // PUT #3
+        do_update(&db, &config, &slug, update_body).await;
+        let doc3 = get(&db, &slug).await.unwrap();
+
+        // All three should have the same raw_content (stable round-trip)
+        assert_eq!(
+            doc1.raw_content, doc2.raw_content,
+            "round-trip: PUT#1 and PUT#2 must produce identical stored content"
+        );
+        assert_eq!(
+            doc2.raw_content, doc3.raw_content,
+            "round-trip: PUT#2 and PUT#3 must produce identical stored content (idempotent)"
+        );
+
+        // Agent should be preserved across all PUTs
+        let fm = crate::parser::extract_frontmatter(&doc3.raw_content).unwrap();
+        let parsed = crate::parser::parse_document(&fm.body, &slug);
+        assert_eq!(
+            parsed.agent.as_deref().map(str::trim),
+            Some("agent stuff"),
+            "agent must survive three successive PUTs without the agent block"
+        );
+    }
+
+    /// Whitespace-only body passes the is_empty() guard and silently overwrites
+    /// the human-visible content with whitespace. This is a Warning: the body is
+    /// accepted but stores invisible content. A trim-based empty check would catch it.
+    #[tokio::test]
+    async fn adversarial_whitespace_only_body_overwrites_content() {
+        let db = Db::open(":memory:").expect("in-memory db");
+        let config = test_config();
+
+        let initial =
+            "# My Doc\n\nImportant content.\n\n<!-- @agent -->\n\nold agent\n\n<!-- @end -->\n";
+        let slug = do_publish(&db, &config, initial).await;
+
+        // PUT a whitespace-only body — passes is_empty() check, gets accepted.
+        // The human content is overwritten; agent is preserved.
+        let req = UpdateRequest {
+            raw_content: "   \n\n   ".to_string(),
+            principal: test_principal(),
+            client_ip: "127.0.0.1".to_string(),
+        };
+        let result = update(&db, &config, &slug, req).await;
+
+        // Currently this succeeds (no error), silently nuking visible content.
+        // This test documents the behavior. If the code is fixed to reject whitespace-only
+        // bodies, change the assert to expect Err.
+        assert!(
+            result.is_ok(),
+            "whitespace-only body is currently accepted (documents the gap in validation)"
+        );
+
+        let doc = get(&db, &slug).await.unwrap();
+        let fm = crate::parser::extract_frontmatter(&doc.raw_content).unwrap();
+        let parsed = crate::parser::parse_document(&fm.body, &slug);
+
+        // Agent is preserved even with whitespace-only human input — correct.
+        assert_eq!(
+            parsed.agent.as_deref().map(str::trim),
+            Some("old agent"),
+            "agent must survive even a whitespace-only PUT body"
+        );
+    }
+
+    /// Unclosed @agent marker in the EXISTING document: update should preserve
+    /// the dangling agent content and the stored result should have a proper @end.
+    #[tokio::test]
+    async fn adversarial_unclosed_agent_in_existing_healed_on_update() {
+        let db = Db::open(":memory:").expect("in-memory db");
+        let config = test_config();
+
+        // Publish a doc where the agent marker is not closed (simulates a corrupt/old doc).
+        // We bypass the normal publish path by publishing a well-formed doc and
+        // directly verifying the update behavior preserves the unclosed content.
+        let initial =
+            "# Doc\n\nHuman.\n\n<!-- @agent -->\n\nUnclosed agent content - no @end marker";
+        let slug = do_publish(&db, &config, initial).await;
+
+        // Update with a body that has no agent block — should preserve the existing agent.
+        do_update(&db, &config, &slug, "# Doc\n\nUpdated human.").await;
+
+        let doc = get(&db, &slug).await.unwrap();
+        let fm = crate::parser::extract_frontmatter(&doc.raw_content).unwrap();
+        let parsed = crate::parser::parse_document(&fm.body, &slug);
+
+        // The unclosed agent content should be preserved (and now properly closed).
+        assert_eq!(
+            parsed.agent.as_deref().map(str::trim),
+            Some("Unclosed agent content - no @end marker"),
+            "unclosed @agent content in existing doc must be preserved and healed on update"
+        );
+
+        // The stored raw_content should now have a proper @end marker (healed).
+        assert!(
+            doc.raw_content.contains("<!-- @end -->"),
+            "stored content after update should have a proper @end marker (unclosed marker healed)"
+        );
+    }
+
+    /// Body starting with --- (horizontal rule) immediately after frontmatter
+    /// closing fence should not confuse frontmatter_prefix_of.
+    #[tokio::test]
+    async fn adversarial_body_hr_after_frontmatter_preserved() {
+        let db = Db::open(":memory:").expect("in-memory db");
+        let config = test_config();
+
+        // Publish: frontmatter, then a markdown HR (---), then content.
+        let initial = "---\ntheme: dark\n---\n---\n# Below the HR\n\nContent.";
+        let slug = do_publish(&db, &config, initial).await;
+
+        // Update with same body — frontmatter_prefix_of must stop at the second ---
+        // (the real closing fence), not the HR.
+        do_update(
+            &db,
+            &config,
+            &slug,
+            "---\ntheme: dark\n---\n---\n# Below the HR\n\nUpdated.",
+        )
+        .await;
+
+        let doc = get(&db, &slug).await.unwrap();
+
+        // Theme should be preserved — frontmatter was parsed correctly.
+        assert_eq!(
+            doc.theme, "dark",
+            "theme must survive update with body-leading HR"
+        );
+
+        // The body should still contain the HR.
+        let fm = crate::parser::extract_frontmatter(&doc.raw_content).unwrap();
+        assert!(
+            fm.body.starts_with("---"),
+            "body-leading HR (---) must be preserved in stored raw_content"
+        );
+    }
+
+    /// Incoming body is ONLY an agent block with no human content.
+    /// This is the "agent_content passed, content omitted" reverse case.
+    /// The spec notes this is partially out of scope but we verify it doesn't corrupt data.
+    #[tokio::test]
+    async fn adversarial_incoming_body_is_only_agent_block() {
+        let db = Db::open(":memory:").expect("in-memory db");
+        let config = test_config();
+
+        // Existing doc has both human content and agent layer.
+        let initial =
+            "# My Doc\n\nHuman content here.\n\n<!-- @agent -->\n\nold agent\n\n<!-- @end -->\n";
+        let slug = do_publish(&db, &config, initial).await;
+
+        // PUT a body that is only an agent block with no human content.
+        // incoming_parsed.human = "" (empty)
+        // incoming_parsed.agent = Some("new agent from update")
+        // This REPLACES the agent (Some arm) and CLEARS human content.
+        // Semantics: "clear human" — the user explicitly sent empty human content.
+        let agent_only_body = "<!-- @agent -->\n\nnew agent from update\n\n<!-- @end -->\n";
+        do_update(&db, &config, &slug, agent_only_body).await;
+
+        let doc = get(&db, &slug).await.unwrap();
+        let fm = crate::parser::extract_frontmatter(&doc.raw_content).unwrap();
+        let parsed = crate::parser::parse_document(&fm.body, &slug);
+
+        // Agent should be the new value.
+        assert_eq!(
+            parsed.agent.as_deref().map(str::trim),
+            Some("new agent from update"),
+            "agent should be replaced when incoming body contains only an agent block"
+        );
+
+        // Human content is empty (clear semantics — user sent no human content).
+        assert!(
+            parsed.human.trim().is_empty(),
+            "human content should be empty when incoming body has no human text"
+        );
+
+        // Critical: no data corruption — the document should be retrievable.
+        assert!(
+            !doc.raw_content.is_empty(),
+            "raw_content must not be empty after agent-only PUT"
+        );
+    }
+
+    /// CRLF line endings in frontmatter must survive a round-trip through update.
+    /// frontmatter_prefix_of uses split('\n') which preserves \r in chunks,
+    /// so the prefix is returned with CRLF intact.
+    #[tokio::test]
+    async fn adversarial_crlf_frontmatter_survives_round_trip() {
+        let db = Db::open(":memory:").expect("in-memory db");
+        let config = test_config();
+
+        // Initial publish without CRLF (normal).
+        let initial = "---\ntheme: dark\n---\n# My Doc\n\nContent.";
+        let slug = do_publish(&db, &config, initial).await;
+
+        // Update with CRLF frontmatter (Windows-style line endings).
+        let crlf_body = "---\r\ntheme: dark\r\n---\r\n# My Doc\r\n\r\nUpdated content.";
+        do_update(&db, &config, &slug, crlf_body).await;
+
+        let doc = get(&db, &slug).await.unwrap();
+
+        // Theme must be parsed and preserved correctly despite CRLF.
+        assert_eq!(
+            doc.theme, "dark",
+            "theme must be preserved from CRLF frontmatter"
+        );
+
+        // A second update with no frontmatter must still preserve the theme.
+        do_update(&db, &config, &slug, "# My Doc\n\nSecond update.").await;
+        let doc2 = get(&db, &slug).await.unwrap();
+        assert_eq!(
+            doc2.theme, "dark",
+            "theme must survive a second update after CRLF frontmatter was stored"
+        );
+    }
+
+    /// Title preserved when existing.title was itself the slug (published with no H1).
+    /// This is the exact case spec mentions: "what if existing.title was itself the slug?"
+    #[tokio::test]
+    async fn adversarial_title_preserved_when_existing_title_was_slug() {
+        let db = Db::open(":memory:").expect("in-memory db");
+        let config = test_config();
+
+        // Publish with no H1 and no title in frontmatter.
+        // extract_title returns slug → title stored AS the slug.
+        let initial = "---\nslug: the-slug-doc\n---\n\nJust content, no H1.";
+        let slug = do_publish(&db, &config, initial).await;
+        assert_eq!(slug, "the-slug-doc");
+
+        let doc = get(&db, &slug).await.unwrap();
+        // Title should be the slug itself (fallback behavior).
+        assert_eq!(
+            doc.title, "the-slug-doc",
+            "initial publish with no H1 should store slug as title"
+        );
+
+        // Update with no H1 and no fm title.
+        do_update(&db, &config, &slug, "No H1 in this update either.").await;
+
+        let doc2 = get(&db, &slug).await.unwrap();
+        // extract_title returns slug, t == slug, so existing.title (== slug) is used.
+        // Result: title stays as slug — correct behavior.
+        assert_eq!(
+            doc2.title, "the-slug-doc",
+            "title should remain as slug when no H1 and existing title was the slug"
+        );
+    }
+
+    /// Multiple agent blocks: parse_document captures ALL agent sections and merges
+    /// their content into a single agent string. After an update that omits agent blocks,
+    /// the merged agent is preserved. The second @agent block is NOT human content —
+    /// it is captured by the parser as part of the combined agent corpus.
+    /// This test verifies no data corruption occurs and the combined agent survives.
+    #[tokio::test]
+    async fn adversarial_multiple_agent_blocks_combined_and_preserved() {
+        let db = Db::open(":memory:").expect("in-memory db");
+        let config = test_config();
+
+        // Doc with two agent blocks — parser merges both into one agent corpus.
+        let initial = "# Doc\n\nHuman.\n\n<!-- @agent -->\n\nfirst agent\n\n<!-- @end -->\n\n<!-- @agent -->\n\nsecond agent\n\n<!-- @end -->\n";
+        let slug = do_publish(&db, &config, initial).await;
+
+        // Verify the initial parse combines both agent blocks.
+        let initial_doc = get(&db, &slug).await.unwrap();
+        let initial_fm = crate::parser::extract_frontmatter(&initial_doc.raw_content).unwrap();
+        let initial_parsed = crate::parser::parse_document(&initial_fm.body, &slug);
+        // Both blocks combined into one agent string.
+        let initial_agent = initial_parsed.agent.as_deref().unwrap_or("");
+        assert!(
+            initial_agent.contains("first agent") && initial_agent.contains("second agent"),
+            "parser should combine both agent blocks: got {:?}",
+            initial_agent
+        );
+
+        // Update with a body that has no agent block — combined agent must be preserved.
+        do_update(&db, &config, &slug, "# Doc\n\nUpdated human.").await;
+
+        let doc = get(&db, &slug).await.unwrap();
+        let fm = crate::parser::extract_frontmatter(&doc.raw_content).unwrap();
+        let parsed = crate::parser::parse_document(&fm.body, &slug);
+
+        // Combined agent preserved (stored as single block by compose_document).
+        let preserved_agent = parsed.agent.as_deref().map(str::trim).unwrap_or("");
+        assert!(
+            preserved_agent.contains("first agent") && preserved_agent.contains("second agent"),
+            "combined agent from multiple blocks must be preserved on update: got {:?}",
+            preserved_agent
+        );
+
+        // After update, content is stored as a single @agent block (normalized).
+        let block_count = doc.raw_content.matches("<!-- @agent -->").count();
+        assert_eq!(
+            block_count, 1,
+            "multiple @agent blocks should be normalized to one after update, got {}",
+            block_count
+        );
+
+        // No data corruption.
+        assert!(!doc.raw_content.is_empty());
+    }
+
+    /// Marker with extreme whitespace: "<!--   @agent   -->" (extra spaces inside).
+    /// is_marker handles this via inner.trim() == tag. Verify through full update cycle.
+    #[tokio::test]
+    async fn adversarial_marker_extreme_whitespace_preserved() {
+        let db = Db::open(":memory:").expect("in-memory db");
+        let config = test_config();
+
+        // Publish with loosely-spaced markers.
+        let initial = "# Doc\n\nHuman.\n\n<!--  @agent  -->\n\nloose agent\n\n<!--  @end  -->\n";
+        let slug = do_publish(&db, &config, initial).await;
+
+        // Update with no agent block — loose-marker agent must be preserved.
+        do_update(&db, &config, &slug, "# Doc\n\nUpdated.").await;
+
+        let doc = get(&db, &slug).await.unwrap();
+        let fm = crate::parser::extract_frontmatter(&doc.raw_content).unwrap();
+        let parsed = crate::parser::parse_document(&fm.body, &slug);
+
+        assert_eq!(
+            parsed.agent.as_deref().map(str::trim),
+            Some("loose agent"),
+            "agent captured with loose-whitespace markers must be preserved on update"
+        );
+
+        // The stored content uses standard markers (compose_document normalizes them).
+        assert!(
+            doc.raw_content.contains("<!-- @agent -->"),
+            "stored content should use normalized standard markers after compose_document"
+        );
+    }
 }
 
 /// Extract the frontmatter prefix from a raw document string byte-exactly.
