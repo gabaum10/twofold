@@ -37,6 +37,11 @@ pub struct FrontmatterResult {
     pub meta: Option<Frontmatter>,
     /// Document body (everything after the closing `---`, or the full content if no frontmatter).
     pub body: String,
+    /// Byte offset in the original source where the closing `---` fence line ends
+    /// (including its trailing newline if present). `None` when no frontmatter block
+    /// was found. Use `&source[..close_end_byte]` to recover the exact frontmatter
+    /// prefix without re-scanning.
+    pub close_end_byte: Option<usize>,
 }
 
 /// Fields to inject or merge into a document's frontmatter.
@@ -65,6 +70,10 @@ pub struct FrontmatterFields {
 /// 4. Empty frontmatter (`---\n---`) is valid — returns default Frontmatter.
 ///
 /// Returns Err with a descriptive message if YAML parsing fails.
+///
+/// The returned `close_end_byte` is the byte offset in `source` immediately after
+/// the closing fence's line terminator (LF or CRLF). This lets callers recover the
+/// exact frontmatter prefix from `source` without re-scanning.
 pub fn extract_frontmatter(source: &str) -> Result<FrontmatterResult, String> {
     let lines: Vec<&str> = source.lines().collect();
 
@@ -73,10 +82,19 @@ pub fn extract_frontmatter(source: &str) -> Result<FrontmatterResult, String> {
         return Ok(FrontmatterResult {
             meta: None,
             body: source.to_string(),
+            close_end_byte: None,
         });
     }
 
-    // Find closing `---`
+    // Find closing `---` — scan only YAML value lines (skip(1) skips opening fence).
+    // We do NOT re-count `---` inside YAML values; `source.lines()` splits on line
+    // boundaries so each element is one logical line. The first line after the opening
+    // fence that trims to "---" is the closing fence. YAML values like `separator: "---"`
+    // produce a line `separator: "---"` which does NOT trim to "---", so they are safe.
+    // The edge case to guard: a bare `---` YAML scalar value on its own line. That would
+    // also trim to "---". We cannot distinguish it from the closing fence here — but
+    // `serde_yml` would parse `---` as a new YAML document separator anyway, so such
+    // content would represent invalid YAML inside a frontmatter block.
     let mut close_idx = None;
     for (i, line) in lines.iter().enumerate().skip(1) {
         if line.trim() == "---" {
@@ -92,6 +110,7 @@ pub fn extract_frontmatter(source: &str) -> Result<FrontmatterResult, String> {
             return Ok(FrontmatterResult {
                 meta: None,
                 body: source.to_string(),
+                close_end_byte: None,
             });
         }
     };
@@ -114,9 +133,33 @@ pub fn extract_frontmatter(source: &str) -> Result<FrontmatterResult, String> {
         String::new()
     };
 
+    // Compute byte offset of the end of the closing fence line in the original source.
+    // Walk the raw bytes, counting LF characters to find the (close_idx+1)-th line start.
+    // This is correct for both LF and CRLF documents because we walk the original bytes.
+    let close_end_byte = {
+        let mut byte_pos = 0usize;
+        let src_bytes = source.as_bytes();
+        let target_newlines = close_idx + 1; // newlines to consume to get past close line
+        let mut newlines_seen = 0usize;
+        while byte_pos < src_bytes.len() {
+            if src_bytes[byte_pos] == b'\n' {
+                newlines_seen += 1;
+                byte_pos += 1;
+                if newlines_seen == target_newlines {
+                    break;
+                }
+            } else {
+                byte_pos += 1;
+            }
+        }
+        // byte_pos is now the start of the line AFTER the closing fence (or end of source).
+        byte_pos
+    };
+
     Ok(FrontmatterResult {
         meta: Some(meta),
         body,
+        close_end_byte: Some(close_end_byte),
     })
 }
 
@@ -412,6 +455,61 @@ mod tests {
         assert!(result.contains("title: Existing"));
         assert!(result.contains("expiry:") && result.contains("7d"));
         assert!(result.contains("# Body"));
+    }
+
+    // close_end_byte — prefix slicing
+
+    /// Regression (F-2): close_end_byte must point past the real closing fence
+    /// even when a YAML value line trims to "---".
+    #[test]
+    fn close_end_byte_skips_yaml_triple_dash_value() {
+        // The YAML value `separator: "---"` must NOT be mistaken for the closing fence.
+        // The real closing fence is the third `---` line.
+        let src = "---\ntitle: Hello\nseparator: \"---\"\n---\n\n# Body";
+        let result = extract_frontmatter(src).unwrap();
+
+        // meta must be Some and contain the title field
+        let meta = result.meta.as_ref().expect("frontmatter should be parsed");
+        assert_eq!(meta.title.as_deref(), Some("Hello"));
+
+        // The prefix slice must cover through the closing fence line
+        let close_end = result.close_end_byte.expect("close_end_byte must be Some");
+        let prefix = &src[..close_end];
+        // The prefix should include the opening fence, both YAML fields, AND the closing fence
+        assert!(
+            prefix.contains("separator:"),
+            "prefix must include separator field"
+        );
+        assert!(
+            prefix.ends_with("---\n"),
+            "prefix must end with the closing fence line"
+        );
+
+        // The body must start with the content after the closing fence
+        assert!(
+            result.body.contains("# Body"),
+            "body must contain content after fence"
+        );
+        assert!(
+            !result.body.contains("separator"),
+            "body must not contain frontmatter fields"
+        );
+    }
+
+    #[test]
+    fn close_end_byte_is_none_when_no_frontmatter() {
+        let src = "# Plain document\n\nNo frontmatter.";
+        let result = extract_frontmatter(src).unwrap();
+        assert!(result.close_end_byte.is_none());
+    }
+
+    #[test]
+    fn close_end_byte_basic_prefix_round_trip() {
+        let src = "---\ntitle: Test\n---\n# Body";
+        let result = extract_frontmatter(src).unwrap();
+        let close_end = result.close_end_byte.expect("close_end_byte must be Some");
+        let prefix = &src[..close_end];
+        assert_eq!(prefix, "---\ntitle: Test\n---\n");
     }
 
     // contains_marker_directive

@@ -83,22 +83,45 @@ pub fn parse_document(source: &str, slug: &str) -> ParseResult {
     }
 }
 
+/// Compose a markdown document from a human portion and an optional agent portion.
+///
+/// Inverse of [`parse_document`]. When `agent` is `Some`, an `<!-- @agent -->` block
+/// is appended after the human text using the same marker format that `mcp.rs` and
+/// `mcp_http.rs` already emit. When `agent` is `None`, only the human portion is
+/// returned.
+///
+/// The human portion may include frontmatter and any markdown — `compose_document`
+/// does not parse it. Trailing whitespace on the human portion is trimmed before
+/// the marker block is appended so callers do not have to manage spacing.
+pub fn compose_document(human: &str, agent: Option<&str>) -> String {
+    match agent {
+        None => human.to_string(),
+        Some(a) => format!(
+            "{}\n\n<!-- @agent -->\n\n{}\n\n<!-- @end -->\n",
+            human.trim_end(),
+            a
+        ),
+    }
+}
+
 /// Extract the title from the first H1 heading in the source.
 ///
 /// Searches line-by-line for `^# <content>` (first match wins).
 /// Title extraction happens on the body (after frontmatter stripped).
 ///
-/// Returns the slug as a fallback if no H1 is found.
-pub fn extract_title(source: &str, slug: &str) -> String {
+/// Returns `None` if no H1 heading is found. The caller supplies the
+/// fallback (slug or existing title) so the no-H1 case is unambiguous
+/// regardless of H1 content.
+pub fn extract_title(source: &str) -> Option<String> {
     for line in source.lines() {
         if let Some(rest) = line.strip_prefix("# ") {
             let title = rest.trim();
             if !title.is_empty() {
-                return title.to_string();
+                return Some(title.to_string());
             }
         }
     }
-    slug.to_string()
+    None
 }
 
 /// Parse an expiry duration string (e.g., "7d", "24h", "30m", "2w").
@@ -260,21 +283,21 @@ mod tests {
     #[test]
     fn extract_title_basic() {
         assert_eq!(
-            extract_title("# Hello World\n\nContent.", "fallback"),
-            "Hello World"
+            extract_title("# Hello World\n\nContent."),
+            Some("Hello World".to_string())
         );
     }
 
     #[test]
-    fn extract_title_falls_back_to_slug() {
-        assert_eq!(extract_title("No heading here.", "my-slug"), "my-slug");
+    fn extract_title_returns_none_when_no_h1() {
+        assert_eq!(extract_title("No heading here."), None);
     }
 
     #[test]
     fn extract_title_in_agent_section() {
         let src = "<!-- @agent -->\n# Hidden Title\n<!-- @end -->\nContent.";
         // extract_title works on raw source, finds H1 regardless of markers
-        assert_eq!(extract_title(src, "fallback"), "Hidden Title");
+        assert_eq!(extract_title(src), Some("Hidden Title".to_string()));
     }
 
     // Expiry parsing tests
@@ -340,5 +363,52 @@ mod tests {
         assert!(validate_slug("mcp").is_err());
         assert!(validate_slug("icon.png").is_err());
         assert!(validate_slug(".well-known").is_err());
+    }
+
+    // compose_document tests
+
+    #[test]
+    fn compose_human_only_no_agent() {
+        let result = compose_document("Hello world.", None);
+        assert_eq!(result, "Hello world.");
+    }
+
+    #[test]
+    fn compose_human_and_agent_produces_marker_block() {
+        let result = compose_document("Human part.", Some("Agent part."));
+        assert_eq!(
+            result,
+            "Human part.\n\n<!-- @agent -->\n\nAgent part.\n\n<!-- @end -->\n"
+        );
+    }
+
+    #[test]
+    fn compose_trims_trailing_whitespace_before_marker() {
+        let result = compose_document("Human part.\n\n\n", Some("Agent part."));
+        assert_eq!(
+            result,
+            "Human part.\n\n<!-- @agent -->\n\nAgent part.\n\n<!-- @end -->\n"
+        );
+    }
+
+    #[test]
+    fn compose_empty_human_with_agent() {
+        let result = compose_document("", Some("Agent content."));
+        assert_eq!(
+            result,
+            "\n\n<!-- @agent -->\n\nAgent content.\n\n<!-- @end -->\n"
+        );
+    }
+
+    #[test]
+    fn compose_round_trip_with_parse() {
+        let human = "# Hello\n\nHuman content.";
+        let agent = "Agent detail.";
+        let composed = compose_document(human, Some(agent));
+        let parsed = parse_document(&composed, "test-slug");
+        assert_eq!(parsed.human.trim_end(), human.trim_end());
+        // parse_document captures blank lines adjacent to markers as part of
+        // the agent content; trim both sides for the round-trip assertion.
+        assert_eq!(parsed.agent.as_deref().map(str::trim), Some(agent.trim()));
     }
 }
