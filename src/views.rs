@@ -728,6 +728,7 @@ pub async fn get_human(
             crate::parser::FrontmatterResult {
                 meta: None,
                 body: raw_content.clone(),
+                close_end_byte: None,
             }
         });
 
@@ -893,6 +894,7 @@ pub async fn get_full(
             crate::parser::FrontmatterResult {
                 meta: None,
                 body: raw_content.clone(),
+                close_end_byte: None,
             }
         });
 

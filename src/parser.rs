@@ -109,17 +109,19 @@ pub fn compose_document(human: &str, agent: Option<&str>) -> String {
 /// Searches line-by-line for `^# <content>` (first match wins).
 /// Title extraction happens on the body (after frontmatter stripped).
 ///
-/// Returns the slug as a fallback if no H1 is found.
-pub fn extract_title(source: &str, slug: &str) -> String {
+/// Returns `None` if no H1 heading is found. The caller supplies the
+/// fallback (slug or existing title) so the no-H1 case is unambiguous
+/// regardless of H1 content.
+pub fn extract_title(source: &str) -> Option<String> {
     for line in source.lines() {
         if let Some(rest) = line.strip_prefix("# ") {
             let title = rest.trim();
             if !title.is_empty() {
-                return title.to_string();
+                return Some(title.to_string());
             }
         }
     }
-    slug.to_string()
+    None
 }
 
 /// Parse an expiry duration string (e.g., "7d", "24h", "30m", "2w").
@@ -281,21 +283,21 @@ mod tests {
     #[test]
     fn extract_title_basic() {
         assert_eq!(
-            extract_title("# Hello World\n\nContent.", "fallback"),
-            "Hello World"
+            extract_title("# Hello World\n\nContent."),
+            Some("Hello World".to_string())
         );
     }
 
     #[test]
-    fn extract_title_falls_back_to_slug() {
-        assert_eq!(extract_title("No heading here.", "my-slug"), "my-slug");
+    fn extract_title_returns_none_when_no_h1() {
+        assert_eq!(extract_title("No heading here."), None);
     }
 
     #[test]
     fn extract_title_in_agent_section() {
         let src = "<!-- @agent -->\n# Hidden Title\n<!-- @end -->\nContent.";
         // extract_title works on raw source, finds H1 regardless of markers
-        assert_eq!(extract_title(src, "fallback"), "Hidden Title");
+        assert_eq!(extract_title(src), Some("Hidden Title".to_string()));
     }
 
     // Expiry parsing tests

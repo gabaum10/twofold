@@ -71,7 +71,7 @@ pub async fn publish(
     config: &ServeConfig,
     req: PublishRequest,
 ) -> Result<PublishResult, AppError> {
-    if req.raw_content.is_empty() {
+    if req.raw_content.trim().is_empty() {
         return Err(AppError::BadRequest(
             "Request body must not be empty".to_string(),
         ));
@@ -91,7 +91,7 @@ pub async fn publish(
 
     let title = meta
         .title
-        .unwrap_or_else(|| extract_title(body_text, &slug));
+        .unwrap_or_else(|| extract_title(body_text).unwrap_or_else(|| slug.clone()));
 
     let theme = meta.theme.unwrap_or_else(|| config.default_theme.clone());
 
@@ -214,7 +214,7 @@ pub async fn update(
     slug: &str,
     req: UpdateRequest,
 ) -> Result<PublishResult, AppError> {
-    if req.raw_content.is_empty() {
+    if req.raw_content.trim().is_empty() {
         return Err(AppError::BadRequest(
             "Request body must not be empty".to_string(),
         ));
@@ -234,7 +234,7 @@ pub async fn update(
     }
 
     let fm_result = extract_frontmatter(&req.raw_content).map_err(AppError::BadRequest)?;
-    let has_frontmatter = fm_result.meta.is_some();
+    let frontmatter_close_byte = fm_result.close_end_byte;
     let meta = fm_result.meta.unwrap_or_default();
     let body_text = &fm_result.body;
 
@@ -270,22 +270,17 @@ pub async fn update(
     let merged_body = compose_document(&incoming_parsed.human, final_agent.as_deref());
 
     // Recover the leading frontmatter portion of req.raw_content byte-exactly,
-    // so user's original YAML formatting is preserved.
-    let frontmatter_prefix = if has_frontmatter {
-        frontmatter_prefix_of(&req.raw_content)
-    } else {
-        ""
-    };
+    // so user's original YAML formatting is preserved. Use the byte offset that
+    // extract_frontmatter already computed — this avoids re-scanning and cannot
+    // miscount YAML values that happen to trim to "---".
+    let frontmatter_prefix = frontmatter_close_byte
+        .map(|end| &req.raw_content[..end])
+        .unwrap_or("");
     let raw_to_store = format!("{frontmatter_prefix}{merged_body}");
 
-    let title = meta.title.unwrap_or_else(|| {
-        let t = extract_title(body_text, slug);
-        if t == slug {
-            existing.title.clone()
-        } else {
-            t
-        }
-    });
+    let title = meta
+        .title
+        .unwrap_or_else(|| extract_title(body_text).unwrap_or_else(|| existing.title.clone()));
 
     let theme = meta.theme.unwrap_or_else(|| existing.theme.clone());
 
@@ -745,14 +740,13 @@ mod tests {
 
     // ── Adversarial / pressure-test cases ────────────────────────────────────
 
-    /// BUG (Warning): If a user writes an H1 whose text happens to equal the slug
-    /// string, the title-preservation guard fires incorrectly, using existing.title
-    /// instead of the H1 content. The fix is to change extract_title to return
-    /// Option<String> (None when no H1) so the slug-fallback is unambiguous.
+    /// Regression: H1 whose text equals the slug must update the title from the H1,
+    /// not fall back to existing.title. This was broken when extract_title returned the
+    /// slug as a fallback String, making the "no H1" case ambiguous. Fixed by returning
+    /// Option<String> where None means "no H1 found."
     ///
-    /// Scenario: existing title = "Old Custom Title", user PUTs body with H1 "# my-slug"
-    /// where "my-slug" equals the actual slug. Expected: title = "my-slug" (from H1).
-    /// Actual: title = "Old Custom Title" (existing title preserved, H1 ignored).
+    /// Scenario: existing title = "Old Custom Title", user PUTs body with H1 "# test-slug-x"
+    /// where "test-slug-x" equals the actual slug. Expected: title = "test-slug-x" (from H1).
     #[tokio::test]
     async fn adversarial_h1_text_equal_to_slug_bypasses_title_update() {
         let db = Db::open(":memory:").expect("in-memory db");
@@ -768,16 +762,14 @@ mod tests {
         assert_eq!(doc.title, "Old Custom Title");
 
         // Update with an H1 whose text equals the slug: "# test-slug-x"
-        // Expected: title should update to "test-slug-x" (the H1 content)
-        // Actual (bug): extract_title returns "test-slug-x", t == slug is true,
-        //               so existing.title ("Old Custom Title") is used instead.
+        // Expected: title should update to "test-slug-x" (the H1 content).
+        // Fixed: extract_title returns Some("test-slug-x"), existing.title is never consulted.
         do_update(&db, &config, &slug, "# test-slug-x\n\nNew content.").await;
 
         let doc = get(&db, &slug).await.expect("doc should exist");
-        // This assertion demonstrates the bug: the H1 should win, but existing title wins.
         assert_eq!(
             doc.title, "test-slug-x",
-            "BUG: H1 text == slug should update title from H1, not fall back to existing.title"
+            "H1 text == slug should update title from H1, not fall back to existing.title"
         );
     }
 
@@ -826,11 +818,11 @@ mod tests {
         );
     }
 
-    /// Whitespace-only body passes the is_empty() guard and silently overwrites
-    /// the human-visible content with whitespace. This is a Warning: the body is
-    /// accepted but stores invisible content. A trim-based empty check would catch it.
+    /// Whitespace-only body must be rejected with 400 BadRequest.
+    /// The is_empty() guard has been replaced with trim().is_empty() so that
+    /// "   \n\n   " is caught before it can silently overwrite human-visible content.
     #[tokio::test]
-    async fn adversarial_whitespace_only_body_overwrites_content() {
+    async fn update_rejects_whitespace_only_body() {
         let db = Db::open(":memory:").expect("in-memory db");
         let config = test_config();
 
@@ -838,8 +830,6 @@ mod tests {
             "# My Doc\n\nImportant content.\n\n<!-- @agent -->\n\nold agent\n\n<!-- @end -->\n";
         let slug = do_publish(&db, &config, initial).await;
 
-        // PUT a whitespace-only body — passes is_empty() check, gets accepted.
-        // The human content is overwritten; agent is preserved.
         let req = UpdateRequest {
             raw_content: "   \n\n   ".to_string(),
             principal: test_principal(),
@@ -847,23 +837,30 @@ mod tests {
         };
         let result = update(&db, &config, &slug, req).await;
 
-        // Currently this succeeds (no error), silently nuking visible content.
-        // This test documents the behavior. If the code is fixed to reject whitespace-only
-        // bodies, change the assert to expect Err.
         assert!(
-            result.is_ok(),
-            "whitespace-only body is currently accepted (documents the gap in validation)"
+            matches!(result, Err(AppError::BadRequest(_))),
+            "whitespace-only PUT body must return 400 BadRequest, got: {:?}",
+            result.map(|_| "Ok")
         );
+    }
 
-        let doc = get(&db, &slug).await.unwrap();
-        let fm = crate::parser::extract_frontmatter(&doc.raw_content).unwrap();
-        let parsed = crate::parser::parse_document(&fm.body, &slug);
+    /// publish must also reject whitespace-only body with 400 BadRequest.
+    #[tokio::test]
+    async fn publish_rejects_whitespace_only_body() {
+        let db = Db::open(":memory:").expect("in-memory db");
+        let config = test_config();
 
-        // Agent is preserved even with whitespace-only human input — correct.
-        assert_eq!(
-            parsed.agent.as_deref().map(str::trim),
-            Some("old agent"),
-            "agent must survive even a whitespace-only PUT body"
+        let req = PublishRequest {
+            raw_content: "   \n\n   ".to_string(),
+            principal: test_principal(),
+            client_ip: "127.0.0.1".to_string(),
+        };
+        let result = publish(&db, &config, req).await;
+
+        assert!(
+            matches!(result, Err(AppError::BadRequest(_))),
+            "whitespace-only POST body must return 400 BadRequest, got: {:?}",
+            result.map(|_| "Ok")
         );
     }
 
@@ -1041,8 +1038,8 @@ mod tests {
         do_update(&db, &config, &slug, "No H1 in this update either.").await;
 
         let doc2 = get(&db, &slug).await.unwrap();
-        // extract_title returns slug, t == slug, so existing.title (== slug) is used.
-        // Result: title stays as slug — correct behavior.
+        // extract_title returns None (no H1), so existing.title is used as fallback.
+        // existing.title == "the-slug-doc" (the slug) — result: title stays as slug.
         assert_eq!(
             doc2.title, "the-slug-doc",
             "title should remain as slug when no H1 and existing title was the slug"
@@ -1132,37 +1129,43 @@ mod tests {
             "stored content should use normalized standard markers after compose_document"
         );
     }
-}
 
-/// Extract the frontmatter prefix from a raw document string byte-exactly.
-///
-/// Returns the slice of `raw` from the start through the closing `---` fence line
-/// (including its trailing newline if present). Returns `""` if no valid frontmatter
-/// block is found.
-///
-/// This preserves the user's original YAML formatting and line endings without
-/// re-serializing through serde_yml.
-fn frontmatter_prefix_of(raw: &str) -> &str {
-    // Must start with a `---` fence.
-    if !raw.starts_with("---") {
-        return "";
+    /// Regression (F-2): frontmatter containing a YAML value of `"---"` must survive
+    /// a round-trip through update without losing any frontmatter fields.
+    ///
+    /// The old `frontmatter_prefix_of` helper re-scanned for the closing fence and
+    /// would miscount when a YAML value line trimmed to "---", cutting the prefix
+    /// mid-frontmatter. The fix: `extract_frontmatter` now returns the byte offset of
+    /// the closing fence directly, which is used verbatim for slicing.
+    #[tokio::test]
+    async fn update_preserves_frontmatter_with_yaml_triple_dash_value() {
+        let db = Db::open(":memory:").expect("in-memory db");
+        let config = test_config();
+
+        // Frontmatter with a field whose value is exactly "---" (a valid YAML scalar
+        // when quoted). serde_yml parses this fine; old frontmatter_prefix_of would not.
+        let initial = "---\ntheme: dark\nseparator: \"---\"\n---\n# My Doc\n\nContent.";
+        let slug = do_publish(&db, &config, initial).await;
+
+        // Verify initial parse stored the theme correctly.
+        let doc = get(&db, &slug).await.unwrap();
+        assert_eq!(doc.theme, "dark");
+
+        // Update with the same frontmatter. The prefix must be recovered byte-exactly.
+        do_update(&db, &config, &slug, initial).await;
+
+        let doc2 = get(&db, &slug).await.unwrap();
+
+        // Theme must survive the update (frontmatter prefix was not truncated).
+        assert_eq!(
+            doc2.theme, "dark",
+            "theme must be preserved when frontmatter contains a 'separator: \"---\"' field"
+        );
+
+        // The stored raw_content must include the separator field (prefix not truncated).
+        assert!(
+            doc2.raw_content.contains("separator:"),
+            "frontmatter field after '---' value must be present in stored raw_content"
+        );
     }
-    let mut fence_count = 0usize;
-    let mut pos = 0usize;
-    for line in raw.split('\n') {
-        let end = pos + line.len();
-        if line.trim() == "---" {
-            fence_count += 1;
-            if fence_count == 2 {
-                // Include the closing `---` and the following newline if present.
-                let after = end + 1; // +1 for the '\n' we split on
-                if after <= raw.len() {
-                    return &raw[..after];
-                }
-                return &raw[..end];
-            }
-        }
-        pos = end + 1; // +1 for the '\n'
-    }
-    ""
 }
