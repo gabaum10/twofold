@@ -31,8 +31,7 @@ use axum::{
 use clap::Parser;
 use tower::Layer;
 use tower_http::{
-    normalize_path::NormalizePathLayer, services::ServeDir, set_header::SetResponseHeaderLayer,
-    trace::TraceLayer,
+    normalize_path::NormalizePathLayer, set_header::SetResponseHeaderLayer, trace::TraceLayer,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -253,8 +252,9 @@ async fn run_server() {
         // Icon and favicon — embedded at compile time, no auth.
         .route("/icon.png", get(handlers::serve_icon))
         .route("/favicon.ico", get(handlers::serve_favicon))
-        // Static assets (twofold.js, etc.) — must be registered before /:slug catch-all.
-        .nest_service("/static", ServeDir::new("static"))
+        // Static assets — embedded at compile time; no runtime filesystem dependency.
+        // Must be registered before /:slug catch-all.
+        .route("/static/twofold.js", get(handlers::serve_twofold_js))
         .route("/:slug/unlock", post(views::post_unlock))
         .route("/:slug/full", get(views::get_full))
         // /:slug handles both plain slugs and /:slug.md (suffix stripped inside handler).

@@ -352,6 +352,24 @@ pub async fn serve_favicon() -> impl IntoResponse {
     axum::response::Redirect::permanent("/icon.png")
 }
 
+// ── GET /static/twofold.js ───────────────────────────────────────────────────
+
+/// Serve the toolbar JavaScript. Embedded at compile time; no runtime file I/O.
+///
+/// Deployed via `cargo install` from crates.io — no `static/` directory exists
+/// at runtime, so the file must travel with the binary.
+pub async fn serve_twofold_js() -> impl IntoResponse {
+    let js = include_str!("../static/twofold.js");
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        js,
+    )
+}
+
 // ── Internal helpers ─────────────────────────────────────────────────────────
 
 /// Auth check: delegates to [`crate::auth::check_auth`].
