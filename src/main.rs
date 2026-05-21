@@ -266,7 +266,10 @@ async fn run_server() {
     // while preventing unbounded memory allocation. Auth is handled inside the handler.
     const MCP_MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
     let mcp_router = Router::new()
-        .route("/mcp", post(mcp_http::handle_mcp_post))
+        .route(
+            "/mcp",
+            get(mcp_http::handle_mcp_get).post(mcp_http::handle_mcp_post),
+        )
         .layer(DefaultBodyLimit::max(MCP_MAX_BODY_BYTES));
 
     let app = app

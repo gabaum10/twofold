@@ -520,31 +520,155 @@ pub async fn handle_oauth_token(
 }
 
 async fn handle_client_credentials(state: AppState, req: TokenRequest) -> Response {
-    let client_id = req.client_id.as_deref().unwrap_or("<unset>");
-    let secret = match req.client_secret.as_deref() {
+    let client_id = match req.client_id.as_deref() {
+        Some(id) if !id.is_empty() => id.to_string(),
+        _ => return invalid_request("client_id is required for client_credentials grant"),
+    };
+    let provided_secret = match req.client_secret.as_deref() {
         Some(s) if !s.is_empty() => s.to_string(),
         _ => return invalid_request("client_secret is required for client_credentials grant"),
     };
-    match check_auth_token(&state, &secret).await {
-        Ok(_) => {
-            tracing::info!(client_id = %client_id, "OAuth client_credentials grant issued");
-            (
-                StatusCode::OK,
-                Json(TokenResponse {
-                    access_token: secret,
-                    token_type: "bearer",
-                    expires_in: 3600,
-                    refresh_token: None,
-                    scope: req.scope,
-                }),
+
+    // Look up the client in oauth_clients (provisioned via `twofold client create`).
+    let db_client = state.db.clone();
+    let client_id_for_lookup = client_id.clone();
+    let client_row = match tokio::task::spawn_blocking(move || {
+        db_client.get_oauth_client(&client_id_for_lookup)
+    })
+    .await
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "Failed to look up OAuth client");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "server_error",
+                    "error_description": "Database error"
+                })),
             )
-                .into_response()
+                .into_response();
         }
-        Err(_) => {
-            tracing::warn!(client_id = %client_id, "OAuth client_credentials denied");
-            invalid_client()
+        Err(e) => {
+            tracing::error!(error = %e, "OAuth client lookup task panicked");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "server_error",
+                    "error_description": "Database error"
+                })),
+            )
+                .into_response();
         }
-    }
+    };
+
+    let access_token = if let Some(ref c) = client_row {
+        // Provisioned client found. It must have a stored secret (client_credentials
+        // requires a confidential client).
+        let stored_secret = match c.client_secret.as_deref() {
+            Some(s) => s,
+            None => {
+                tracing::warn!(client_id = %client_id, "OAuth client_credentials denied: public client cannot use client_credentials grant");
+                return invalid_client();
+            }
+        };
+        if !constant_time_str_eq(&provided_secret, stored_secret) {
+            tracing::warn!(client_id = %client_id, "OAuth client_credentials denied: wrong client_secret");
+            return invalid_client();
+        }
+        // Secret matches — mint a short-lived access token.
+        let at = new_uuid();
+        let at_expires = {
+            let future = chrono::Utc::now() + chrono::Duration::hours(1);
+            future.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+        };
+        let at_row = AccessTokenRow {
+            token: at.clone(),
+            client_id: client_id.clone(),
+            scope: req.scope.clone(),
+            expires_at: at_expires,
+        };
+        let db_at = state.db.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || db_at.insert_access_token(&at_row))
+            .await
+            .unwrap_or_else(|e| {
+                Err(rusqlite::Error::InvalidPath(std::path::PathBuf::from(
+                    format!("task panicked: {e}"),
+                )))
+            })
+        {
+            tracing::error!(error = %e, "Failed to insert access token");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "server_error",
+                    "error_description": "Database error"
+                })),
+            )
+                .into_response();
+        }
+        tracing::info!(client_id = %client_id, "OAuth client_credentials grant issued (provisioned client)");
+        at
+    } else {
+        // Client not in oauth_clients — fall back to admin/managed token check
+        // for backwards compatibility with pre-provisioning usage.
+        match check_auth_token(&state, &provided_secret).await {
+            Ok(_) => {
+                // Admin token is valid. Mint a proper short-lived access token instead of
+                // echoing the raw secret back — returning the raw admin secret as an
+                // access_token would leak the master credential to callers.
+                let at = new_uuid();
+                let at_expires = {
+                    let future = chrono::Utc::now() + chrono::Duration::hours(1);
+                    future.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+                };
+                let at_row = AccessTokenRow {
+                    token: at.clone(),
+                    client_id: client_id.clone(),
+                    scope: req.scope.clone(),
+                    expires_at: at_expires,
+                };
+                let db_at = state.db.clone();
+                if let Err(e) =
+                    tokio::task::spawn_blocking(move || db_at.insert_access_token(&at_row))
+                        .await
+                        .unwrap_or_else(|e| {
+                            Err(rusqlite::Error::InvalidPath(std::path::PathBuf::from(
+                                format!("task panicked: {e}"),
+                            )))
+                        })
+                {
+                    tracing::error!(error = %e, "Failed to insert access token (admin-token fallback)");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": "server_error",
+                            "error_description": "Database error"
+                        })),
+                    )
+                        .into_response();
+                }
+                tracing::info!(client_id = %client_id, "OAuth client_credentials grant issued via admin-token fallback");
+                at
+            }
+            Err(_) => {
+                tracing::warn!(client_id = %client_id, "OAuth client_credentials denied: unknown client and invalid admin token");
+                return invalid_client();
+            }
+        }
+    };
+
+    (
+        StatusCode::OK,
+        Json(TokenResponse {
+            access_token,
+            token_type: "bearer",
+            expires_in: 3600,
+            refresh_token: None,
+            scope: req.scope,
+        }),
+    )
+        .into_response()
 }
 
 async fn handle_authorization_code(state: AppState, req: TokenRequest) -> Response {

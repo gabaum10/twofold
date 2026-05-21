@@ -55,6 +55,14 @@ Growth figures are trailing-twelve-month calculations normalized against...
 
 The markers are HTML comments. They're invisible in any standard markdown renderer. Any LLM can emit them. Without twofold, the document degrades gracefully to normal markdown with some comments in it.
 
+## Token Model
+
+Twofold has three distinct token concepts:
+
+- **`TWOFOLD_TOKEN`** — master admin secret. Set as an environment variable. Single value. Grants full access to all admin endpoints (publish, update, delete, audit). Server-side only; never passed to clients.
+- **Managed tokens** — database-backed, per-name tokens created with `twofold token create --name <name>`. Scoped per-agent or per-user. Revocable individually. Created by an admin, used by callers.
+- **`TWOFOLD_MCP_TOKEN`** — client-side environment variable for the stdio MCP client. Falls back to `TWOFOLD_TOKEN` if unset. Set this in your MCP server config when the agent needs a non-admin token.
+
 ## Quick Start
 
 ```bash
@@ -89,6 +97,8 @@ cd twofold
 cargo build --release
 ./target/release/twofold serve
 ```
+
+> **Note:** The release build target directory is ~5 GiB. On servers with small `/tmp` partitions, set `CARGO_TARGET_DIR` to a larger volume before building.
 
 ## Features
 
@@ -244,7 +254,9 @@ twofold client list
 twofold client revoke <client_id>
 ```
 
-**Confidential clients** store a hashed `client_secret` and require it at token exchange (`client_secret` in the POST body). Provisioned clients are exempt from the 24-hour reaper that removes unused dynamically registered clients.
+**The `client_secret` is shown once at creation and cannot be retrieved later.** If lost, revoke the client (`twofold client revoke <client_id>`) and re-create. Save the secret immediately.
+
+**Confidential clients** store the `client_secret` and require it at token exchange (`client_secret` in the POST body). Provisioned clients are exempt from the 24-hour reaper that removes unused dynamically registered clients.
 
 ## Connecting from Claude.ai / Cowork
 

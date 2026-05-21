@@ -32,6 +32,32 @@ use crate::{
     service::{self, PublishRequest, UpdateRequest},
 };
 
+/// GET /mcp — discovery endpoint for clients (e.g. Claude.ai) that probe the MCP
+/// endpoint before initiating a POST session. Returns 200 with a JSON body
+/// describing the supported transport so the client doesn't give up on a 405.
+///
+/// The MCP 2025-03-26 spec permits GET on the endpoint for SSE session
+/// initiation, but we don't implement SSE — our tools are fast round-trips.
+/// Returning 200 here is enough to satisfy discovery probes.
+pub async fn handle_mcp_get() -> Response {
+    (
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, "application/json"),
+            (axum::http::header::ALLOW, "GET, POST"),
+        ],
+        axum::body::Body::from(
+            serde_json::json!({
+                "transport": "http",
+                "methods": ["POST"],
+                "note": "MCP JSON-RPC requests must use POST. GET is supported for discovery only."
+            })
+            .to_string(),
+        ),
+    )
+        .into_response()
+}
+
 /// POST /mcp — remote MCP JSON-RPC endpoint (bearer token required).
 pub async fn handle_mcp_post(
     State(state): State<AppState>,
