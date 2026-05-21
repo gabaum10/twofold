@@ -663,7 +663,7 @@ async fn handle_client_credentials(state: AppState, req: TokenRequest) -> Respon
         Json(TokenResponse {
             access_token,
             token_type: "bearer",
-            expires_in: 3600,
+            expires_in: 604800,
             refresh_token: None,
             scope: req.scope,
         }),
@@ -990,7 +990,7 @@ async fn handle_authorization_code(state: AppState, req: TokenRequest) -> Respon
         Json(TokenResponse {
             access_token,
             token_type: "bearer",
-            expires_in: 3600,
+            expires_in: 604800,
             refresh_token: refresh_tok,
             scope: record.scope,
         }),
@@ -1251,7 +1251,7 @@ async fn handle_refresh_token(state: AppState, req: TokenRequest) -> Response {
         Json(TokenResponse {
             access_token,
             token_type: "bearer",
-            expires_in: 3600,
+            expires_in: 604800,
             refresh_token: Some(new_rt),
             scope: record.scope,
         }),
