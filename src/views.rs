@@ -34,7 +34,6 @@ struct CleanTemplate<'a> {
     base_url: &'a str,
     /// When true, toolbar shows "Summary view" instead of "Full detail".
     full_view: bool,
-    body_empty: bool,
     expires_at: Option<String>,
     /// First ~150 chars of plain text content for meta description / OpenGraph.
     description: String,
@@ -48,7 +47,6 @@ struct DarkTemplate<'a> {
     content: &'a str,
     slug: &'a str,
     base_url: &'a str,
-    body_empty: bool,
     expires_at: Option<String>,
     description: String,
 }
@@ -61,7 +59,6 @@ struct PaperTemplate<'a> {
     content: &'a str,
     slug: &'a str,
     base_url: &'a str,
-    body_empty: bool,
     expires_at: Option<String>,
     description: String,
 }
@@ -74,7 +71,6 @@ struct MinimalTemplate<'a> {
     content: &'a str,
     slug: &'a str,
     base_url: &'a str,
-    body_empty: bool,
     expires_at: Option<String>,
     description: String,
 }
@@ -88,7 +84,6 @@ struct HearthTemplate<'a> {
     slug: &'a str,
     base_url: &'a str,
     full_view: bool,
-    body_empty: bool,
     expires_at: Option<String>,
     description: String,
 }
@@ -409,8 +404,6 @@ fn render_themed_sync(
     let is_dark = theme == "dark";
     let highlighted = crate::highlight::apply_syntax_highlighting(content, is_dark);
 
-    let body_empty = highlighted.trim().is_empty();
-
     // Compute plain-text excerpt for meta description / OpenGraph.
     // Strip HTML tags from the rendered content, collapse whitespace, truncate at 150 chars.
     let description = plain_text_excerpt(&highlighted, 150);
@@ -422,7 +415,6 @@ fn render_themed_sync(
                 content: &highlighted,
                 slug,
                 base_url,
-                body_empty,
                 expires_at,
                 description,
             };
@@ -434,7 +426,6 @@ fn render_themed_sync(
                 content: &highlighted,
                 slug,
                 base_url,
-                body_empty,
                 expires_at,
                 description,
             };
@@ -446,7 +437,6 @@ fn render_themed_sync(
                 content: &highlighted,
                 slug,
                 base_url,
-                body_empty,
                 expires_at,
                 description,
             };
@@ -459,7 +449,6 @@ fn render_themed_sync(
                 slug,
                 base_url,
                 full_view,
-                body_empty,
                 expires_at,
                 description,
             };
@@ -473,7 +462,6 @@ fn render_themed_sync(
                 slug,
                 base_url,
                 full_view,
-                body_empty,
                 expires_at,
                 description,
             };

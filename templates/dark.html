@@ -401,8 +401,7 @@ footer small a:hover {
                 <button class="doc-btn" id="btn-copy-md" title="Copy markdown source to clipboard">
                     Copy markdown
                 </button>
-                <button class="doc-btn" id="btn-pdf" title="Save as PDF"{% if body_empty %} hidden{% endif %}>PDF</button>
-                <a class="doc-btn" id="btn-view-raw" href="#" title="View raw markdown source">
+                <a class="doc-btn" id="btn-view-raw" href="/{{ slug }}?raw=1" title="View raw markdown source">
                     View raw
                 </a>
             </div>
@@ -418,90 +417,6 @@ footer small a:hover {
 
     <div class="doc-toast" id="doc-toast" aria-live="polite"></div>
 
-    <script>
-    (function () {
-        'use strict';
-
-        var toast = document.getElementById('doc-toast');
-        var toastTimer = null;
-
-        function showToast(msg) {
-            if (toastTimer) clearTimeout(toastTimer);
-            toast.textContent = msg;
-            toast.classList.add('doc-toast--visible');
-            toastTimer = setTimeout(function () {
-                toast.classList.remove('doc-toast--visible');
-            }, 2000);
-        }
-
-        var pathParts = window.location.pathname.replace(/^\//, '').split('/');
-        var slug = pathParts[0];
-        var rawUrl = window.location.origin + '/' + slug + '?raw=1';
-
-        document.getElementById('btn-view-raw').href = rawUrl;
-
-        document.getElementById('btn-copy-url').addEventListener('click', function () {
-            navigator.clipboard.writeText(window.location.href).then(function () {
-                showToast('Copied!');
-            }).catch(function () {
-                showToast('Copy failed');
-            });
-        });
-
-        document.getElementById('btn-copy-md').addEventListener('click', function () {
-            fetch('/' + slug + '?raw=1')
-                .then(function (r) { return r.text(); })
-                .then(function (text) {
-                    return navigator.clipboard.writeText(text);
-                })
-                .then(function () {
-                    showToast('Copied markdown!');
-                })
-                .catch(function () {
-                    showToast('Copy failed');
-                });
-        });
-
-        var btnPdf = document.getElementById('btn-pdf');
-        if (btnPdf) {
-            btnPdf.addEventListener('click', function() {
-                window.print();
-            });
-        }
-    })();
-
-    (function() {
-        var el = document.querySelector('.doc-expiry');
-        if (!el) return;
-        var exp = new Date(el.dataset.expires);
-
-        function update() {
-            var now = new Date();
-            var diff = exp - now;
-            if (diff <= 0) {
-                el.querySelector('.expiry-countdown').textContent = 'expired';
-                el.classList.add('expired');
-                return;
-            }
-            var days = Math.floor(diff / 86400000);
-            var h = Math.floor((diff % 86400000) / 3600000);
-            var m = Math.floor((diff % 3600000) / 60000);
-            var text = '';
-            if (days > 0) {
-                text = days + (days === 1 ? ' day' : ' days');
-                if (h > 0) text += ', ' + h + (h === 1 ? ' hour' : ' hours');
-            } else if (h > 0) {
-                text = h + (h === 1 ? ' hour' : ' hours');
-                if (m > 0) text += ', ' + m + (m === 1 ? ' minute' : ' minutes');
-            } else {
-                text = (m > 0 ? m : 1) + (m === 1 ? ' minute' : ' minutes');
-            }
-            el.querySelector('.expiry-countdown').textContent = text;
-            if (diff < 300000) el.classList.add('expiry-urgent');
-        }
-        update();
-        setInterval(update, 1000);
-    })();
-    </script>
+    <script src="/static/twofold.js"></script>
 </body>
 </html>
