@@ -20,6 +20,7 @@
     var btnCopyUrl = document.getElementById('btn-copy-url');
     if (btnCopyUrl) {
         btnCopyUrl.addEventListener('click', function () {
+            if (!navigator.clipboard) { showToast('Copy not available'); return; }
             navigator.clipboard.writeText(window.location.href).then(function () {
                 showToast('Copied!');
             }).catch(function () {
@@ -31,6 +32,7 @@
     var btnCopyMd = document.getElementById('btn-copy-md');
     if (btnCopyMd) {
         btnCopyMd.addEventListener('click', function () {
+            if (!navigator.clipboard) { showToast('Copy not available'); return; }
             fetch('/' + slug + '?raw=1')
                 .then(function (r) { return r.text(); })
                 .then(function (text) {
