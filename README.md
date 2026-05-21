@@ -100,6 +100,8 @@ cargo build --release
 
 > **Note:** The release build target directory is ~5 GiB. On servers with small `/tmp` partitions, set `CARGO_TARGET_DIR` to a larger volume before building.
 
+> **Runtime layout:** The `static/` directory must be present in the working directory when the server starts. `ServeDir::new("static")` resolves relative to CWD, not the binary location. Everything else (templates, SQLite schema, icon, favicon) is compiled into the binary. When deploying, copy or symlink `static/` alongside the binary and run from that directory.
+
 ## Features
 
 - **Frontmatter** -- title, slug, theme, expiry, description (YAML in `---` fences)

@@ -31,7 +31,8 @@ use axum::{
 use clap::Parser;
 use tower::Layer;
 use tower_http::{
-    normalize_path::NormalizePathLayer, set_header::SetResponseHeaderLayer, trace::TraceLayer,
+    normalize_path::NormalizePathLayer, services::ServeDir, set_header::SetResponseHeaderLayer,
+    trace::TraceLayer,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -207,11 +208,11 @@ async fn run_server() {
     // Route ordering matters: API routes must be registered BEFORE the
     // slug catch-all, otherwise axum would try to parse "api" as a slug.
     // XSS threat model: only trusted publishers can POST content (bearer token auth).
-    // We control all HTML output, so inline scripts are safe here.
-    // 'unsafe-inline' is required for our own toolbar buttons (clipboard, toast, slug derivation).
-    // External script sources are still blocked by default-src 'self'.
+    // We control all HTML output. script-src 'self' allows /static/twofold.js and
+    // nothing else — no inline scripts, no external origins. Compatible with nginx
+    // proxies that enforce their own script-src policies.
     let csp = HeaderValue::from_static(
-        "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'",
+        "default-src 'self'; script-src 'self'; style-src 'unsafe-inline'",
     );
 
     let app = Router::new()
@@ -252,6 +253,8 @@ async fn run_server() {
         // Icon and favicon — embedded at compile time, no auth.
         .route("/icon.png", get(handlers::serve_icon))
         .route("/favicon.ico", get(handlers::serve_favicon))
+        // Static assets (twofold.js, etc.) — must be registered before /:slug catch-all.
+        .nest_service("/static", ServeDir::new("static"))
         .route("/:slug/unlock", post(views::post_unlock))
         .route("/:slug/full", get(views::get_full))
         // /:slug handles both plain slugs and /:slug.md (suffix stripped inside handler).
