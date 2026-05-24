@@ -1,0 +1,8 @@
+target/
+.git/
+*.db
+*.db-wal
+*.db-shm
+sharesvc.db
+twofold.db
+result
