@@ -12,7 +12,7 @@
 #   SQLite: compiled in via rusqlite "bundled" feature -- no system SQLite needed
 #   Templates/assets: compiled in via askama + include_str! -- no runtime files
 
-FROM rust:1.87-slim-bookworm@sha256:437507c3e719e4f968033b88d851ffa9f5aceeb2dcc2482cc6cb7647811a55eb AS builder
+FROM rust:1.88-slim-bookworm@sha256:38bc5a86d998772d4aec2348656ed21438d20fcdce2795b56ca434cf21430d89 AS builder
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
