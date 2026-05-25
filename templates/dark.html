@@ -404,6 +404,15 @@ footer small a:hover {
                 <a class="doc-btn" id="btn-view-raw" href="/{{ slug }}?raw=1" title="View raw markdown source">
                     View raw
                 </a>
+                {% if full_view %}
+                <a class="doc-btn" id="btn-toggle-view" href="/{{ slug }}" title="Summary view">
+                    &larr; Summary
+                </a>
+                {% else %}
+                <a class="doc-btn" id="btn-toggle-view" href="/{{ slug }}/full" title="Full rendered view with all sections">
+                    Full detail &rarr;
+                </a>
+                {% endif %}
             </div>
             {{ content|safe }}
         </article>

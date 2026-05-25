@@ -47,6 +47,7 @@ struct DarkTemplate<'a> {
     content: &'a str,
     slug: &'a str,
     base_url: &'a str,
+    full_view: bool,
     expires_at: Option<String>,
     description: String,
 }
@@ -415,6 +416,7 @@ fn render_themed_sync(
                 content: &highlighted,
                 slug,
                 base_url,
+                full_view,
                 expires_at,
                 description,
             };
